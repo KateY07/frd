@@ -34,7 +34,7 @@ static class AuthenticationRegression
             return Process.Start(info) ?? throw new IOException("Cannot start authentication test host.");
         }
         Process Start(params string[] extra) => StartCommand(["--host", "--listen", "127.0.0.1", "--port", port.ToString(), .. extra]);
-        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v1.pre4"), ("--unknown-option", 1, "") })
+        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v1.pre5"), ("--unknown-option", 1, "") })
         {
             using var process = StartCommand(argument);
             var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();
@@ -162,6 +162,7 @@ static class AuthenticationRegression
             }
             File.WriteAllText(Path.Combine(Path.GetDirectoryName(report)!, "authentication-host.log"), await stderr + await stdout);
         }
+        Check(host.ExitCode == 0, "Authenticated host closes without reporting listener cancellation as a fatal error");
         File.WriteAllText(report, JsonSerializer.Serialize(new { Passed = true, Checks = checks, InputInjected = false }, new JsonSerializerOptions { WriteIndented = true }));
     }
 }

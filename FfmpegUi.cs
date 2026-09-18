@@ -226,6 +226,7 @@ static partial class FfmpegUi
                 started = true; presets.IsEnabled = bitrate.IsEnabled = transmissionScale.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
                 clipboardEnabled.IsEnabled = session.IsRemote;
+                operation.Text = $"已连接：{config.InitialPreset} / {config.InitialBitrateKbps / 1000d:0.###} Mbps / {config.TransmissionScale}× {config.Width}×{config.Height}";
                 if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
                 if (InteractionScriptPath != null)
                 {
@@ -304,7 +305,7 @@ static partial class FfmpegUi
                 var enabled = packetDiagnostics.IsChecked == true;
                 var result = await session.SetPacketDiagnosticsAsync(enabled);
                 if (!result.Success) throw new InvalidOperationException(result.Message);
-                operation.Text = enabled ? "独立诊断 UDP 包已开启，开销计入流量与码率上限。" : "诊断包已关闭；本机分层计时仍然可用。";
+                operation.Text = enabled ? "独立诊断 UDP 包已开启，开销计入实际流量；滑条只限制编码码率。" : "诊断包已关闭；本机分层计时仍然可用。";
             }
             catch (Exception ex)
             {

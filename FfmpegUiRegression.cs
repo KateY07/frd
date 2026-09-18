@@ -13,6 +13,8 @@ static partial class FfmpegUi
         {
             await Task.Delay(100);
             if (stopping) return;
+            if (operation.Text?.StartsWith("已连接：", StringComparison.Ordinal) != true)
+                throw new InvalidOperationException("连接成功后控制栏仍显示启动状态。");
             var originalState = WindowState;
             var originalSize = new Size(Width, Height);
             var originalPosition = Position;

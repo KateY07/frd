@@ -355,7 +355,13 @@ sealed class RemoteHost : IAsyncDisposable
         {
             while (!stop.IsCancellationRequested)
             {
-                var client = await listener.AcceptTcpClientAsync(stop.Token); client.NoDelay = true;
+                TcpClient client;
+                try { client = await listener.AcceptTcpClientAsync(stop.Token); }
+                catch (Exception error) when (stop.IsCancellationRequested &&
+                    (error is ObjectDisposedException or InvalidOperationException ||
+                    error is SocketException { SocketErrorCode: SocketError.OperationAborted or SocketError.Interrupted }))
+                { Console.Error.WriteLine("Remote listener stopped: " + error.Message); break; }
+                client.NoDelay = true;
                 var id = Interlocked.Increment(ref peerId);
                 var task = HandleAsync(client); peers[id] = task;
                 _ = task.ContinueWith(_ => peers.TryRemove(id, out var removed), TaskScheduler.Default);

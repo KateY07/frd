@@ -533,7 +533,13 @@ public sealed class NativeInputSource : IDisposable
                     }
                     return 0;
                 }
-                if (message is 0x0008 or 0x0215) Input?.Invoke(new(RemoteInputKind.ReleaseAll));
+                // Normal mouse-up clears heldButtons before ReleaseCapture; keyboard modifiers must stay held.
+                if (message == 0x0008 || message == 0x0215 && heldButtons != 0)
+                {
+                    heldButtons = 0;
+                    if (message == 0x0008 && GetCapture() == hwnd) ReleaseCapture();
+                    Input?.Invoke(new(RemoteInputKind.ReleaseAll));
+                }
             }
         }
         catch (Exception error)
