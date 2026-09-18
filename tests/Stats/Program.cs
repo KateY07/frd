@@ -48,6 +48,22 @@ static class Program
         current = Read();
         Check((int)current[2]! == 0 && (double)current[1]! == 0 && Math.Abs((double)current[0]! - 5) < .001,
             "idle window has no samples while last frame remains identifiable", new { Samples = current[2], RecentMean = current[1], LastFrame = current[0] });
+        var diagnosticHistory = (Dictionary<long, FrameDiagnostic>)typeof(DemoSession).GetField("remoteDiagnostics", flags)!.GetValue(session)!;
+        var presentedHistory = (Dictionary<long, long>)typeof(DemoSession).GetField("remotePresented", flags)!.GetValue(session)!;
+        var prune = typeof(DemoSession).GetMethod("PruneRemoteHistory", flags)!;
+        for (long id = 0; id <= 20000; id += 17)
+        {
+            var clock = Activator.CreateInstance(timeline, flags, null, [1L, 2L, 3L, 1], null)!;
+            journal.GetType().GetProperty("Item")!.SetValue(journal, clock, [id]);
+            diagnosticHistory[id] = new(1, id, 1, 2, 3, Stopwatch.Frequency);
+            presentedHistory[id] = id;
+            prune.Invoke(session, [id]);
+        }
+        var journalCount = (int)journal.GetType().GetProperty("Count")!.GetValue(journal)!;
+        Check(journalCount < 250 && diagnosticHistory.Count < 250 && presentedHistory.Count < 250,
+            "sparse/lost frame IDs cannot accumulate expired diagnostic histories", new { journalCount, Diagnostics = diagnosticHistory.Count, Presented = presentedHistory.Count });
+        Check(diagnosticHistory.Keys.Min() > 15000 && diagnosticHistory.ContainsKey(19992),
+            "range eviction removes old sparse IDs and preserves recent diagnostics", new { Oldest = diagnosticHistory.Keys.Min(), Newest = diagnosticHistory.Keys.Max() });
         var output = args.FirstOrDefault() ?? "results/ffmpeg-stats/rolling-window.json";
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
         File.WriteAllText(output, JsonSerializer.Serialize(new

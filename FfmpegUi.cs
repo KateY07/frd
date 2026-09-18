@@ -363,6 +363,7 @@ static partial class FfmpegUi
             catch (Exception ex)
             {
                 ReportError(ex);
+                regressionExitCode = 1;
                 if (autoCloseSeconds > 0) Close();
             }
         }

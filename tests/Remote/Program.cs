@@ -2,6 +2,12 @@ using System.Diagnostics;
 using System.Text.Json;
 using Frd;
 
+if (args is ["--auth-only", var executable, var authReport])
+{
+    await Frd.Tests.AuthenticationRegression.Run(executable, authReport);
+    return;
+}
+
 if (args.Length < 2) throw new ArgumentException("CONFIG_PATH REPORT_PATH [--qsv|--nvenc]; optional FRD_TEST_HOST, FRD_TEST_PORT, FRD_TEST_TOKEN environment variables");
 var config = AppConfiguration.Load(Path.GetFullPath(args[0]));
 List<object> steps = new();

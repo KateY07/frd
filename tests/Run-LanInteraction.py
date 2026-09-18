@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
 import uuid
 
@@ -16,6 +17,7 @@ def quote(value):
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", required=True)
     parser.add_argument("--maintenance-port", type=int, default=17246)
@@ -38,6 +40,7 @@ def main():
     results = []
     controller = fixture = None
     remote_host_pid = None
+    remote_fixture_started = False
 
     def remote_command(script, timeout=30):
         request = {"session_id": uuid.uuid4().hex, "token": maintenance_token,
@@ -106,6 +109,7 @@ def main():
         remote_host_pid = remote_launch(remote + "/FRD.exe", f'--host --listen {args.host} --port {args.port} --token {session_token}')
         fixture_mode = "--fixture" if args.input else "--clipboard-fixture"
         remote_launch(remote + "/InteractionTests.exe", f'{fixture_mode} "{remote_fixture}"', hidden=True)
+        remote_fixture_started = True
         fixture = subprocess.Popen([str(local / "InteractionTests.exe"), fixture_mode, str(local_fixture)], creationflags=subprocess.CREATE_NO_WINDOW)
         state = wait(remote_state, lambda s: s.get("ready"))
         wait(local_state, lambda s: s.get("ready"))
@@ -153,7 +157,6 @@ def main():
         controller.wait(timeout=20)
         ui = json.loads((output / "ui.json").read_text(encoding="utf-8-sig"))
         check(controller.returncode == 0 and ui["Passed"], "Physical LAN real GPU presentation and clean shutdown", receivedFrames=ui["ReceivedFrames"], presentedFrames=ui["GpuConfirmedFrames"])
-        (output / "verified.json").write_text(json.dumps({"passed": True, "checks": results}, ensure_ascii=False, indent=2), encoding="utf-8")
     finally:
         (output / "finish").touch()
         if controller is not None and controller.poll() is None:
@@ -164,15 +167,36 @@ def main():
                 controller.wait(timeout=5)
                 print("Controller forced to close after timeout", flush=True)
         # Stop synchronization BEFORE restoring original clipboards, so backups cannot be forwarded.
-        if fixture is not None:
-            (local_fixture / "stop").touch()
-            fixture.wait(timeout=8)
-        remote_command(f"if(Test-Path -LiteralPath {quote(remote_fixture)}){{[IO.File]::WriteAllText({quote(remote_fixture + '/stop')},'done')}}")
-        closed = remote_command(f"$p={quote(remote_fixture + '/closed.json')}; for($i=0;$i -lt 40 -and -not(Test-Path -LiteralPath $p);$i++){{Start-Sleep -Milliseconds 100}}; if(Test-Path -LiteralPath $p){{Get-Content -LiteralPath $p -Raw -Encoding UTF8}}")
-        if fixture is not None and (not (local_fixture / "closed.json").exists() or not closed):
-            raise RuntimeError("Test fixture did not confirm clipboard restoration")
-        if remote_host_pid is not None:
-            remote_command(f"$p=Get-Process -Id {remote_host_pid} -ErrorAction SilentlyContinue; if($p){{[void]$p.CloseMainWindow(); if(-not $p.WaitForExit(8000)){{throw 'Regression host did not close'}}}}")
+        cleanup_errors = []
+        try:
+            if fixture is not None:
+                (local_fixture / "stop").touch()
+                fixture.wait(timeout=8)
+                closed = json.loads((local_fixture / "closed.json").read_text(encoding="utf-8-sig"))
+                if not closed.get("ClipboardRestored"):
+                    raise RuntimeError("Local clipboard restoration not confirmed")
+        except Exception as error:
+            print("Local fixture cleanup failed: " + str(error), file=sys.stderr)
+            cleanup_errors.append(error)
+        try:
+            if remote_fixture_started:
+                remote_command(f"[IO.File]::WriteAllText({quote(remote_fixture + '/stop')},'done')")
+                closed = remote_command(f"$p={quote(remote_fixture + '/closed.json')}; for($i=0;$i -lt 40 -and -not(Test-Path -LiteralPath $p);$i++){{Start-Sleep -Milliseconds 100}}; if(Test-Path -LiteralPath $p){{Get-Content -LiteralPath $p -Raw -Encoding UTF8}}")
+                if not closed or not json.loads(closed).get("ClipboardRestored"):
+                    raise RuntimeError("Remote clipboard restoration not confirmed")
+        except Exception as error:
+            print("Remote fixture cleanup failed: " + str(error), file=sys.stderr)
+            cleanup_errors.append(error)
+        try:
+            if remote_host_pid is not None:
+                remote_command(f"$p=Get-Process -Id {remote_host_pid} -ErrorAction SilentlyContinue; if($p){{[void]$p.CloseMainWindow(); if(-not $p.WaitForExit(8000)){{throw 'Regression host did not close'}}}}")
+        except Exception as error:
+            print("Remote host cleanup failed: " + str(error), file=sys.stderr)
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            raise ExceptionGroup("Regression cleanup failed", cleanup_errors)
+    check(True, "Both original clipboards restored and all regression processes closed")
+    (output / "verified.json").write_text(json.dumps({"passed": True, "checks": results}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

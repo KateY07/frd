@@ -66,7 +66,7 @@ static class Program
         }
         else if (args.FirstOrDefault() == "--codec")
         {
-            var configuration = AppConfiguration.Load(Path.GetFullPath(args.ElementAtOrDefault(2) ?? "bin/live-demo/codec-config.json"));
+            var configuration = AppConfiguration.Load(Path.GetFullPath(args.ElementAtOrDefault(2) ?? Path.Combine(AppContext.BaseDirectory, "codec-config.json")));
             const int width = 1280, height = 720, fps = 30, framesPerStep = 90;
             var pixels = new byte[width * height * 4];
             using var encoder = new FfmpegEncoder(configuration.Presets["h264"].EncoderArguments, width, height, fps, 1000);
@@ -75,8 +75,10 @@ static class Program
             List<double> outputRates = new();
             foreach (var cap in new[] { 1000, 2000, 3000, 4000, 5000, 1000, 500, 5000, 10000, 20000, 1000 })
             {
+                var previousBufferBits = Math.Max(encoder.BufferSizeBits, encoder.MaxRateBitsPerSecond / fps);
                 if (!encoder.SetBitrate(cap) || encoder.MaxRateBitsPerSecond != cap * 1000L) throw new Exception("Bitrate update failed");
-                long bytes = 0;
+                var effectiveBufferBits = Math.Max(encoder.BufferSizeBits, encoder.MaxRateBitsPerSecond / fps);
+                long bytes = 0, steadyBytes = 0;
                 var decoded = 0;
                 for (var index = 0; index < framesPerStep; index++, frame++)
                 {
@@ -92,14 +94,24 @@ static class Program
                         pixels[offset + 3] = 255;
                     }
                     foreach (var packet in encoder.Encode(pixels, frame))
-                    { bytes += packet.Data.Length; decoded += decoder.Decode(packet.Data, packet.Pts).Count; }
+                    {
+                        bytes += packet.Data.Length;
+                        if (index >= fps) steadyBytes += packet.Data.Length;
+                        decoded += decoder.Decode(packet.Data, packet.Pts).Count;
+                    }
                 }
-                var allowanceBits = cap * 1000L * framesPerStep / fps + encoder.BufferSizeBits;
-                if (decoded != framesPerStep || bytes * 8 > allowanceBits) throw new Exception($"Codec cap {cap}: {bytes * 8} bits > {allowanceBits}, decoded {decoded}");
+                // x264 enforces at least one frame of VBV; a live downward change also has pre-change buffer state.
+                var transitionBufferBits = Math.Max(previousBufferBits, effectiveBufferBits);
+                var allowanceBits = cap * 1000L * framesPerStep / fps + transitionBufferBits;
+                var steadyAllowanceBits = cap * 1000L * (framesPerStep - fps) / fps + effectiveBufferBits;
+                if (decoded != framesPerStep || bytes * 8 > allowanceBits || steadyBytes * 8 > steadyAllowanceBits)
+                    throw new Exception($"Codec cap {cap}: full {bytes * 8}/{allowanceBits}, steady {steadyBytes * 8}/{steadyAllowanceBits} bits, decoded {decoded}");
                 outputRates.Add(bytes * 8d / (framesPerStep / fps) / 1000);
                 checks.Add(new { Case = "Live encoder bitrate change without network shaping", CapKbps = cap,
                     ActualKbps = bytes * 8d / (framesPerStep / fps) / 1000, Frames = decoded,
-                    VbvBurstAllowanceBits = encoder.BufferSizeBits, Passed = true });
+                    SteadyActualKbps = steadyBytes * 8d / ((framesPerStep - fps) / fps) / 1000,
+                    ConfiguredVbvBits = encoder.BufferSizeBits, EffectiveVbvBits = effectiveBufferBits,
+                    TransitionBurstAllowanceBits = transitionBufferBits, SteadyBurstAllowanceBits = effectiveBufferBits, Passed = true });
             }
             if (outputRates[4] < outputRates[6] * 3 || outputRates[7] < outputRates[6] * 3)
                 throw new Exception("Demand was insufficient or bitrate changes did not affect actual output");

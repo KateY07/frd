@@ -602,9 +602,18 @@ static class Program
     {
         try
         {
+            if (args is ["--help"] or ["--help-window"]) { RemoteLaunch.Help(args[0] == "--help-window"); return 0; }
+            if (args is ["--version"])
+            {
+                Console.WriteLine(System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                    .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
+                return 0;
+            }
+            if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
+                "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (args.Length > 0 && args[0] is "--host" or "--connect" or "--help")
+            if (args.Length > 0 && args[0] is "--host" or "--connect")
                 return RemoteLaunch.Run(config, args);
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
@@ -2268,17 +2277,18 @@ sealed class DesktopStreamSource : IDisposable
 {
     readonly object gate = new();
     DesktopCapture capture;
+    int width, height;
     public int SourceWidth { get; }
     public int SourceHeight { get; }
-    public int Width { get; }
-    public int Height { get; }
+    public int Width { get { lock (gate) return width; } }
+    public int Height { get { lock (gate) return height; } }
     public DesktopCaptureStatistics? Statistics { get { lock (gate) return capture.Statistics; } }
     public string Backend { get { lock (gate) return capture.Backend; } }
     public DesktopStreamSource(double scale)
     {
         var bounds = Win32InputInjector.ReadPrimaryMonitor();
         SourceWidth = bounds.Width; SourceHeight = bounds.Height;
-        (Width, Height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
+        (width, height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
         capture = new(Width, Height);
     }
     public byte[] Capture() { lock (gate) return capture.Capture(); }
@@ -2287,7 +2297,7 @@ sealed class DesktopStreamSource : IDisposable
         var replacement = new DesktopCapture(width, height);
         try { replacement.Capture(); }
         catch { replacement.Dispose(); throw; }
-        lock (gate) { var previous = capture; capture = replacement; previous.Dispose(); }
+        lock (gate) { var previous = capture; capture = replacement; this.width = width; this.height = height; previous.Dispose(); }
     }
     public void Dispose() { lock (gate) capture.Dispose(); }
 }
@@ -3757,6 +3767,7 @@ public sealed partial class DemoSession
     readonly Dictionary<long, FrameDiagnostic> remoteDiagnostics = new();
     readonly Dictionary<long, long> remotePresented = new();
     readonly Queue<long> remotePresentationTicks = new();
+    long remoteHistorySweep;
     public bool IsRemote => remoteOptions != null;
     public AppConfiguration Configuration => config;
     internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
@@ -3897,7 +3908,7 @@ public sealed partial class DemoSession
             if (remoteDiagnostics.Remove(video.FrameId, out var diagnostic) && diagnostic.Generation == video.Generation)
                 ApplyRemoteDiagnostic(clock, diagnostic);
             frameClocks[video.FrameId] = clock;
-            frameClocks.TryRemove(video.FrameId - 4096, out _);
+            PruneRemoteHistory(video.FrameId);
         }
     }
 
@@ -3909,7 +3920,7 @@ public sealed partial class DemoSession
             if (frameClocks.TryGetValue(diagnostic.FrameId, out var clock) && clock.Generation == diagnostic.Generation)
                 ApplyRemoteDiagnostic(clock, diagnostic);
             else remoteDiagnostics[diagnostic.FrameId] = diagnostic;
-            remoteDiagnostics.Remove(diagnostic.FrameId - 4096);
+            PruneRemoteHistory(diagnostic.FrameId);
             remotePresented.TryGetValue(diagnostic.FrameId, out completed);
         }
         if (completed > 0) ReportPresented(diagnostic.FrameId, completed);
@@ -3920,7 +3931,7 @@ public sealed partial class DemoSession
         lock (remoteTimingGate)
         {
             if (remotePresented.TryAdd(id, tick)) remotePresentationTicks.Enqueue(tick);
-            remotePresented.Remove(id - 4096);
+            PruneRemoteHistory(id);
             if (!frameClocks.TryGetValue(id, out var clock) || !clock.HasRemoteDiagnostic) return false;
             remotePresented.Remove(id);
             return true;
@@ -3934,6 +3945,17 @@ public sealed partial class DemoSession
             while (remotePresentationTicks.TryPeek(out var tick) && Stopwatch.GetTimestamp() - tick > Stopwatch.Frequency) remotePresentationTicks.Dequeue();
             return remotePresentationTicks.Count;
         }
+    }
+
+    void PruneRemoteHistory(long frameId)
+    {
+        if (frameId < remoteHistorySweep) return;
+        remoteHistorySweep = frameId + 64;
+        var oldest = frameId - 4096;
+        // Missing frames cannot trigger exact-id eviction; periodically sweep the whole expired range.
+        foreach (var id in frameClocks.Keys) if (id <= oldest) frameClocks.TryRemove(id, out _);
+        foreach (var id in remoteDiagnostics.Keys.Where(id => id <= oldest).ToArray()) remoteDiagnostics.Remove(id);
+        foreach (var id in remotePresented.Keys.Where(id => id <= oldest).ToArray()) remotePresented.Remove(id);
     }
 }
 
@@ -3954,7 +3976,10 @@ sealed class RemoteHost : IAsyncDisposable
     Task? acceptTask;
     public event Action<string>? Status;
     public RemoteHost(AppConfiguration config, IPAddress address, int port, string token)
-    { this.config = config; this.token = token; listener = new(address, port); }
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        this.config = config; this.token = token; listener = new(address, port);
+    }
 
     public void Start(nint clipboardOwner = 0)
     {
@@ -3991,7 +4016,8 @@ sealed class RemoteHost : IAsyncDisposable
                 var stream = client.GetStream();
                 var hello = await RemoteWire.ReadAsync<RemoteRequest>(stream, timeout.Token);
                 var received = Stopwatch.GetTimestamp();
-                if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(hello.Token)), SHA256.HashData(Encoding.UTF8.GetBytes(token))))
+                if (string.IsNullOrWhiteSpace(hello.Token) ||
+                    !CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(hello.Token)), SHA256.HashData(Encoding.UTF8.GetBytes(token))))
                 { await RemoteWire.WriteAsync(stream, new RemoteReply(false, "连接口令错误。"), timeout.Token); return; }
                 var address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
                 if (hello.Kind == "cursor")
@@ -4116,10 +4142,15 @@ sealed class RemoteHost : IAsyncDisposable
 
 static class RemoteLaunch
 {
-    public const string Usage = "被控：FRD.exe --host --port 5000 --token 自定口令 [--listen 0.0.0.0]\n主控：FRD.exe --connect 被控IPv4或主机名 --port 5000 --token 相同口令\n无参数：原 localhost Demo。TCP 控制及独立键鼠连接共用被控监听端口，视频和诊断走协商的 UDP 端口。";
+    static int hostExitCode;
+    public const string Usage = "FRD CLI\n被控：FRD.exe --host --port 5000 --token 自定口令 [--listen 0.0.0.0]\n主控：FRD.exe --connect 被控IPv4或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --token；没有默认或保存的口令。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
+    public static void Help(bool window)
+    {
+        Console.WriteLine(Usage);
+        if (window) ShowMessage(Usage);
+    }
     public static int Run(AppConfiguration config, string[] args)
     {
-        if (args[0] == "--help") { Console.WriteLine(Usage); ShowMessage(Usage); return 0; }
         var host = args[0] == "--host";
         if (!host && args.Length < 2) throw new ArgumentException(Usage);
         var values = new Dictionary<string, string>();
@@ -4128,8 +4159,10 @@ static class RemoteLaunch
             if (i + 1 >= args.Length || args[i] is not ("--port" or "--token" or "--listen" or "--test-seconds" or "--report" or "--interaction-script") || !values.TryAdd(args[i], args[i + 1]))
                 throw new ArgumentException(Usage);
         }
-        if (!values.TryGetValue("--port", out var portText) || !int.TryParse(portText, out var port) || port is < 1 or > 65535 ||
-            !values.TryGetValue("--token", out var token) || string.IsNullOrWhiteSpace(token)) throw new ArgumentException(Usage);
+        if (!values.TryGetValue("--token", out var token) || string.IsNullOrWhiteSpace(token))
+            throw new ArgumentException("必须每次通过命令行 --token 指定非空连接口令；没有默认口令，也不会从配置文件读取口令。\n" + Usage);
+        if (!values.TryGetValue("--port", out var portText) || !int.TryParse(portText, out var port) || port is < 1 or > 65535)
+            throw new ArgumentException(Usage);
         if (!host)
         {
             FfmpegUi.InteractionScriptPath = values.GetValueOrDefault("--interaction-script");
@@ -4140,7 +4173,8 @@ static class RemoteLaunch
         var address = IPAddress.Parse(values.GetValueOrDefault("--listen", "0.0.0.0"));
         if (address.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("目前支持 IPv4。");
         HostApplication.Factory = () => new HostWindow(config, address, port, token);
-        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return 0;
+        hostExitCode = 0;
+        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return hostExitCode;
     }
 
     static void ShowMessage(string text)
@@ -4171,7 +4205,15 @@ static class RemoteLaunch
             var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
             Content = status; server = new(config, address, port, token);
             server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
-            Opened += (_, _) => { try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); } catch (Exception error) { Console.Error.WriteLine(error); status.Text = error.Message; } };
+            Opened += (_, _) =>
+            {
+                try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine(error); status.Text = error.Message; hostExitCode = 1;
+                    Avalonia.Threading.Dispatcher.UIThread.Post(Close);
+                }
+            };
             Closing += async (_, e) =>
             {
                 if (finished) return;
@@ -5141,6 +5183,7 @@ static partial class FfmpegUi
             catch (Exception ex)
             {
                 ReportError(ex);
+                regressionExitCode = 1;
                 if (autoCloseSeconds > 0) Close();
             }
         }

@@ -569,9 +569,18 @@ static class Program
     {
         try
         {
+            if (args is ["--help"] or ["--help-window"]) { RemoteLaunch.Help(args[0] == "--help-window"); return 0; }
+            if (args is ["--version"])
+            {
+                Console.WriteLine(System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+                    .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
+                return 0;
+            }
+            if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
+                "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (args.Length > 0 && args[0] is "--host" or "--connect" or "--help")
+            if (args.Length > 0 && args[0] is "--host" or "--connect")
                 return RemoteLaunch.Run(config, args);
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }

@@ -1,12 +1,47 @@
 $ErrorActionPreference = 'Stop'
-$output = Join-Path $PSScriptRoot 'artifacts/v1.pre1/win-x64'
+$project = Join-Path $PSScriptRoot 'FRD.csproj'
+$version = ([xml](Get-Content -LiteralPath $project -Raw)).Project.PropertyGroup.InformationalVersion
+if ($version -notmatch '^v\d+\.pre\d+$') { throw 'Invalid release version.' }
+$releaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "artifacts/$version"))
+$output = Join-Path $releaseRoot 'win-x64'
+$staging = Join-Path $releaseRoot ('staging-' + [Guid]::NewGuid().ToString('N'))
 if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'third_party/ffmpeg/runtime/avcodec-62.dll'))) {
     throw 'Run Get-FFmpeg.ps1 first.'
 }
-& dotnet publish (Join-Path $PSScriptRoot 'FRD.csproj') -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $output
-if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.md') -Destination $output
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/使用.md') -Destination $output
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/v1.pre1-验证.md') -Destination $output
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/双机补充验证.md') -Destination $output
-Write-Output ('Run FRD.exe in: ' + $output)
+& dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $staging
+if ($LASTEXITCODE -ne 0) { throw "Publish failed; staging retained at $staging" }
+foreach ($document in @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md', "docs/$version-发布说明.md", "docs/$version-静态检查.md")) {
+    $destination = Join-Path $staging $document
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination
+}
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/使用.md') -Destination $staging
+$productVersion = (Get-Item -LiteralPath (Join-Path $staging 'FRD.exe')).VersionInfo.ProductVersion
+if (-not $productVersion.StartsWith($version + '+') -and $productVersion -ne $version) { throw 'Published binary version mismatch.' }
+foreach ($required in @('codec-config.json', 'ffmpeg/avcodec-62.dll', 'ffmpeg/avutil-60.dll', 'ffmpeg/LICENSE.txt')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $staging $required))) { throw "Missing release file: $required" }
+}
+if (Get-ChildItem -LiteralPath $staging -Filter '*Tests*' -Recurse) { throw 'Test executable leaked into release.' }
+$workspace = [IO.Path]::GetFullPath($PSScriptRoot) + [IO.Path]::DirectorySeparatorChar
+foreach ($path in @($staging, $output)) {
+    if (-not $path.StartsWith($workspace, [StringComparison]::OrdinalIgnoreCase)) { throw 'Publish path escapes workspace.' }
+}
+if (Test-Path -LiteralPath $output) {
+    $archive = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('archive/replaced-builds/' + $version + '-' + [Guid]::NewGuid().ToString('N'))))
+    if (-not $archive.StartsWith($workspace, [StringComparison]::OrdinalIgnoreCase)) { throw 'Archive path escapes workspace.' }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archive) | Out-Null
+    Move-Item -LiteralPath $output -Destination $archive
+}
+Move-Item -LiteralPath $staging -Destination $output
+$archivePath = Join-Path $releaseRoot "frd-$version-win-x64.zip"
+$zipTool = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+if (-not $zipTool -and (Test-Path -LiteralPath 'C:/Program Files/7-Zip/7z.exe')) { $zipTool = 'C:/Program Files/7-Zip/7z.exe' }
+if (-not $zipTool) { throw '7-Zip is required to package the release.' }
+# A fresh archive cannot inherit stale members from any previous package.
+$freshZip = Join-Path $releaseRoot ('package-' + [Guid]::NewGuid().ToString('N') + '.zip')
+& $zipTool a -tzip -mx=1 $freshZip (Join-Path $output '*')
+if ($LASTEXITCODE -ne 0) { throw 'Release archive creation failed.' }
+Move-Item -LiteralPath $freshZip -Destination $archivePath -Force
+$hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText((Join-Path $releaseRoot 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archivePath))`n")
+Write-Output "Published $productVersion`: $archivePath"

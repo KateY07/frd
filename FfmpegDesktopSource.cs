@@ -19,17 +19,18 @@ sealed class DesktopStreamSource : IDisposable
 {
     readonly object gate = new();
     DesktopCapture capture;
+    int width, height;
     public int SourceWidth { get; }
     public int SourceHeight { get; }
-    public int Width { get; }
-    public int Height { get; }
+    public int Width { get { lock (gate) return width; } }
+    public int Height { get { lock (gate) return height; } }
     public DesktopCaptureStatistics? Statistics { get { lock (gate) return capture.Statistics; } }
     public string Backend { get { lock (gate) return capture.Backend; } }
     public DesktopStreamSource(double scale)
     {
         var bounds = Win32InputInjector.ReadPrimaryMonitor();
         SourceWidth = bounds.Width; SourceHeight = bounds.Height;
-        (Width, Height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
+        (width, height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
         capture = new(Width, Height);
     }
     public byte[] Capture() { lock (gate) return capture.Capture(); }
@@ -38,7 +39,7 @@ sealed class DesktopStreamSource : IDisposable
         var replacement = new DesktopCapture(width, height);
         try { replacement.Capture(); }
         catch { replacement.Dispose(); throw; }
-        lock (gate) { var previous = capture; capture = replacement; previous.Dispose(); }
+        lock (gate) { var previous = capture; capture = replacement; this.width = width; this.height = height; previous.Dispose(); }
     }
     public void Dispose() { lock (gate) capture.Dispose(); }
 }
