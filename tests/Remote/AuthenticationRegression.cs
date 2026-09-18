@@ -20,6 +20,10 @@ static class AuthenticationRegression
             if (!passed) throw new InvalidOperationException(name);
             Console.WriteLine("PASS " + name);
         }
+        using (var binary = File.OpenRead(executable))
+        using (var image = new System.Reflection.PortableExecutable.PEReader(binary))
+            Check(image.PEHeaders.PEHeader?.Subsystem == System.Reflection.PortableExecutable.Subsystem.WindowsCui,
+                "Console subsystem keeps interactive CLI invocation synchronous");
         using var reservation = new TcpListener(IPAddress.Loopback, 0);
         reservation.Start(); var port = ((IPEndPoint)reservation.LocalEndpoint).Port; reservation.Stop();
         Process StartCommand(params string[] arguments)
