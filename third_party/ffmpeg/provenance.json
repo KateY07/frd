@@ -1,0 +1,8 @@
+{
+  "version": "8.1.2-full_build-shared",
+  "provider": "Gyan.dev",
+  "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.2-full_build-shared.7z",
+  "sha256": "CBA748035C21CE1431D0823C7A3A711F38616F89F87A265DCEDDF9B7F6749D2D",
+  "integrity": "Matched provider download.sha256 before extraction",
+  "license": "runtime/LICENSE.txt"
+}

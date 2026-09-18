@@ -1,0 +1,17 @@
+bin/
+obj/
+.packages/
+api-reference/
+vortice-inspect.zip
+results/
+archive/
+artifacts/
+*.lnk
+*.user
+*.log
+startup-error.txt
+third_party/ffmpeg/runtime/
+third_party/ffmpeg/ffmpeg-*/
+third_party/ffmpeg/*.7z
+third_party/ffmpeg/*.zip
+third_party/openh264/

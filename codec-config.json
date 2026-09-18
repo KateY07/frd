@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 3,
+  "width": 1280,
+  "height": 720,
+  "framesPerSecond": 30,
+  "initialPreset": "h264",
+  "initialBitrateKbps": 1000,
+  "libraryDirectory": "ffmpeg",
+  "simulation": {
+    "capacityMbps": 0,
+    "lossRate": 0,
+    "maxDelayMs": 0
+  },
+  "presets": {
+    "h264": {
+      "label": "H.264 / x264 · 限码率质量优先",
+      "encoderArguments": "-c:v libx264 -preset veryfast -tune zerolatency -crf 20 -bf 0 -g 300 -threads 4 -bufsize 100k",
+      "decoderArguments": "-c:v h264 -threads 1"
+    },
+    "h264_fast": {
+      "label": "H.264 / x264 · 速度优先",
+      "encoderArguments": "-c:v libx264 -preset ultrafast -tune zerolatency -crf 23 -bf 0 -g 300 -threads 4 -bufsize 100k",
+      "decoderArguments": "-c:v h264 -threads 1"
+    },
+    "h264_lowdelay": {
+      "label": "H.264 / 小 VBV · 运动低延迟",
+      "encoderArguments": "-c:v libx264 -preset veryfast -tune zerolatency -crf 28 -bf 0 -g 900 -threads 4 -bufsize 34k",
+      "decoderArguments": "-c:v h264 -threads 1"
+    },
+    "h264_qsv_swdec": {
+      "label": "H.264 / Intel 硬编 + 软件解码",
+      "encoderArguments": "-c:v h264_qsv -preset veryfast -async_depth 1 -bf 0 -g 300 -pix_fmt nv12 -bufsize 100k -look_ahead 0 -forced_idr 1",
+      "decoderArguments": "-c:v h264 -threads 1"
+    },
+    "vp9": {
+      "label": "VP9 / libvpx · 实时",
+      "encoderArguments": "-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -row-mt 1 -threads 4 -g 300 -bufsize 100k -b:v {bitrateKbps}k -minrate {bitrateKbps}k -maxrate {bitrateKbps}k -drop-threshold 30 -tune-content screen -aq-mode 3",
+      "decoderArguments": "-c:v vp9 -threads 1"
+    },
+    "av1": {
+      "label": "AV1 / libaom · 实时",
+      "encoderArguments": "-c:v libaom-av1 -usage realtime -cpu-used 8 -lag-in-frames 0 -row-mt 1 -threads 4 -g 300 -bufsize 100k -b:v {bitrateKbps}k -minrate {bitrateKbps}k -maxrate {bitrateKbps}k -drop-threshold 30 -aq-mode 3",
+      "decoderArguments": "-c:v libdav1d -threads 1"
+    },
+    "h264_qsv": {
+      "label": "H.264 / Intel QSV 硬编 + D3D11 硬解",
+      "encoderArguments": "-c:v h264_qsv -preset veryfast -async_depth 1 -bf 0 -g 300 -pix_fmt nv12 -bufsize 100k -look_ahead 0 -forced_idr 1",
+      "decoderArguments": "-c:v h264 -hwaccel d3d11va -hwaccel_output_format d3d11 -threads 1"
+    },
+    "h264_d3d11va": {
+      "label": "H.264 / x264 软件编码 + D3D11 硬解",
+      "encoderArguments": "-c:v libx264 -preset veryfast -tune zerolatency -crf 20 -bf 0 -g 300 -threads 4 -bufsize 100k",
+      "decoderArguments": "-c:v h264 -hwaccel d3d11va -hwaccel_output_format d3d11 -threads 1"
+    },
+    "h264_nvenc": {
+      "label": "H.264 / NVIDIA NVENC · 限码率质量优先",
+      "encoderArguments": "-c:v h264_nvenc -preset p3 -tune ull -rc vbr -cq 22 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "decoderArguments": "-hwaccel cuda -c:v h264"
+    },
+    "av1_nvenc": {
+      "label": "AV1 / NVIDIA NVENC · 限码率质量优先",
+      "encoderArguments": "-c:v av1_nvenc -preset p3 -tune ull -rc vbr -cq 28 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "decoderArguments": "-hwaccel cuda -c:v av1"
+    },
+    "hevc_nvenc": {
+      "label": "HEVC / NVIDIA NVENC · 限码率质量优先",
+      "encoderArguments": "-c:v hevc_nvenc -preset p3 -tune ull -rc vbr -cq 24 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "decoderArguments": "-hwaccel cuda -c:v hevc"
+    },
+    "vp9_nvdec": {
+      "label": "VP9 / 软件编码 + NVIDIA 解码",
+      "encoderArguments": "-c:v libvpx-vp9 -deadline realtime -cpu-used 8 -lag-in-frames 0 -auto-alt-ref 0 -row-mt 1 -threads 4 -g 300 -bufsize 100k -b:v {bitrateKbps}k -minrate {bitrateKbps}k -maxrate {bitrateKbps}k -drop-threshold 30 -tune-content screen -aq-mode 3",
+      "decoderArguments": "-hwaccel cuda -c:v vp9"
+    },
+    "av2": {
+      "label": "AV2 · 当前 FFmpeg 构建不提供",
+      "enabled": false,
+      "unavailableReason": "当前分发的 FFmpeg 没有 AV2 编解码器；不会回退为其他编码冒充 AV2。后续构建提供后，可在这里填写其真实 -c:v 名称。",
+      "encoderArguments": "",
+      "decoderArguments": ""
+    }
+  }
+}
