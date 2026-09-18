@@ -1,4 +1,4 @@
-# FRD v1.pre5 · 远程桌面 CLI
+# FRD v1.pre6 · 远程桌面 CLI
 
 FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
@@ -49,7 +49,7 @@ using System.Diagnostics;
 
 var executable = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-    "Programs", "FRD", "v1.pre5", "FRD.exe");
+    "Programs", "FRD", "v1.pre6", "FRD.exe");
 var info = new ProcessStartInfo(executable)
 {
     WorkingDirectory = Path.GetDirectoryName(executable),
@@ -78,8 +78,8 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - 修改 EXE 同目录的 `codec-config.json`。`presets` 的 `encoderArguments` / `decoderArguments` 是单行 FFmpeg 参数字符串；支持现有构建和设备提供的 H.264、VP9、AV1、NVENC、QSV 等预设。不支持的预设明确失败。
 - `initialBitrateKbps` 设置初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示；此值限制编码码率，不进行额外链路节流，允许编码缓冲和帧发送突发。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre5\`，不同版本分目录保留。
-- 发布脚本的输出目录为 `artifacts/v1.pre5/`，包含便携 ZIP、README 和 SHA-256。Git 只推送版本标签及其引用的源码提交，不更新远端默认分支；安装包保留本机，不上传 GitHub Releases。
+- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre6\`，不同版本分目录保留。
+- 发布脚本的输出目录为 `artifacts/v1.pre6/`，包含便携 ZIP、README 和 SHA-256。Git 只推送版本标签及其引用的源码提交，不更新远端默认分支；安装包保留本机，不上传 GitHub Releases。
 
 ## 开发与边界
 
@@ -87,13 +87,13 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 
 当前支持 IPv4/IPv6 双栈，为单主控、可信局域网原型，无 NAT 穿透；口令认证不等于传输加密。静止画面不保证零带宽或无损；跨机延迟包含时钟估算误差，GPU 完成不等于物理屏幕扫描完成。键鼠已人工确认，自动键鼠回归保持暂停。
 
-## v1.pre5 界面
+## v1.pre6 界面
 
 - 主控和本机演示使用紧凑控制栏；主控、被控和帮助窗口统一采用 Avalonia Simple 主题。
 - 点击全屏按钮或按 Ctrl+Alt+F11 切换全屏；Ctrl+Alt 退出键鼠转发。启用转发时，单独按 Esc 或 F11 保留远端输入含义。
 - 展开时可拖动控制栏的空白区域，按钮、下拉框和滑条保持正常交互。收起后显示为 50 像素半透明悬浮球，同样可拖动；单击恢复控制栏。两种状态均限制在视口内，窗口缩放或切换全屏时保留当前位置，必要时调整至可见范围。
 - 诊断水印可独立隐藏，保持鼠标穿透且不获取键盘焦点。水印显隐与诊断包开关独立，隐藏水印不会关闭诊断采集或网络诊断包。
 
-以上界面继承自已获人工确认的 v1.pre4。v1.pre5 修复发布后审查发现的修饰键提前释放、关闭监听竞态及状态文案问题，验证状态见本版检查记录。后续问题仍通过递增 pre 版本发布，保留旧标签。自动键鼠注入回归继续保持暂停。
+以上界面继承自已获人工确认的 v1.pre4。v1.pre6 在 pre5 实际完成双机回归后发布，保留 pre5 的修饰键、关闭监听及状态修复；产品功能代码与编码配置不变，双机证据见本版检查记录。后续问题仍通过递增 pre 版本发布，保留旧标签。自动键鼠注入回归继续保持暂停。
 
-进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre5-发布说明.md)、[静态检查](docs/v1.pre5-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre6-发布说明.md)、[静态检查](docs/v1.pre6-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
