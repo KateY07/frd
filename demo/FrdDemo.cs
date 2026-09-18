@@ -2,11 +2,16 @@
 using AVPixelFormat = FFmpeg.AutoGen.AVPixelFormat;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Controls;
+using Avalonia.Data;
+using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Platform;
-using Avalonia.Themes.Fluent;
+using Avalonia.Styling;
+using Avalonia.Themes.Simple;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using Avalonia;
 using Color4 = Vortice.Mathematics.Color4;
 using FFmpeg.AutoGen;
@@ -2095,6 +2100,260 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
     }
 }
 
+// Source: FfmpegControls.cs
+static partial class FfmpegUi
+{
+    sealed partial class DesktopWindow
+    {
+        const double OrbSize = 50, ChromeMargin = 12;
+        readonly Button fullScreen = new() { Name = "FullScreen", Content = "全屏", Padding = new Thickness(10, 4) };
+        readonly CheckBox showWatermark = new() { Name = "ShowWatermark", Content = "诊断水印", IsChecked = true };
+        readonly Button floatingOrb = new()
+        {
+            Name = "FloatingOrb", Content = "FRD", Width = OrbSize, Height = OrbSize,
+            CornerRadius = new CornerRadius(OrbSize / 2), Padding = new Thickness(0), FontSize = 12,
+            Background = new SolidColorBrush(Color.Parse("#BE263445")), Foreground = Brushes.White,
+            BorderBrush = new SolidColorBrush(Color.Parse("#99CAD7E6")), BorderThickness = new Thickness(1),
+            IsVisible = false, Cursor = new Cursor(StandardCursorType.Hand)
+        };
+        readonly Border controlPanel = new() { CornerRadius = new CornerRadius(6), BorderThickness = new Thickness(1), Padding = new Thickness(12, 10) };
+        readonly Grid chromeRoot = new();
+        Point orbFraction = new(1, 0), panelFraction = new(.5, 0), orbDragOrigin;
+        PixelPoint orbPointerOrigin, restorePosition;
+        Size restoreSize;
+        WindowState restoreState = WindowState.Normal;
+        IPointer? orbPointer;
+        bool orbDragged, dragExpanded, chromeOpened, fullScreenKeyHeld;
+
+        void BuildControls()
+        {
+            overlay.FontSize = 12;
+            presets.MinHeight = transmissionScale.MinHeight = 28;
+            presets.Height = transmissionScale.Height = double.NaN;
+            presets.MinWidth = 130;
+            transmissionScale.Width = 110;
+            bitrate.VerticalAlignment = VerticalAlignment.Center;
+            controlTitle.Text = "编码预设"; controlTitle.FontSize = 11; controlTitle.Opacity = .75;
+            inputEnabled.Content = "键鼠"; inputEnabled.Margin = new Thickness(0);
+            clipboardEnabled.Content = "剪贴板"; packetDiagnostics.Margin = new Thickness(0);
+            collapse.Content = "收起"; collapse.MinWidth = 48; collapse.Padding = new Thickness(8, 4);
+            fullScreen.Height = collapse.Height = 28;
+            ToolTip.SetTip(fullScreen, "Ctrl+Alt+F11 切换全屏；Ctrl+Alt 退出键鼠控制");
+            ToolTip.SetTip(collapse, "收起为可拖动的悬浮球");
+            ToolTip.SetTip(floatingOrb, "点击展开控制栏；拖动移动，方向键微调");
+            ToolTip.SetTip(showWatermark, "只隐藏显示，不改变诊断包或统计");
+            ToolTip.SetTip(packetDiagnostics, "主控切换独立诊断包；关闭后跨机延迟不可测");
+            ToolTip.SetTip(clipboardEnabled, clipboardMessage);
+
+            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,110,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
+            controls.Children.Add(controlTitle);
+            var scaleTitle = new TextBlock { Text = "传输比例", FontSize = 11, Opacity = .75 };
+            Grid.SetColumn(bitrateLabel, 2); controls.Children.Add(bitrateLabel);
+            Grid.SetColumn(scaleTitle, 4); controls.Children.Add(scaleTitle);
+            Grid.SetRow(presets, 2); controls.Children.Add(presets);
+            Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 2); controls.Children.Add(bitrate);
+            Grid.SetColumn(transmissionScale, 4); Grid.SetRow(transmissionScale, 2); controls.Children.Add(transmissionScale);
+            Grid.SetColumn(fullScreen, 6); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
+            Grid.SetColumn(collapse, 8); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
+            Add(details, controls, 0);
+            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale =>
+                new ComboBoxItem { Content = scale == 1 ? "1× 原始" : $"{scale}×", Tag = scale }).ToArray();
+            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
+            ToolTip.SetTip(transmissionScale, "传输分辨率比例，与窗口缩放无关");
+            var options = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 4) };
+            foreach (var check in new[] { inputEnabled, clipboardEnabled, showWatermark, packetDiagnostics })
+            {
+                check.FontSize = 12; check.MinHeight = 24; check.Margin = new Thickness(0, 0, 16, 0);
+                options.Children.Add(check);
+            }
+            Add(details, options, 1);
+            operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
+            operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
+            operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
+            Add(details, operation, 2);
+            controlPanel.Child = details;
+            chromeRoot.Children.Add(controlPanel); chromeRoot.Children.Add(floatingOrb);
+            overlay.Content = chromeRoot;
+            ApplyChromeColors();
+
+            var diagnosticBody = new StackPanel { IsHitTestVisible = false, Opacity = .8 };
+            watermark.FontSize = 11; watermark.Foreground = Brushes.White;
+            watermark.Content = new Border
+            {
+                Background = new SolidColorBrush(Color.Parse("#8017202B")),
+                CornerRadius = new CornerRadius(4), Padding = new Thickness(10, 7), Child = diagnosticBody,
+                IsHitTestVisible = false, ClipToBounds = true
+            };
+            summary.FontSize = 12; diagnosticBody.Children.Add(summary);
+            metrics.FontSize = 11; metrics.Margin = new Thickness(0, 3, 0, 4);
+            metrics.Text = "正在启动真实捕获与 FFmpeg…"; diagnosticBody.Children.Add(metrics);
+            diagnosticBody.Children.Add(new TextBlock { Text = "分层耗时：最近 / 近 1 秒平均（ms）", Opacity = .8 });
+            var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
+            for (var i = 0; i < timings.Length; i++)
+            { Grid.SetRow(timings[i], i / 3); Grid.SetColumn(timings[i], i % 3); timingGrid.Children.Add(timings[i]); }
+            diagnosticBody.Children.Add(timingGrid); diagnosticBody.Children.Add(captureDetails);
+            diagnosticBody.Children.Add(new TextBlock
+            {
+                Text = "带宽估计仅供参考；传输含等待与重组。GPU 完成不等于物理扫描；不变像素可保持显示。",
+                TextWrapping = TextWrapping.Wrap, Opacity = .7
+            });
+
+            fullScreen.Click += (_, _) => ToggleFullScreen();
+            void ReleaseShortcut(object? sender, KeyEventArgs args) { if (args.Key == Key.F11) fullScreenKeyHeld = false; }
+            AddHandler(KeyUpEvent, ReleaseShortcut, RoutingStrategies.Tunnel);
+            overlay.AddHandler(KeyUpEvent, ReleaseShortcut, RoutingStrategies.Tunnel);
+            Deactivated += (_, _) => fullScreenKeyHeld = false;
+            overlay.Deactivated += (_, _) => fullScreenKeyHeld = false;
+            showWatermark.IsCheckedChanged += (_, _) => SyncChromeVisibility();
+            floatingOrb.Click += (_, _) => ToggleDetails();
+            chromeRoot.AddHandler(PointerPressedEvent, BeginOrbDrag, RoutingStrategies.Tunnel);
+            chromeRoot.AddHandler(PointerMovedEvent, ContinueOrbDrag, RoutingStrategies.Tunnel);
+            chromeRoot.AddHandler(PointerReleasedEvent, EndOrbDrag, RoutingStrategies.Tunnel);
+            chromeRoot.PointerCaptureLost += (_, _) => orbPointer = null;
+            floatingOrb.KeyDown += (_, args) =>
+            {
+                var delta = args.Key switch { Key.Left => new Point(-10, 0), Key.Right => new Point(10, 0), Key.Up => new Point(0, -10), Key.Down => new Point(0, 10), _ => default };
+                if (delta == default) return;
+                var current = OrbPosition(); MoveOrb(new(current.X + delta.X, current.Y + delta.Y)); args.Handled = true;
+            };
+        }
+
+        void ApplyChromeColors()
+        {
+            var dark = ActualThemeVariant == ThemeVariant.Dark;
+            overlay.RequestedThemeVariant = ActualThemeVariant;
+            overlay.Foreground = new SolidColorBrush(Color.Parse(dark ? "#EDF0F3" : "#20252B"));
+            controlPanel.Background = new SolidColorBrush(Color.Parse(dark ? "#222529" : "#FAFAFA"));
+            controlPanel.BorderBrush = new SolidColorBrush(Color.Parse(dark ? "#484E56" : "#D7DCE1"));
+        }
+
+        void HandleLocalKeyDown(object? sender, KeyEventArgs args)
+        {
+            var firstFullScreenKey = args.Key == Key.F11 && !fullScreenKeyHeld;
+            if (args.Key == Key.F11) fullScreenKeyHeld = true;
+            if ((args.KeyModifiers & (KeyModifiers.Control | KeyModifiers.Alt)) != (KeyModifiers.Control | KeyModifiers.Alt)) return;
+            if (inputEnabled.IsChecked == true) HandleLocalShortcut(0x11);
+            if (args.Key == Key.F11)
+            {
+                if (firstFullScreenKey) HandleLocalShortcut(0x7A);
+                args.Handled = true;
+            }
+        }
+
+        void HandleLocalShortcut(int key)
+        {
+            if (key == 0x7A) ToggleFullScreen();
+            else if (key == 0x11)
+            {
+                if (inputEnabled.IsChecked == true) { preview.SetInputEnabled(false); inputEnabled.IsChecked = false; }
+            }
+        }
+
+        void ToggleFullScreen()
+        {
+            if (stopping) return;
+            if (WindowState != WindowState.FullScreen)
+            {
+                restoreState = WindowState; restoreSize = new(Width, Height); restorePosition = Position;
+                WindowState = WindowState.FullScreen; fullScreen.Content = "退出全屏";
+            }
+            else
+            {
+                WindowState = restoreState; fullScreen.Content = "全屏";
+                if (restoreState == WindowState.Normal)
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (stopping || WindowState != WindowState.Normal) return;
+                        Width = restoreSize.Width; Height = restoreSize.Height; Position = restorePosition; PositionOverlay();
+                    });
+            }
+            PositionOverlay();
+        }
+
+        void ToggleDetails()
+        {
+            details.IsVisible = !details.IsVisible;
+            controlPanel.IsVisible = details.IsVisible;
+            floatingOrb.IsVisible = !details.IsVisible;
+            PositionOverlay();
+        }
+
+        Point OrbPosition() => new(ChromeMargin + orbFraction.X * Math.Max(0, ClientSize.Width - OrbSize - ChromeMargin * 2),
+            ChromeMargin + orbFraction.Y * Math.Max(0, ClientSize.Height - OrbSize - ChromeMargin * 2));
+
+        Point PanelPosition() => new(ChromeMargin + panelFraction.X * Math.Max(0, ClientSize.Width - overlay.Width - ChromeMargin * 2),
+            ChromeMargin + panelFraction.Y * Math.Max(0, ClientSize.Height - overlay.ClientSize.Height - ChromeMargin * 2));
+
+        void MoveControlPanel(Point position)
+        {
+            panelFraction = new(Math.Clamp((position.X - ChromeMargin) / Math.Max(1, ClientSize.Width - overlay.Width - ChromeMargin * 2), 0, 1),
+                Math.Clamp((position.Y - ChromeMargin) / Math.Max(1, ClientSize.Height - overlay.ClientSize.Height - ChromeMargin * 2), 0, 1));
+            PositionOverlay();
+        }
+
+        void MoveOrb(Point position)
+        {
+            orbFraction = new(Math.Clamp((position.X - ChromeMargin) / Math.Max(1, ClientSize.Width - OrbSize - ChromeMargin * 2), 0, 1),
+                Math.Clamp((position.Y - ChromeMargin) / Math.Max(1, ClientSize.Height - OrbSize - ChromeMargin * 2), 0, 1));
+            PositionOverlay();
+        }
+
+        void BeginOrbDrag(object? sender, PointerPressedEventArgs args)
+        {
+            if (orbPointer != null || args.GetCurrentPoint(chromeRoot).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonPressed) return;
+            if (details.IsVisible && args.Source is Visual source && source.GetSelfAndVisualAncestors()
+                .Any(control => control is Button or CheckBox or ComboBox or Slider or TextBox)) return;
+            dragExpanded = details.IsVisible;
+            orbPointerOrigin = overlay.PointToScreen(args.GetPosition(overlay)); orbDragOrigin = dragExpanded ? PanelPosition() : OrbPosition();
+            orbDragged = false; orbPointer = args.Pointer; args.Pointer.Capture(chromeRoot); args.Handled = true;
+        }
+
+        void ContinueOrbDrag(object? sender, PointerEventArgs args)
+        {
+            if (orbPointer != args.Pointer) return;
+            var current = overlay.PointToScreen(args.GetPosition(overlay));
+            var dx = (current.X - orbPointerOrigin.X) / RenderScaling;
+            var dy = (current.Y - orbPointerOrigin.Y) / RenderScaling;
+            if (dx * dx + dy * dy > 16) orbDragged = true;
+            if (orbDragged)
+            {
+                var next = new Point(orbDragOrigin.X + dx, orbDragOrigin.Y + dy);
+                if (dragExpanded) MoveControlPanel(next); else MoveOrb(next);
+            }
+            args.Handled = true;
+        }
+
+        void EndOrbDrag(object? sender, PointerReleasedEventArgs args)
+        {
+            if (orbPointer != args.Pointer || args.InitialPressMouseButton != MouseButton.Left) return;
+            var moved = orbDragged; orbPointer = null; args.Pointer.Capture(null);
+            args.Handled = true;
+            if (!moved && !dragExpanded) ToggleDetails();
+        }
+
+        void SyncChromeVisibility()
+        {
+            if (!chromeOpened || stopping) return;
+            if (WindowState == WindowState.Minimized) { overlay.Hide(); watermark.Hide(); return; }
+            if (!overlay.IsVisible) overlay.Show(this);
+            if (showWatermark.IsChecked == true) { if (!watermark.IsVisible) watermark.Show(this); }
+            else watermark.Hide();
+            PositionOverlay();
+        }
+
+        void PositionOverlay()
+        {
+            if (!overlay.IsVisible || ClientSize.Width <= 0) return;
+            overlay.Width = details.IsVisible ? Math.Max(280, Math.Min(980, ClientSize.Width - ChromeMargin * 2)) : OrbSize;
+            overlay.Position = this.PointToScreen(details.IsVisible ? PanelPosition() : OrbPosition());
+            if (!watermark.IsVisible) return;
+            watermark.Width = Math.Max(280, Math.Min(920, ClientSize.Width - ChromeMargin * 2));
+            watermark.MaxHeight = Math.Max(40, ClientSize.Height - (details.IsVisible ? overlay.ClientSize.Height : 0) - ChromeMargin * 3);
+            watermark.Position = this.PointToScreen(new Point(ChromeMargin, Math.Max(ChromeMargin, ClientSize.Height - watermark.ClientSize.Height - ChromeMargin)));
+        }
+    }
+}
+
 // Source: FfmpegCursor.cs
 public sealed record CursorShape(int Width, int Height, int HotX, int HotY, byte[] Color, byte[] Mask);
 public sealed record CursorUpdate(long Id, bool Visible, double X, double Y, CursorShape? Shape = null, bool Reset = false);
@@ -2548,8 +2807,17 @@ public sealed class RemoteInputServer : IDisposable
         {
             while (!stop.IsCancellationRequested)
             {
-                using var peer = await listener.AcceptTcpClientAsync(stop.Token).ConfigureAwait(false);
-                await ServePeerAsync(injector, peer, stop.Token, Report);
+                TcpClient peer;
+                try { peer = await listener.AcceptTcpClientAsync(stop.Token).ConfigureAwait(false); }
+                catch (Exception error) when (stop.IsCancellationRequested &&
+                    (error is InvalidOperationException ||
+                    error is SocketException { SocketErrorCode: SocketError.OperationAborted or SocketError.Interrupted }))
+                {
+                    // Stop can dispose the socket or clear the listening state before cancellation reaches accept.
+                    InputProtocol.Log("Input listener stopped during accept.");
+                    return;
+                }
+                using (peer) await ServePeerAsync(injector, peer, stop.Token, Report);
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { InputProtocol.Log("Input listener stopped."); }
@@ -2834,7 +3102,7 @@ public sealed class NativeInputSource : IDisposable
     readonly SubclassProcedure procedure;
     readonly nuint id;
     static long nextId;
-    bool enabled, disposed;
+    bool enabled, disposed, localFullscreenKeyDown;
     int heldButtons;
     readonly Dictionary<long, nint> cursors = new();
     nint remoteCursor;
@@ -2866,6 +3134,7 @@ public sealed class NativeInputSource : IDisposable
     }
     public event Action<RemoteInputEvent>? Input;
     public event Action? ExitRequested;
+    public event Action<int>? LocalShortcutRequested;
     public event Action<Exception>? Failed;
 
     public NativeInputSource(nint hwnd)
@@ -2897,15 +3166,31 @@ public sealed class NativeInputSource : IDisposable
             if (enabled && message == 0x0084) return 1;
             if (enabled && hasRemoteCursor && message == 0x0020 && ((long)lParam & 0xFFFF) == 1)
             { NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0); return 1; }
-            if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
+            if (message == 0x0008) localFullscreenKeyDown = false;
+            if (GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker &&
+                message is 0x0100 or 0x0101 or 0x0104 or 0x0105)
             {
-                if (message is 0x0100 or 0x0104 && wParam == 0x1B)
+                var keyDown = message is 0x0100 or 0x0104;
+                var controlAlt = GetKeyState(0x11) < 0 && GetKeyState(0x12) < 0;
+                if (keyDown && controlAlt && enabled)
                 {
                     SetEnabled(false);
                     Input?.Invoke(new(RemoteInputKind.ReleaseAll));
                     ExitRequested?.Invoke();
+                }
+                if (wParam == 0x7A && (controlAlt || localFullscreenKeyDown))
+                {
+                    localFullscreenKeyDown = keyDown;
+                    if (keyDown && controlAlt && ((long)lParam & (1L << 30)) == 0)
+                    {
+                        LocalShortcutRequested?.Invoke(0x7A);
+                    }
                     return 0;
                 }
+                if (keyDown && controlAlt && wParam is 0x11 or 0x12 or 0xA2 or 0xA3 or 0xA4 or 0xA5) return 0;
+            }
+            if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
+            {
                 if (message is 0x0100 or 0x0101 or 0x0104 or 0x0105)
                 {
                     var scanCode = (int)(((long)lParam >> 16) & 0xFF);
@@ -2971,6 +3256,7 @@ public sealed class NativeInputSource : IDisposable
     [DllImport("user32.dll")] static extern nint GetCapture();
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ReleaseCapture();
     [DllImport("user32.dll")] static extern nint GetMessageExtraInfo();
+    [DllImport("user32.dll")] static extern short GetKeyState(int virtualKey);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool GetClientRect(nint hwnd, out NativeRect rect);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ScreenToClient(nint hwnd, ref NativePoint point);
 }
@@ -3010,12 +3296,12 @@ static partial class FfmpegUi
                 await Until(() => preview.VideoWidth == session.Configuration.Width && receivedFrames >= 3);
                 foreach (var cap in new[] { .5m, 5m, 10m, 20m, 5m })
                 {
-                    if (cap > bitrateLabel.Maximum) continue;
+                    if ((double)cap > bitrate.Maximum) continue;
                     var before = receivedFrames;
-                    bitrateLabel.Value = cap;
+                    bitrate.Value = (double)cap;
                     await Until(() => !applying && pendingStatus?.AppliedLimitKbps == (int)(cap * 1000) && receivedFrames > before);
-                    Check(Math.Abs(bitrate.Value - (double)cap) < .00001 && bitrateLabel.Value == cap,
-                        "Mbps numeric input, slider and sender acknowledgement " + cap, new { Mbps = cap, SenderKbps = pendingStatus?.AppliedLimitKbps });
+                    Check(Math.Abs(bitrate.Value - (double)cap) < .00001 && bitrateLabel.Text == $"码率上限 · {cap:0.0##} Mbps",
+                        "Mbps slider, label and sender acknowledgement " + cap, new { Mbps = cap, SenderKbps = pendingStatus?.AppliedLimitKbps });
                 }
                 if (details.IsVisible) ToggleDetails();
                 var bounds = Win32InputInjector.ReadPrimaryMonitor();
@@ -3073,9 +3359,9 @@ static partial class FfmpegUi
                 await SetInputAsync(true);
                 SendMessage(preview.SourceWindow, 0x0100, 0x10, (nint)(0x2A << 16 | 1));
                 await Task.Delay(120);
-                SendMessage(preview.SourceWindow, 0x0100, 0x1B, (nint)(1 << 16 | 1));
+                HandleLocalShortcut(0x11);
                 await Until(() => inputClient?.Enabled == false);
-                Check(inputEnabled.IsChecked == false, "Escape exits control and releases held input");
+                Check(inputEnabled.IsChecked == false, "Exit shortcut handler releases held input");
                 Check(inputRejected == 0, "No injected input rejected", new { inputSent, inputRejected });
                 Check(cursorClient is { Updates: > 0, Shapes: >= 3 }, "Cursor shape feedback is independent of video", new { cursorClient?.Updates, cursorClient?.Shapes });
                 }
@@ -3163,6 +3449,7 @@ public sealed class ConfirmedVideoView : NativeControlHost
     public event Action<Exception>? Failed;
     public event Action<RemoteInputEvent>? Input;
     public event Action? InputExitRequested;
+    public event Action<int>? LocalShortcutRequested;
     public nint SourceWindow => sourceWindow;
     public int VideoWidth => Volatile.Read(ref sourceWidth);
     public int VideoHeight => Volatile.Read(ref sourceHeight);
@@ -3213,6 +3500,7 @@ public sealed class ConfirmedVideoView : NativeControlHost
         inputSource = new(hwnd);
         inputSource.Input += value => Input?.Invoke(value);
         inputSource.ExitRequested += () => { inputEnabled = false; InputExitRequested?.Invoke(); };
+        inputSource.LocalShortcutRequested += key => LocalShortcutRequested?.Invoke(key);
         inputSource.Failed += Report;
         inputSource.SetEnabled(inputEnabled);
         lock (gate)
@@ -4265,7 +4553,7 @@ static class RemoteLaunch
     sealed class HostApplication : Application
     {
         public static Func<Window>? Factory;
-        public override void Initialize() => Styles.Add(new FluentTheme());
+        public override void Initialize() => Styles.Add(new SimpleTheme());
         public override void OnFrameworkInitializationCompleted()
         {
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop) desktop.MainWindow = Factory!();
@@ -4943,7 +5231,7 @@ static partial class FfmpegUi
 
     sealed class DemoApplication : Application
     {
-        public override void Initialize() => Styles.Add(new FluentTheme());
+        public override void Initialize() => Styles.Add(new SimpleTheme());
         public override void OnFrameworkInitializationCompleted()
         {
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
@@ -4964,17 +5252,16 @@ static partial class FfmpegUi
         readonly ComboBox presets = new() { Name = "EncoderPreset", HorizontalAlignment = HorizontalAlignment.Stretch };
         readonly ComboBox transmissionScale = new() { Name = "TransmissionScale", Width = 165, IsEnabled = false };
         readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = .1, Maximum = 100, TickFrequency = .1, IsSnapToTickEnabled = true };
-        readonly NumericUpDown bitrateLabel = new() { Name = "BitrateValueMbps", Minimum = .1m, Maximum = 100m, Increment = .1m, FormatString = "0.0##", Width = 115 };
-        bool updatingBitrate;
+        readonly TextBlock bitrateLabel = new() { Name = "BitrateValueMbps", FontSize = 11, Opacity = .75 };
         readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
         readonly TextBlock operation = new() { TextWrapping = TextWrapping.Wrap };
         readonly TextBlock captureDetails = new() { TextWrapping = TextWrapping.Wrap, Opacity = .8, Margin = new Thickness(0, 4, 0, 6) };
         readonly TextBlock summary = new() { Text = "FRD · 真实屏幕 / FFmpeg / UDP", VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
         readonly TextBlock[] timings = Enumerable.Range(0, 6).Select(_ => new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 8, 3) }).ToArray();
-        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto") };
         readonly DiagnosticWatermark watermark = new();
         readonly TextBlock controlTitle = new() { Text = "FRD 控制", VerticalAlignment = VerticalAlignment.Center };
-        readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Esc 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
+        readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Ctrl+Alt 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
         readonly CheckBox packetDiagnostics = new() { Name = "PacketDiagnostics", Content = "诊断包", IsEnabled = false, Margin = new Thickness(8, 0) };
         readonly CheckBox clipboardEnabled = new() { Name = "ClipboardSync", Content = "剪贴板同步（文本、文件、目录）", IsEnabled = false };
         readonly TextBlock clipboardMessage = new() { Text = "关闭；开启后同步两端新复制的内容", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 0) };
@@ -4983,7 +5270,6 @@ static partial class FfmpegUi
         {
             Title = "FRD 控制栏", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
             ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.Height,
-            RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark,
             Background = Brushes.Transparent, TransparencyLevelHint = [WindowTransparencyLevel.Transparent]
         };
         readonly ConfirmedVideoView preview = new() { Name = "ReceivedVideo" };
@@ -5027,60 +5313,13 @@ static partial class FfmpegUi
             preview.Failed += ex => { if (Dispatcher.UIThread.CheckAccess()) ReportError(ex); else Dispatcher.UIThread.Post(() => ReportError(ex)); };
             preview.Input += QueueInput;
             preview.InputExitRequested += () => inputEnabled.IsChecked = false;
+            preview.LocalShortcutRequested += HandleLocalShortcut;
             Title = autoCloseSeconds > 0 ? "FRD — 自动回归（完成后关闭）" : "FRD — FFmpeg 真实屏幕 / localhost UDP";
-            if (remote != null) { Title = $"FRD 主控端 — {remote.Host}:{remote.Port}"; ToolTip.SetTip(inputEnabled, "转发到被控端；Esc 退出并释放按键。"); }
-            Width = 1280; Height = 860; MinWidth = 780; MinHeight = 520; CanResize = true;
+            if (remote != null) { Title = $"FRD 主控端 — {remote.Host}:{remote.Port}"; ToolTip.SetTip(inputEnabled, "转发到被控端；Ctrl+Alt 退出并释放按键。"); }
+            Width = 1280; Height = 860; MinWidth = 680; MinHeight = 460; CanResize = true;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Content = new Border { Background = Brushes.Black, Child = preview };
-            var header = new Grid { ColumnDefinitions = new("*,Auto,Auto,Auto") };
-            header.Children.Add(controlTitle); Grid.SetColumn(inputEnabled, 1); header.Children.Add(inputEnabled);
-            Grid.SetColumn(packetDiagnostics, 2); header.Children.Add(packetDiagnostics);
-            Grid.SetColumn(collapse, 3); header.Children.Add(collapse);
-            var panel = new StackPanel(); panel.Children.Add(header); panel.Children.Add(details);
-            overlay.Content = new Border
-            {
-                Background = new SolidColorBrush(Color.Parse("#EE17202B")), BorderBrush = new SolidColorBrush(Color.Parse("#556B829B")),
-                BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Child = panel
-            };
-            overlay.Foreground = Brushes.Gainsboro;
-            var controls = new Grid { ColumnDefinitions = new("260,16,*,125"), RowDefinitions = new("Auto,Auto"), Margin = new Thickness(0, 0, 0, 8) };
-            controls.Children.Add(new TextBlock { Text = "主控端手动选择编码预设", Margin = new Thickness(0, 0, 0, 5) });
-            Grid.SetRow(presets, 1); controls.Children.Add(presets);
-            var capTitle = new TextBlock { Text = "编码码率上限（Mbps）· 可拖动或直接输入", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) };
-            Grid.SetColumn(capTitle, 2); Grid.SetColumnSpan(capTitle, 2); controls.Children.Add(capTitle);
-            Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 1); controls.Children.Add(bitrate);
-            bitrateLabel.VerticalAlignment = VerticalAlignment.Center; bitrateLabel.HorizontalAlignment = HorizontalAlignment.Right;
-            Grid.SetColumn(bitrateLabel, 3); Grid.SetRow(bitrateLabel, 1); controls.Children.Add(bitrateLabel);
-            Add(details, controls, 0);
-            var diagnostics = new StackPanel { IsHitTestVisible = false, Opacity = .8 };
-            diagnostics.Children.Add(summary);
-            watermark.FontSize = 12; watermark.Foreground = Brushes.White;
-            watermark.Content = new Border
-            {
-                Background = new SolidColorBrush(Color.Parse("#6017202B")),
-                CornerRadius = new CornerRadius(6), Padding = new Thickness(10), Child = diagnostics,
-                IsHitTestVisible = false, ClipToBounds = true
-            };
-            metrics.Margin = new Thickness(0, 4, 0, 5); metrics.Text = "正在启动真实捕获与 FFmpeg…";
-            diagnostics.Children.Add(metrics);
-            diagnostics.Children.Add(new TextBlock { Text = "分层耗时：最近一帧 / 近 1 秒平均（ms）；无新样本显示 —", Opacity = .8 });
-            var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
-            for (var i = 0; i < timings.Length; i++) { Grid.SetRow(timings[i], i / 3); Grid.SetColumn(timings[i], i % 3); timingGrid.Children.Add(timings[i]); }
-            diagnostics.Children.Add(timingGrid); diagnostics.Children.Add(captureDetails); Add(details, operation, 1);
-            var clipboardRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 5, 0, 0) };
-            clipboardRow.Children.Add(clipboardEnabled); Grid.SetColumn(clipboardMessage, 1); clipboardRow.Children.Add(clipboardMessage);
-            Add(details, clipboardRow, 2);
-            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale => new ComboBoxItem { Content = scale == 1 ? "1× 原始分辨率" : $"{scale}× 宽高", Tag = scale }).ToArray();
-            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
-            var scaleRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 6, 0, 0) };
-            scaleRow.Children.Add(transmissionScale);
-            var scaleHelp = new TextBlock { Text = "传输比例 · 与主控窗口缩放无关", Margin = new Thickness(12, 0), VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
-            Grid.SetColumn(scaleHelp, 1); scaleRow.Children.Add(scaleHelp); Add(details, scaleRow, 3);
-            diagnostics.Children.Add(new TextBlock
-            {
-                Text = "带宽估计仅供参考。传输含限速与重组，渲染含等待绘制；GPU 完成不等于物理扫描。相同像素保持显示，静止绘制 FPS 可为 0。",
-                TextWrapping = TextWrapping.Wrap, Opacity = .7, Margin = new Thickness(0, 8, 0, 0)
-            });
+            BuildControls();
 
             var entries = config.Presets.Select(pair =>
             {
@@ -5090,19 +5329,14 @@ static partial class FfmpegUi
             }).ToArray();
             presets.ItemsSource = entries;
             presets.SelectedItem = entries.FirstOrDefault(item => Equals(item.Tag, config.InitialPreset));
-            bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+            bitrate.Maximum = config.MaximumBitrateMbps;
             bitrate.Value = Math.Clamp(config.InitialBitrateKbps / 1000d, .1, config.MaximumBitrateMbps); UpdateBitrateLabel();
-            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = false;
+            presets.IsEnabled = bitrate.IsEnabled = false;
             presets.SelectionChanged += (_, _) => ScheduleApply();
             transmissionScale.SelectionChanged += (_, _) => ScheduleApply();
             bitrate.PropertyChanged += (_, args) =>
             {
                 if (args.Property == Slider.ValueProperty) { UpdateBitrateLabel(); ScheduleApply(); }
-            };
-            bitrateLabel.ValueChanged += (_, _) =>
-            {
-                if (updatingBitrate || bitrateLabel.Value is not { } value) return;
-                bitrate.Value = Math.Clamp((double)value, bitrate.Minimum, bitrate.Maximum);
             };
             refresh.Tick += (_, _) => RefreshStatus();
             debounce.Tick += (_, _) => ApplySelection();
@@ -5120,8 +5354,8 @@ static partial class FfmpegUi
                 }
             };
             packetDiagnostics.IsCheckedChanged += (_, _) => ChangeDiagnostics();
-            AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-            overlay.AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            AddHandler(Avalonia.Input.InputElement.KeyDownEvent, HandleLocalKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+            overlay.AddHandler(Avalonia.Input.InputElement.KeyDownEvent, HandleLocalKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
             overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "控制栏"); PositionOverlay(); };
             watermark.Opened += (_, _) => { ExcludeFromCapture(watermark, "诊断水印"); PositionOverlay(); };
             overlay.SizeChanged += (_, _) => PositionOverlay();
@@ -5131,82 +5365,15 @@ static partial class FfmpegUi
             PropertyChanged += (_, args) =>
             {
                 if (args.Property == ClientSizeProperty || args.Property == BoundsProperty) PositionOverlay();
-                if (args.Property == WindowStateProperty && WindowState == WindowState.Minimized) { overlay.Hide(); watermark.Hide(); }
-                else if (args.Property == WindowStateProperty && started && !stopping && WindowState != WindowState.Minimized)
-                { if (!watermark.IsVisible) watermark.Show(this); if (!overlay.IsVisible) overlay.Show(this); PositionOverlay(); }
+                if (args.Property == WindowStateProperty) SyncChromeVisibility();
+                if (args.Property == ActualThemeVariantProperty) ApplyChromeColors();
             };
             Opened += Start;
             Closing += Shutdown;
         }
 
         static void Add(Grid grid, Control child, int row) { Grid.SetRow(child, row); grid.Children.Add(child); }
-        void UpdateBitrateLabel() { updatingBitrate = true; bitrateLabel.Value = (decimal)bitrate.Value; updatingBitrate = false; }
-
-        void ExitInputOnEscape(object? sender, Avalonia.Input.KeyEventArgs args)
-        {
-            if (args.Key != Avalonia.Input.Key.Escape || inputEnabled.IsChecked != true) return;
-            preview.SetInputEnabled(false); inputEnabled.IsChecked = false; args.Handled = true;
-        }
-
-        void ToggleDetails()
-        {
-            details.IsVisible = !details.IsVisible; collapse.Content = details.IsVisible ? "收起 ▴" : "展开 ▾"; PositionOverlay();
-        }
-
-        async Task VerifyOverlayAsync()
-        {
-            await Task.Delay(100);
-            if (stopping) return;
-            var expanded = overlay.ClientSize.Height;
-            var expandedBounds = CheckOverlayBounds(true);
-            ToggleDetails(); await Task.Delay(100);
-            if (stopping) return;
-            var folded = overlay.ClientSize.Height;
-            var foldedBounds = CheckOverlayBounds(false);
-            var keptToggle = overlay.IsVisible && collapse.IsVisible && !details.IsVisible;
-            ToggleDetails(); await Task.Delay(100);
-            if (stopping) return;
-            var nativeOwner = GetWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0, 4) == (TryGetPlatformHandle()?.Handle ?? 0);
-            var passThrough = watermark.VerifyPassThrough(preview.SourceWindow);
-            overlayPassed = nativeOwner && passThrough && keptToggle && folded > 0 && folded < expanded && details.IsVisible && expandedBounds.Passed && foldedBounds.Passed;
-            overlayCheck = new { Passed = overlayPassed, WatermarkMouseTransparent = passThrough, WatermarkCannotActivate = passThrough, WatermarkOpacity = .8, NativeOwnedWindow = nativeOwner, ExpandedHeight = expanded, CollapsedHeight = folded, CollapseButtonRemainsVisible = keptToggle, ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds };
-            if (!overlayPassed) throw new InvalidOperationException("真实浮层或折叠布局验证失败");
-        }
-
-        sealed record OverlayBounds(bool Passed, bool InsidePreview, bool ControlsInsideOverlay, double Width, double Height);
-
-        OverlayBounds CheckOverlayBounds(bool expanded)
-        {
-            var origin = overlay.PointToScreen(new Point());
-            var outerOrigin = this.PointToScreen(new Point());
-            var width = overlay.ClientSize.Width * overlay.RenderScaling;
-            var height = overlay.ClientSize.Height * overlay.RenderScaling;
-            var inside = origin.X >= outerOrigin.X - 1 && origin.Y >= outerOrigin.Y - 1 &&
-                origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
-                origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
-            Control[] controls = expanded ? [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel, clipboardEnabled, transmissionScale] : [controlTitle, inputEnabled, packetDiagnostics, collapse];
-            var contentInside = controls.All(control =>
-            {
-                var point = control.PointToScreen(new Point());
-                return point.X >= origin.X - 1 && point.Y >= origin.Y - 1 &&
-                    point.X + control.Bounds.Width * overlay.RenderScaling <= origin.X + width + 1 &&
-                    point.Y + control.Bounds.Height * overlay.RenderScaling <= origin.Y + height + 1;
-            });
-            return new(inside && contentInside, inside, contentInside, overlay.ClientSize.Width, overlay.ClientSize.Height);
-        }
-
-        void PositionOverlay()
-        {
-            if (!overlay.IsVisible || ClientSize.Width <= 0) return;
-            overlay.Width = Math.Max(340, Math.Min(details.IsVisible ? 1100 : 750, ClientSize.Width - 24));
-            overlay.Position = this.PointToScreen(new Point(Math.Max(12, (ClientSize.Width - overlay.Width) / 2), 12));
-            if (watermark.IsVisible)
-            {
-                watermark.Width = Math.Max(340, Math.Min(1100, ClientSize.Width - 24));
-                watermark.MaxHeight = Math.Max(40, ClientSize.Height - overlay.ClientSize.Height - 36);
-                watermark.Position = this.PointToScreen(new Point(12, Math.Max(12, ClientSize.Height - watermark.ClientSize.Height - 12)));
-            }
-        }
+        void UpdateBitrateLabel() => bitrateLabel.Text = $"码率上限 · {bitrate.Value:0.0##} Mbps";
 
         void ExcludeFromCapture(Window window, string description)
         {
@@ -5217,7 +5384,7 @@ static partial class FfmpegUi
         async void Start(object? sender, EventArgs args)
         {
             ExcludeFromCapture(this, "预览窗口");
-            watermark.Show(this); overlay.Show(this); PositionOverlay();
+            chromeOpened = true; SyncChromeVisibility();
             refresh.Start();
             try
             {
@@ -5234,7 +5401,7 @@ static partial class FfmpegUi
                 if (remoteOptions != null)
                 {
                     config = session.Configuration;
-                    bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+                    bitrate.Maximum = config.MaximumBitrateMbps;
                     bitrate.Value = config.InitialBitrateKbps / 1000d;
                     presets.ItemsSource = config.Presets.Select(entry => new ComboBoxItem
                         { Content = entry.Value.Label, Tag = entry.Key, IsEnabled = entry.Value.Enabled }).ToArray();
@@ -5251,7 +5418,7 @@ static partial class FfmpegUi
                         catch (Exception error) { ReportError(error); }
                     }), error => Dispatcher.UIThread.Post(() => ReportError(error)), inputStop.Token);
                 if (stopping) return;
-                started = true; presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = true;
+                started = true; presets.IsEnabled = bitrate.IsEnabled = transmissionScale.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
                 clipboardEnabled.IsEnabled = session.IsRemote;
                 if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
@@ -5364,7 +5531,7 @@ static partial class FfmpegUi
                 if (enabled && stopping) { await inputClient.SetEnabledAsync(false); enabled = false; }
                 preview.SetInputEnabled(enabled);
                 updatingInput = true; inputEnabled.IsChecked = enabled; updatingInput = false;
-                operation.Text = enabled ? "键鼠转发已启用，按 Esc 退出。本机共用桌面，目标若是预览窗口会被拒绝；预览获得焦点时无法同时作为被控键盘目标。双机控制需独立桌面。" : "键鼠转发已关闭，按键已释放。";
+                operation.Text = enabled ? "键鼠转发已启用，按 Ctrl+Alt 退出。本机共用桌面，目标若是预览窗口会被拒绝；预览获得焦点时无法同时作为被控键盘目标。双机控制需独立桌面。" : "键鼠转发已关闭，按键已释放。";
             }
             catch
             {
@@ -5511,7 +5678,7 @@ static partial class FfmpegUi
             args.Cancel = true;
             if (stopping) return;
             stopping = true; debounce.Stop(); autoClose.Stop();
-            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            presets.IsEnabled = bitrate.IsEnabled = transmissionScale.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
             try { await SetClipboardAsync(false); } catch (Exception ex) { ReportError(ex); }
             try { if (cursorClient != null) await cursorClient.DisposeAsync(); } catch (Exception ex) { ReportError(ex); }
             try { await StopInputAsync(); } catch (Exception ex) { ReportError(ex); }
@@ -5675,6 +5842,304 @@ static partial class FfmpegUi
             var passed = view.Bounds.Width > 0 && view.Bounds.Height > 0 && Math.Abs(actual - expected) < .005;
             assertions.Add(new { Stage = stage, WindowWidth = Width, WindowHeight = Height, ViewWidth = view.Bounds.Width, ViewHeight = view.Bounds.Height, ExpectedAspect = expected, ActualAspect = actual, Passed = passed });
             if (!passed) throw new InvalidOperationException($"{stage}: rendered view has aspect {actual}, expected {expected}.");
+        }
+    }
+}
+
+// Source: FfmpegUiRegression.cs
+static partial class FfmpegUi
+{
+    sealed partial class DesktopWindow
+    {
+        async Task VerifyOverlayAsync()
+        {
+            await Task.Delay(100);
+            if (stopping) return;
+            var originalState = WindowState;
+            var originalSize = new Size(Width, Height);
+            var originalPosition = Position;
+            var originalExpanded = details.IsVisible;
+            var originalOrbFraction = orbFraction;
+            var originalPanelFraction = panelFraction;
+            var originalWatermark = showWatermark.IsChecked;
+            var originalDiagnostics = packetDiagnostics.IsChecked;
+            var originalConfiguration = JsonSerializer.Serialize(session?.Configuration, AppConfiguration.JsonOptions);
+            var layouts = new List<object>();
+            OverlayBounds? expandedBounds = null, foldedBounds = null;
+            var expandedHeight = 0d;
+            var foldedHeight = 0d;
+            var nativeOwner = false;
+            var passThrough = false;
+            var keptOrb = false;
+            var edgeClamping = false;
+            var resizeRetainedOrb = false;
+            var panelEdgeClamping = false;
+            var resizeRetainedPanel = false;
+            var collapseRetainedPanel = false;
+            var watermarkHideIndependent = false;
+            var watermarkHideSurvivesRestore = false;
+            var normalFullScreenRestored = false;
+            var maximizedFullScreenRestored = false;
+            overlayPassed = false;
+
+            object Report(string? failure = null) => new
+            {
+                Passed = overlayPassed, Failure = failure,
+                WatermarkMouseTransparent = passThrough, WatermarkCannotActivate = passThrough,
+                WatermarkOpacity = .8, NativeOwnedWindow = nativeOwner,
+                ExpandedHeight = expandedHeight, CollapsedHeight = foldedHeight,
+                CollapseButtonRemainsVisible = keptOrb, FloatingOrbRemainsVisible = keptOrb,
+                OrbEdgeClamping = edgeClamping, OrbAccessibleAfterResize = resizeRetainedOrb,
+                PanelEdgeClamping = panelEdgeClamping, PanelAccessibleAfterResize = resizeRetainedPanel,
+                PanelPositionSurvivesCollapse = collapseRetainedPanel,
+                WatermarkHideIndependent = watermarkHideIndependent,
+                WatermarkHideSurvivesRestore = watermarkHideSurvivesRestore,
+                NormalFullScreenRestored = normalFullScreenRestored,
+                MaximizedFullScreenRestored = maximizedFullScreenRestored,
+                ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds,
+                LayoutChecks = layouts
+            };
+
+            void Require(bool passed, string message)
+            {
+                if (!passed) throw new InvalidOperationException("真实控制浮层回归失败：" + message);
+            }
+
+            async Task SettleAsync(Func<bool> ready, string message)
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(2);
+                do
+                {
+                    if (stopping) throw new OperationCanceledException("控制浮层回归期间窗口已关闭。");
+                    PositionOverlay();
+                    await Task.Delay(200);
+                    if (ready()) return;
+                }
+                while (DateTime.UtcNow < deadline);
+                Require(false, message);
+            }
+
+            OverlayBounds CheckLayout(string scenario, bool expanded)
+            {
+                var bounds = CheckOverlayBounds(expanded);
+                layouts.Add(new { Scenario = scenario, RequestedWidth = Width, RequestedHeight = Height, ClientSize.Width, ClientSize.Height, Bounds = bounds });
+                Require(bounds.Passed, $"{scenario}：浮层、可见控件或悬浮球超出可操作范围。{JsonSerializer.Serialize(bounds)}");
+                return bounds;
+            }
+
+            bool ConfigurationUnchanged() => packetDiagnostics.IsChecked == originalDiagnostics &&
+                JsonSerializer.Serialize(session?.Configuration, AppConfiguration.JsonOptions) == originalConfiguration;
+
+            bool WatermarkVisible() => watermark.IsVisible && IsRegressionWindowVisible(watermark.TryGetPlatformHandle()?.Handle ?? 0);
+            bool WatermarkHidden() => !watermark.IsVisible && !IsRegressionWindowVisible(watermark.TryGetPlatformHandle()?.Handle ?? 0);
+
+            bool PanelAtFraction(Point fraction)
+            {
+                var expected = this.PointToScreen(new Point(
+                    ChromeMargin + fraction.X * Math.Max(0, ClientSize.Width - overlay.ClientSize.Width - ChromeMargin * 2),
+                    ChromeMargin + fraction.Y * Math.Max(0, ClientSize.Height - overlay.ClientSize.Height - ChromeMargin * 2)));
+                var actual = overlay.PointToScreen(new Point());
+                return Math.Abs(actual.X - expected.X) <= 2 && Math.Abs(actual.Y - expected.Y) <= 2;
+            }
+
+            async Task<bool> CheckFullScreenAsync(WindowState priorState)
+            {
+                var size = ClientSize;
+                var width = Width;
+                var height = Height;
+                var position = Position;
+                ToggleFullScreen();
+                await SettleAsync(() => WindowState == WindowState.FullScreen && CheckOverlayBounds(true).Passed,
+                    $"{priorState} 状态未进入可操作的全屏布局。");
+                CheckLayout($"fullscreen-from-{priorState}", true);
+                ToggleFullScreen();
+                await SettleAsync(() => WindowState == priorState &&
+                    Math.Abs(ClientSize.Width - size.Width) <= 2 && Math.Abs(ClientSize.Height - size.Height) <= 2 &&
+                    Math.Abs(Width - width) <= 2 && Math.Abs(Height - height) <= 2 &&
+                    Math.Abs(Position.X - position.X) <= 2 && Math.Abs(Position.Y - position.Y) <= 2 && CheckOverlayBounds(true).Passed,
+                    $"退出全屏后未还原 {priorState} 的状态、尺寸和位置。");
+                CheckLayout($"fullscreen-restored-{priorState}", true);
+                return true;
+            }
+
+            try
+            {
+                if (WindowState == WindowState.FullScreen) ToggleFullScreen();
+                WindowState = WindowState.Normal;
+                if (!details.IsVisible) ToggleDetails();
+                showWatermark.IsChecked = true;
+                foreach (var size in new[] { new Size(1280, 860), new Size(780, 520), new Size(980, 600), new Size(680, 460) })
+                {
+                    Width = size.Width; Height = size.Height;
+                    await SettleAsync(() => overlay.IsVisible && WatermarkVisible() && CheckOverlayBounds(true).Passed,
+                        $"{size.Width}×{size.Height} 展开布局中的控件被裁切。");
+                    var bounds = CheckLayout($"expanded-{size.Width}x{size.Height}", true);
+                    SaveChromePreview($"controls-{size.Width}");
+                    if (expandedHeight == 0) { expandedHeight = bounds.Height; expandedBounds = bounds; }
+                }
+
+                var ownerHandle = TryGetPlatformHandle()?.Handle ?? 0;
+                var overlayHandle = overlay.TryGetPlatformHandle()?.Handle ?? 0;
+                nativeOwner = ownerHandle != 0 && overlayHandle != 0 && GetWindow(overlayHandle, 4) == ownerHandle;
+                Require(nativeOwner, "控制栏不是预览窗口的原生从属窗口。");
+                passThrough = watermark.VerifyPassThrough(preview.SourceWindow);
+                Require(passThrough, "诊断水印必须鼠标穿透且不能激活。");
+
+                Width = 1280; Height = 860;
+                await SettleAsync(() => CheckOverlayBounds(true).Passed, "工具栏拖动测试前布局无效。");
+                MoveControlPanel(new Point(-100000, -100000));
+                await SettleAsync(() => CheckOverlayBounds(true).Passed && PanelAtFraction(new Point()),
+                    "工具栏拖至左上方后未限制到窗口内边界。");
+                CheckLayout("panel-clamped-top-left", true);
+                Require(panelFraction == new Point(), "工具栏左上越界位置未正确限制。");
+                MoveControlPanel(new Point(100000, 100000));
+                await SettleAsync(() => CheckOverlayBounds(true).Passed && PanelAtFraction(new Point(1, 1)),
+                    "工具栏拖至右下方后未限制到窗口内边界。");
+                CheckLayout("panel-clamped-bottom-right", true);
+                panelEdgeClamping = panelFraction == new Point(1, 1);
+                Require(panelEdgeClamping, "工具栏右下越界位置未正确限制。");
+                var movedPanelFraction = panelFraction;
+                Width = 680; Height = 460;
+                await SettleAsync(() => CheckOverlayBounds(true).Passed && PanelAtFraction(movedPanelFraction),
+                    "缩小到最小窗口后工具栏无法操作或丢失拖动位置。");
+                CheckLayout("panel-after-minimum-resize", true);
+                resizeRetainedPanel = panelFraction == movedPanelFraction;
+                Require(resizeRetainedPanel, "窗口缩放未保留工具栏位置。");
+                Width = 980; Height = 600;
+                await SettleAsync(() => CheckOverlayBounds(true).Passed && PanelAtFraction(movedPanelFraction),
+                    "重新放大窗口后工具栏丢失拖动位置。");
+                CheckLayout("panel-after-grow", true);
+
+                ToggleDetails();
+                await SettleAsync(() => CheckOverlayBounds(false).Passed, "收起后未形成独立的 50×50 悬浮球。");
+                var folded = CheckLayout("collapsed", false);
+                SaveChromePreview("orb");
+                foldedHeight = folded.Height; foldedBounds = folded;
+                keptOrb = floatingOrb.IsEffectivelyVisible && overlay.IsVisible && !details.IsVisible && !controlPanel.IsVisible;
+                Require(keptOrb && foldedHeight < expandedHeight, "收起后仍存在工具栏，或缺少可点击的悬浮球。");
+
+                MoveOrb(new Point(-100000, -100000));
+                await SettleAsync(() => CheckOverlayBounds(false).Passed, "悬浮球移至左上方后未限制到窗口内。");
+                CheckLayout("orb-clamped-top-left", false);
+                Require(orbFraction.X == 0 && orbFraction.Y == 0, "悬浮球左上越界位置未正确限制。");
+                MoveOrb(new Point(100000, 100000));
+                await SettleAsync(() => CheckOverlayBounds(false).Passed, "悬浮球移至右下方后未限制到窗口内。");
+                CheckLayout("orb-clamped-bottom-right", false);
+                edgeClamping = orbFraction.X == 1 && orbFraction.Y == 1;
+                Require(edgeClamping, "悬浮球右下越界位置未正确限制。");
+                var movedFraction = orbFraction;
+                Width = 680; Height = 460;
+                await SettleAsync(() => CheckOverlayBounds(false).Passed, "缩小窗口后悬浮球无法操作。");
+                CheckLayout("orb-after-resize", false);
+                resizeRetainedOrb = orbFraction == movedFraction && floatingOrb.IsEffectivelyVisible;
+                Require(resizeRetainedOrb, "窗口缩放未保留悬浮球位置。");
+                ToggleDetails();
+                await SettleAsync(() => CheckOverlayBounds(true).Passed && PanelAtFraction(movedPanelFraction),
+                    "悬浮球展开后控件被裁切或工具栏丢失拖动位置。");
+                CheckLayout("expanded-after-orb-move", true);
+                collapseRetainedPanel = panelFraction == movedPanelFraction;
+                Require(collapseRetainedPanel, "收起、移动悬浮球并展开后工具栏未保留拖动位置。");
+
+                showWatermark.IsChecked = false;
+                await SettleAsync(() => WatermarkHidden(), "关闭诊断水印后窗口仍可见。");
+                watermarkHideIndependent = ConfigurationUnchanged();
+                Require(watermarkHideIndependent, "隐藏水印改变了诊断包开关或会话配置。");
+                WindowState = WindowState.Minimized;
+                await SettleAsync(() => WindowState == WindowState.Minimized, "窗口无法最小化。");
+                WindowState = WindowState.Normal;
+                await SettleAsync(() => WindowState == WindowState.Normal && overlay.IsVisible && CheckOverlayBounds(true).Passed,
+                    "最小化恢复后控制浮层未恢复。");
+                watermarkHideSurvivesRestore = showWatermark.IsChecked == false && WatermarkHidden() && ConfigurationUnchanged();
+                Require(watermarkHideSurvivesRestore, "最小化恢复后已隐藏的水印重新显示，或改变了会话配置。");
+                showWatermark.IsChecked = true;
+                await SettleAsync(() => WatermarkVisible(), "诊断水印无法重新显示。");
+                Require(watermark.VerifyPassThrough(preview.SourceWindow), "重新显示后水印不再鼠标穿透。");
+
+                Width = 980; Height = 600;
+                await SettleAsync(() => CheckOverlayBounds(true).Passed, "全屏测试前控制浮层布局无效。");
+                normalFullScreenRestored = await CheckFullScreenAsync(WindowState.Normal);
+                WindowState = WindowState.Maximized;
+                await SettleAsync(() => WindowState == WindowState.Maximized && CheckOverlayBounds(true).Passed,
+                    "窗口无法最大化。");
+                maximizedFullScreenRestored = await CheckFullScreenAsync(WindowState.Maximized);
+                Require(ConfigurationUnchanged(), "显示操作改变了诊断包开关或会话配置。");
+                overlayPassed = true;
+                overlayCheck = Report();
+            }
+            catch (Exception error)
+            {
+                overlayCheck = Report(error.Message);
+                throw;
+            }
+            finally
+            {
+                if (!stopping)
+                {
+                    if (WindowState == WindowState.FullScreen) { ToggleFullScreen(); await Task.Delay(200); }
+                    WindowState = WindowState.Normal;
+                    Width = originalSize.Width; Height = originalSize.Height; Position = originalPosition;
+                    orbFraction = originalOrbFraction;
+                    panelFraction = originalPanelFraction;
+                    if (details.IsVisible != originalExpanded) ToggleDetails();
+                    showWatermark.IsChecked = originalWatermark;
+                    WindowState = originalState;
+                    PositionOverlay();
+                    await Task.Delay(100);
+                    PositionOverlay();
+                }
+            }
+        }
+
+        sealed record OverlayBounds(bool Passed, bool InsidePreview, bool ControlsInsideOverlay, double Width, double Height,
+            bool ControlsVisible, bool CorrectPresentation, bool ControlsDoNotOverlap);
+
+        void SaveChromePreview(string name)
+        {
+            if (reportPath == null) return;
+            var directory = Path.GetDirectoryName(Path.GetFullPath(reportPath))!;
+            Directory.CreateDirectory(directory);
+            using var bitmap = new Avalonia.Media.Imaging.RenderTargetBitmap(
+                new PixelSize((int)Math.Ceiling(overlay.ClientSize.Width * overlay.RenderScaling),
+                    (int)Math.Ceiling(overlay.ClientSize.Height * overlay.RenderScaling)),
+                new Vector(96 * overlay.RenderScaling, 96 * overlay.RenderScaling));
+            bitmap.Render(chromeRoot);
+            bitmap.Save(Path.Combine(directory, name + ".png"), Avalonia.Media.Imaging.PngBitmapEncoderOptions.Default);
+        }
+
+        [DllImport("user32.dll", EntryPoint = "IsWindowVisible")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool IsRegressionWindowVisible(nint window);
+
+        OverlayBounds CheckOverlayBounds(bool expanded)
+        {
+            var origin = overlay.PointToScreen(new Point());
+            var outerOrigin = this.PointToScreen(new Point());
+            var width = overlay.ClientSize.Width * overlay.RenderScaling;
+            var height = overlay.ClientSize.Height * overlay.RenderScaling;
+            var inside = overlay.IsVisible && origin.X >= outerOrigin.X - 1 && origin.Y >= outerOrigin.Y - 1 &&
+                origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
+                origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
+            Control[] expandedControls = [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel,
+                clipboardEnabled, transmissionScale, fullScreen, showWatermark];
+            Control[] controls = expanded ? expandedControls : [floatingOrb];
+            var visible = controls.All(control => control.IsEffectivelyVisible && control.Bounds.Width > 0 && control.Bounds.Height > 0);
+            var rectangles = controls.Select(control =>
+            {
+                var point = control.PointToScreen(new Point());
+                return new Rect(point.X, point.Y, control.Bounds.Width * overlay.RenderScaling, control.Bounds.Height * overlay.RenderScaling);
+            }).ToArray();
+            var contentInside = rectangles.All(rect => rect.Left >= origin.X - 1 && rect.Top >= origin.Y - 1 &&
+                rect.Right <= origin.X + width + 1 && rect.Bottom <= origin.Y + height + 1);
+            var noOverlap = !rectangles.Where((rect, index) => rectangles.Skip(index + 1).Any(other =>
+                Math.Min(rect.Right, other.Right) - Math.Max(rect.Left, other.Left) > 1 &&
+                Math.Min(rect.Bottom, other.Bottom) - Math.Max(rect.Top, other.Top) > 1)).Any();
+            var presentation = expanded
+                ? details.IsVisible && controlPanel.IsVisible && !floatingOrb.IsVisible && overlay.ClientSize.Width <= Math.Min(980, ClientSize.Width - 24) + 1
+                : !details.IsVisible && !controlPanel.IsVisible && floatingOrb.IsHitTestVisible &&
+                    expandedControls.All(control => !control.IsEffectivelyVisible) &&
+                    Math.Abs(overlay.ClientSize.Width - OrbSize) <= 1 && Math.Abs(overlay.ClientSize.Height - OrbSize) <= 1;
+            return new(inside && contentInside && visible && presentation && noOverlap, inside, contentInside,
+                overlay.ClientSize.Width, overlay.ClientSize.Height, visible, presentation, noOverlap);
         }
     }
 }

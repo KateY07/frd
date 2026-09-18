@@ -10,7 +10,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Layout;
-using Avalonia.Themes.Fluent;
+using Avalonia.Themes.Simple;
 
 namespace Frd;
 
@@ -573,7 +573,7 @@ static class RemoteLaunch
     sealed class HostApplication : Application
     {
         public static Func<Window>? Factory;
-        public override void Initialize() => Styles.Add(new FluentTheme());
+        public override void Initialize() => Styles.Add(new SimpleTheme());
         public override void OnFrameworkInitializationCompleted()
         {
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop) desktop.MainWindow = Factory!();

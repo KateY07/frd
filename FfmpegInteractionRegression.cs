@@ -40,12 +40,12 @@ static partial class FfmpegUi
                 await Until(() => preview.VideoWidth == session.Configuration.Width && receivedFrames >= 3);
                 foreach (var cap in new[] { .5m, 5m, 10m, 20m, 5m })
                 {
-                    if (cap > bitrateLabel.Maximum) continue;
+                    if ((double)cap > bitrate.Maximum) continue;
                     var before = receivedFrames;
-                    bitrateLabel.Value = cap;
+                    bitrate.Value = (double)cap;
                     await Until(() => !applying && pendingStatus?.AppliedLimitKbps == (int)(cap * 1000) && receivedFrames > before);
-                    Check(Math.Abs(bitrate.Value - (double)cap) < .00001 && bitrateLabel.Value == cap,
-                        "Mbps numeric input, slider and sender acknowledgement " + cap, new { Mbps = cap, SenderKbps = pendingStatus?.AppliedLimitKbps });
+                    Check(Math.Abs(bitrate.Value - (double)cap) < .00001 && bitrateLabel.Text == $"码率上限 · {cap:0.0##} Mbps",
+                        "Mbps slider, label and sender acknowledgement " + cap, new { Mbps = cap, SenderKbps = pendingStatus?.AppliedLimitKbps });
                 }
                 if (details.IsVisible) ToggleDetails();
                 var bounds = Win32InputInjector.ReadPrimaryMonitor();
@@ -103,9 +103,9 @@ static partial class FfmpegUi
                 await SetInputAsync(true);
                 SendMessage(preview.SourceWindow, 0x0100, 0x10, (nint)(0x2A << 16 | 1));
                 await Task.Delay(120);
-                SendMessage(preview.SourceWindow, 0x0100, 0x1B, (nint)(1 << 16 | 1));
+                HandleLocalShortcut(0x11);
                 await Until(() => inputClient?.Enabled == false);
-                Check(inputEnabled.IsChecked == false, "Escape exits control and releases held input");
+                Check(inputEnabled.IsChecked == false, "Exit shortcut handler releases held input");
                 Check(inputRejected == 0, "No injected input rejected", new { inputSent, inputRejected });
                 Check(cursorClient is { Updates: > 0, Shapes: >= 3 }, "Cursor shape feedback is independent of video", new { cursorClient?.Updates, cursorClient?.Shapes });
                 }

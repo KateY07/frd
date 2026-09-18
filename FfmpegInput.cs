@@ -118,8 +118,17 @@ public sealed class RemoteInputServer : IDisposable
         {
             while (!stop.IsCancellationRequested)
             {
-                using var peer = await listener.AcceptTcpClientAsync(stop.Token).ConfigureAwait(false);
-                await ServePeerAsync(injector, peer, stop.Token, Report);
+                TcpClient peer;
+                try { peer = await listener.AcceptTcpClientAsync(stop.Token).ConfigureAwait(false); }
+                catch (Exception error) when (stop.IsCancellationRequested &&
+                    (error is InvalidOperationException ||
+                    error is SocketException { SocketErrorCode: SocketError.OperationAborted or SocketError.Interrupted }))
+                {
+                    // Stop can dispose the socket or clear the listening state before cancellation reaches accept.
+                    InputProtocol.Log("Input listener stopped during accept.");
+                    return;
+                }
+                using (peer) await ServePeerAsync(injector, peer, stop.Token, Report);
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { InputProtocol.Log("Input listener stopped."); }
@@ -404,7 +413,7 @@ public sealed class NativeInputSource : IDisposable
     readonly SubclassProcedure procedure;
     readonly nuint id;
     static long nextId;
-    bool enabled, disposed;
+    bool enabled, disposed, localFullscreenKeyDown;
     int heldButtons;
     readonly Dictionary<long, nint> cursors = new();
     nint remoteCursor;
@@ -436,6 +445,7 @@ public sealed class NativeInputSource : IDisposable
     }
     public event Action<RemoteInputEvent>? Input;
     public event Action? ExitRequested;
+    public event Action<int>? LocalShortcutRequested;
     public event Action<Exception>? Failed;
 
     public NativeInputSource(nint hwnd)
@@ -467,15 +477,31 @@ public sealed class NativeInputSource : IDisposable
             if (enabled && message == 0x0084) return 1;
             if (enabled && hasRemoteCursor && message == 0x0020 && ((long)lParam & 0xFFFF) == 1)
             { NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0); return 1; }
-            if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
+            if (message == 0x0008) localFullscreenKeyDown = false;
+            if (GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker &&
+                message is 0x0100 or 0x0101 or 0x0104 or 0x0105)
             {
-                if (message is 0x0100 or 0x0104 && wParam == 0x1B)
+                var keyDown = message is 0x0100 or 0x0104;
+                var controlAlt = GetKeyState(0x11) < 0 && GetKeyState(0x12) < 0;
+                if (keyDown && controlAlt && enabled)
                 {
                     SetEnabled(false);
                     Input?.Invoke(new(RemoteInputKind.ReleaseAll));
                     ExitRequested?.Invoke();
+                }
+                if (wParam == 0x7A && (controlAlt || localFullscreenKeyDown))
+                {
+                    localFullscreenKeyDown = keyDown;
+                    if (keyDown && controlAlt && ((long)lParam & (1L << 30)) == 0)
+                    {
+                        LocalShortcutRequested?.Invoke(0x7A);
+                    }
                     return 0;
                 }
+                if (keyDown && controlAlt && wParam is 0x11 or 0x12 or 0xA2 or 0xA3 or 0xA4 or 0xA5) return 0;
+            }
+            if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
+            {
                 if (message is 0x0100 or 0x0101 or 0x0104 or 0x0105)
                 {
                     var scanCode = (int)(((long)lParam >> 16) & 0xFF);
@@ -541,6 +567,7 @@ public sealed class NativeInputSource : IDisposable
     [DllImport("user32.dll")] static extern nint GetCapture();
     [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ReleaseCapture();
     [DllImport("user32.dll")] static extern nint GetMessageExtraInfo();
+    [DllImport("user32.dll")] static extern short GetKeyState(int virtualKey);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool GetClientRect(nint hwnd, out NativeRect rect);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ScreenToClient(nint hwnd, ref NativePoint point);
 }

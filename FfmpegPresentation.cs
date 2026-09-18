@@ -32,6 +32,7 @@ public sealed class ConfirmedVideoView : NativeControlHost
     public event Action<Exception>? Failed;
     public event Action<RemoteInputEvent>? Input;
     public event Action? InputExitRequested;
+    public event Action<int>? LocalShortcutRequested;
     public nint SourceWindow => sourceWindow;
     public int VideoWidth => Volatile.Read(ref sourceWidth);
     public int VideoHeight => Volatile.Read(ref sourceHeight);
@@ -82,6 +83,7 @@ public sealed class ConfirmedVideoView : NativeControlHost
         inputSource = new(hwnd);
         inputSource.Input += value => Input?.Invoke(value);
         inputSource.ExitRequested += () => { inputEnabled = false; InputExitRequested?.Invoke(); };
+        inputSource.LocalShortcutRequested += key => LocalShortcutRequested?.Invoke(key);
         inputSource.Failed += Report;
         inputSource.SetEnabled(inputEnabled);
         lock (gate)

@@ -1,4 +1,4 @@
-# FRD v1.pre3 · 远程桌面 CLI
+# FRD v1.pre4 · 远程桌面 CLI
 
 FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
@@ -19,7 +19,7 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 .\FRD.exe --connect 192.168.1.20 --port 5000 --token "与被控端本次启动相同的口令"
 ```
 
-4. 在主控窗口选择编码预设、码率上限、传输比例；键鼠和剪贴板同步需手动开启。Esc 退出键鼠控制。
+4. 在主控窗口选择编码预设、码率上限、传输比例；键鼠和剪贴板同步需手动开启。Ctrl+Alt 退出键鼠转发，Ctrl+Alt+F11 切换全屏。启用转发时，单独按 Esc 或 F11 仍传给远端。
 
 **被控端每次启动必须显式传入 `--token`。** 缺失、空字符串或纯空白口令时，在加载配置和编解码库前向 stderr 输出原因并以退出码 1 退出，不开启窗口或监听；无默认口令，不自动生成，不保存上次口令，也不从 JSON 读取口令。只有匹配口令的客户端能建立会话；键鼠、鼠标状态和剪贴板附属连接还需匹配当前会话。口令区分大小写。
 
@@ -49,7 +49,7 @@ using System.Diagnostics;
 
 var executable = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-    "Programs", "FRD", "v1.pre3", "FRD.exe");
+    "Programs", "FRD", "v1.pre4", "FRD.exe");
 var info = new ProcessStartInfo(executable)
 {
     WorkingDirectory = Path.GetDirectoryName(executable),
@@ -76,10 +76,10 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 ## 配置与交付
 
 - 修改 EXE 同目录的 `codec-config.json`。`presets` 的 `encoderArguments` / `decoderArguments` 是单行 FFmpeg 参数字符串；支持现有构建和设备提供的 H.264、VP9、AV1、NVENC、QSV 等预设。不支持的预设明确失败。
-- `initialBitrateKbps` 设置初始码率，`maximumBitrateMbps` 设置控件上限（默认 100 Mbps，可配置至 1000 Mbps）。界面统一使用 Mbps；此值限制编码码率，不进行额外链路节流，允许编码缓冲和帧发送突发。
+- `initialBitrateKbps` 设置初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示；此值限制编码码率，不进行额外链路节流，允许编码缓冲和帧发送突发。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre3\`；本机为 `C:\Users\arosa\AppData\Local\Programs\FRD\v1.pre3\`。
-- 发布 ZIP 和 SHA-256 位于项目 `artifacts/v1.pre3/`。源码版本标签为 `v1.pre3`；安装包保留本机，不上传 GitHub Releases。
+- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre4\`，不同版本分目录保留。
+- 发布脚本的 pre4 输出目录为 `artifacts/v1.pre4/`，包含便携 ZIP、README 和 SHA-256。源码及版本标签推送至 Git；安装包保留本机，不上传 GitHub Releases。
 
 ## 开发与边界
 
@@ -87,11 +87,13 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 
 当前支持 IPv4/IPv6 双栈，为单主控、可信局域网原型，无 NAT 穿透；口令认证不等于传输加密。静止画面不保证零带宽或无损；跨机延迟包含时钟估算误差，GPU 完成不等于物理屏幕扫描完成。键鼠已人工确认，自动键鼠回归保持暂停。
 
-## 下一版本待办
+## v1.pre4 界面
 
-- 实现全屏模式。
-- 控制栏收起后显示为半透明悬浮球，支持拖动位置和重新展开控制栏。
+- 主控和本机演示使用紧凑控制栏；主控、被控和帮助窗口统一采用 Avalonia Simple 主题。
+- 点击全屏按钮或按 Ctrl+Alt+F11 切换全屏；Ctrl+Alt 退出键鼠转发。启用转发时，单独按 Esc 或 F11 保留远端输入含义。
+- 展开时可拖动控制栏的空白区域，按钮、下拉框和滑条保持正常交互。收起后显示为 50 像素半透明悬浮球，同样可拖动；单击恢复控制栏。两种状态均限制在视口内，窗口缩放或切换全屏时保留当前位置，必要时调整至可见范围。
+- 诊断水印可独立隐藏，保持鼠标穿透且不获取键盘焦点。水印显隐与诊断包开关独立，隐藏水印不会关闭诊断采集或网络诊断包。
 
-以上两项尚未实现，不属于 v1.pre3 交付范围。
+以上行为已接入真实桌面 Demo，本机短测通过，UI 已获人工确认。本版先发布再进行完整回归；若发现问题，修复后递增 pre 版本重新发布，保留旧标签。验证状态见本版检查记录。自动键鼠回归继续保持暂停。
 
-进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre3-发布说明.md)、[静态检查](docs/v1.pre3-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre4-发布说明.md)、[静态检查](docs/v1.pre4-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
