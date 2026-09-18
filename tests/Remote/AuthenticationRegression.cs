@@ -53,6 +53,20 @@ static class AuthenticationRegression
         finally { reservation.Stop(); }
         foreach (var (arguments, name) in new[]
         {
+            (new[] { "--host", "--port", port.ToString(), "--token", "test-only" }, "Missing explicit listener address rejected"),
+            (new[] { "--host", "--listen", "127.0.0.1", "--token", "test-only" }, "Missing explicit listener port rejected"),
+            (new[] { "--host", "--listen", "invalid-address", "--port", port.ToString(), "--token", "test-only" }, "Invalid listener address rejected")
+        })
+        {
+            using var process = StartCommand(arguments);
+            var error = process.StandardError.ReadToEndAsync(); var output = process.StandardOutput.ReadToEndAsync();
+            try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10)); }
+            finally { if (!process.HasExited) { process.Kill(); await process.WaitForExitAsync(); } }
+            Check(process.ExitCode == 1 && (await error).Length > 0, name);
+            Check(!(await output).Contains("FFmpeg", StringComparison.OrdinalIgnoreCase), name + "; rejected before codec initialization");
+        }
+        foreach (var (arguments, name) in new[]
+        {
             (Array.Empty<string>(), "Missing command-line token rejected"),
             (new[] { "--token", "" }, "Empty command-line token rejected"),
             (new[] { "--token", "   " }, "Whitespace command-line token rejected")
@@ -72,6 +86,14 @@ static class AuthenticationRegression
             Check(!connected, name + "; no listener remains");
         }
         var password = Guid.NewGuid().ToString("N");
+        using (var disconnected = StartCommand("--connect", "127.0.0.1", "--port", port.ToString(), "--token", password))
+        {
+            var error = disconnected.StandardError.ReadToEndAsync(); var output = disconnected.StandardOutput.ReadToEndAsync();
+            try { await disconnected.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(12)); }
+            finally { if (!disconnected.HasExited) { disconnected.Kill(); await disconnected.WaitForExitAsync(); } }
+            Check(disconnected.ExitCode == 1 && (await error).Contains("Cannot connect"), "Connection startup failure exits with stderr and no idle demo window");
+            await output;
+        }
         using var host = Start("--token", password);
         var stderr = host.StandardError.ReadToEndAsync(); var stdout = host.StandardOutput.ReadToEndAsync();
         try

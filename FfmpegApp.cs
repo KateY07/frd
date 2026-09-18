@@ -131,6 +131,8 @@ public sealed partial class DemoSession : IDisposable
     long receivedDiagnosticFrames;
     public event Action<DecodedPixels>? FrameReceived;
     public event Action<SessionStatus>? StatusChanged;
+    public event Action<Exception>? Failed;
+    int failureReported;
     public int AppliedGeneration => Volatile.Read(ref appliedGeneration);
     public int DecodedGeneration => Volatile.Read(ref decodedGeneration);
     public int RenderedGeneration => Volatile.Read(ref renderedGeneration);
@@ -163,10 +165,13 @@ public sealed partial class DemoSession : IDisposable
     {
         if (remoteOptions != null) { await StartRemoteAsync(); return; }
         receiver = new();
+        receiver.Failed += error => ReportError("UDP 接收", error);
         receiver.VideoReceived += ReceiveVideo;
         diagnosticsReceiver = new();
+        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         diagnosticsReceiver.Received += ReceiveDiagnostic;
         sender = new(new(IPAddress.Loopback, receiver.Port), config.Simulation);
+        sender.Failed += error => ReportError("UDP 发送/反馈", error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation)
@@ -461,7 +466,12 @@ public sealed partial class DemoSession : IDisposable
         catch (Exception ex) { ReportError("状态统计", ex); }
     }
 
-    void ReportError(string stage, Exception ex) { message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex); }
+    void ReportError(string stage, Exception ex)
+    {
+        message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
+        stop.Cancel();
+        if (Interlocked.Exchange(ref failureReported, 1) == 0) Failed?.Invoke(ex);
+    }
 
     public void ReportPresented(long frameId, long completedTick)
     {
@@ -578,10 +588,10 @@ static class Program
             }
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
                 "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
+            var remoteOptions = args.Length > 0 && args[0] is "--host" or "--connect" ? RemoteLaunch.Parse(args) : null;
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (args.Length > 0 && args[0] is "--host" or "--connect")
-                return RemoteLaunch.Run(config, args);
+            if (remoteOptions != null) return RemoteLaunch.Run(config, remoteOptions);
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--presentation-regression") { FfmpegUi.RunPresentationRegression(config, args.Length > 1 ? args[1] : "results/ffmpeg-presentation.json"); return Environment.ExitCode; }
@@ -592,12 +602,13 @@ static class Program
                 var output = args.Length > 2 ? args[2] : "results/ffmpeg-demo.json";
                 FfmpegUi.Run(config, seconds, output); return Environment.ExitCode;
             }
-            FfmpegUi.Run(config); return 0;
+            FfmpegUi.Run(config); return Environment.ExitCode;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine(ex);
-            File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString());
+            try { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString()); }
+            catch (Exception logError) { Console.Error.WriteLine("Cannot write startup-error.txt: " + logError); }
             return 1;
         }
     }

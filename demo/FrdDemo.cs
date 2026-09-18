@@ -164,6 +164,8 @@ public sealed partial class DemoSession : IDisposable
     long receivedDiagnosticFrames;
     public event Action<DecodedPixels>? FrameReceived;
     public event Action<SessionStatus>? StatusChanged;
+    public event Action<Exception>? Failed;
+    int failureReported;
     public int AppliedGeneration => Volatile.Read(ref appliedGeneration);
     public int DecodedGeneration => Volatile.Read(ref decodedGeneration);
     public int RenderedGeneration => Volatile.Read(ref renderedGeneration);
@@ -196,10 +198,13 @@ public sealed partial class DemoSession : IDisposable
     {
         if (remoteOptions != null) { await StartRemoteAsync(); return; }
         receiver = new();
+        receiver.Failed += error => ReportError("UDP 接收", error);
         receiver.VideoReceived += ReceiveVideo;
         diagnosticsReceiver = new();
+        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         diagnosticsReceiver.Received += ReceiveDiagnostic;
         sender = new(new(IPAddress.Loopback, receiver.Port), config.Simulation);
+        sender.Failed += error => ReportError("UDP 发送/反馈", error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation)
@@ -494,7 +499,12 @@ public sealed partial class DemoSession : IDisposable
         catch (Exception ex) { ReportError("状态统计", ex); }
     }
 
-    void ReportError(string stage, Exception ex) { message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex); }
+    void ReportError(string stage, Exception ex)
+    {
+        message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
+        stop.Cancel();
+        if (Interlocked.Exchange(ref failureReported, 1) == 0) Failed?.Invoke(ex);
+    }
 
     public void ReportPresented(long frameId, long completedTick)
     {
@@ -611,10 +621,10 @@ static class Program
             }
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
                 "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
+            var remoteOptions = args.Length > 0 && args[0] is "--host" or "--connect" ? RemoteLaunch.Parse(args) : null;
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (args.Length > 0 && args[0] is "--host" or "--connect")
-                return RemoteLaunch.Run(config, args);
+            if (remoteOptions != null) return RemoteLaunch.Run(config, remoteOptions);
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--presentation-regression") { FfmpegUi.RunPresentationRegression(config, args.Length > 1 ? args[1] : "results/ffmpeg-presentation.json"); return Environment.ExitCode; }
@@ -625,12 +635,13 @@ static class Program
                 var output = args.Length > 2 ? args[2] : "results/ffmpeg-demo.json";
                 FfmpegUi.Run(config, seconds, output); return Environment.ExitCode;
             }
-            FfmpegUi.Run(config); return 0;
+            FfmpegUi.Run(config); return Environment.ExitCode;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine(ex);
-            File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString());
+            try { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString()); }
+            catch (Exception logError) { Console.Error.WriteLine("Cannot write startup-error.txt: " + logError); }
             return 1;
         }
     }
@@ -2362,7 +2373,7 @@ public static class FrameDiagnosticProtocol
 
 public sealed class UdpFrameDiagnosticsReceiver : IDisposable
 {
-    readonly Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    readonly Socket socket;
     readonly CancellationTokenSource stop = new();
     readonly Thread worker;
     long receivedPackets;
@@ -2371,11 +2382,14 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public long ReceivedPackets => Interlocked.Read(ref receivedPackets);
     public event Action<FrameDiagnostic>? Received;
+    public event Action<Exception>? Failed;
 
     public UdpFrameDiagnosticsReceiver(int port = 0, bool remote = false)
     {
+        socket = new(remote ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        if (remote) socket.DualMode = true;
         socket.ReceiveBufferSize = 256 * 1024;
-        socket.Bind(new IPEndPoint(remote ? IPAddress.Any : IPAddress.Loopback, port));
+        socket.Bind(new IPEndPoint(remote ? IPAddress.IPv6Any : IPAddress.Loopback, port));
         worker = new(Read) { IsBackground = true, Name = "FRD separate frame diagnostics" };
         worker.Start();
     }
@@ -2397,20 +2411,20 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
                 try
                 {
                     if (!socket.Poll(100_000, SelectMode.SelectRead)) continue;
-                    EndPoint source = new IPEndPoint(IPAddress.Any, 0);
+                    EndPoint source = new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0);
                     length = socket.ReceiveFrom(bytes, ref source);
-                    if (Volatile.Read(ref expectedSource) is { } expected && !expected.Equals(source)) continue;
+                    if (Volatile.Read(ref expectedSource) is { } expected && !FrdNetwork.SameEndpoint(expected, source)) continue;
                 }
                 catch (SocketException error) when (!stop.IsCancellationRequested && VideoDatagram.Recoverable(error, "Diagnostic receive")) { continue; }
                 if (!FrameDiagnosticProtocol.TryDecode(bytes.AsSpan(0, length), out var frame)) continue;
                 Interlocked.Increment(ref receivedPackets);
                 try { Received?.Invoke(frame!); }
-                catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); }
+                catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); Failed?.Invoke(error); }
             }
         }
         catch (ObjectDisposedException) when (stop.IsCancellationRequested) { VideoDatagram.Log("Diagnostic receiver stopped."); }
         catch (SocketException error) when (stop.IsCancellationRequested) { VideoDatagram.Log("Diagnostic receiver stopped", error); }
-        catch (Exception error) { VideoDatagram.Log("Diagnostic receiver failed", error); }
+        catch (Exception error) { VideoDatagram.Log("Diagnostic receiver failed", error); Failed?.Invoke(error); }
     }
 
     public void Dispose()
@@ -3104,6 +3118,35 @@ static partial class FfmpegUi
     }
 }
 
+// Source: FfmpegNetwork.cs
+static class FrdNetwork
+{
+    public static IPAddress Canonical(IPAddress address) => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+    public static bool SameEndpoint(EndPoint first, EndPoint second) => first is IPEndPoint a && second is IPEndPoint b &&
+        a.Port == b.Port && Canonical(a.Address).Equals(Canonical(b.Address));
+    public static int UdpOverhead(IPAddress address) => Canonical(address).AddressFamily == AddressFamily.InterNetworkV6 ? 48 : 28;
+    public static IPAddress Any(AddressFamily family) => family == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
+    public static IPAddress[] ListenAddresses(string value) => value.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+        ? [IPAddress.Loopback, IPAddress.IPv6Loopback] : [Canonical(IPAddress.Parse(value))];
+    public static async Task<TcpClient> ConnectAsync(string host, int port, CancellationToken token)
+    {
+        var addresses = IPAddress.TryParse(host, out var literal) ? [literal] : await Dns.GetHostAddressesAsync(host, token);
+        Exception? failure = null;
+        foreach (var address in addresses.Select(Canonical).Distinct())
+        {
+            var client = new TcpClient(address.AddressFamily) { NoDelay = true };
+            try { await client.ConnectAsync(address, port, token); return client; }
+            catch (SocketException error)
+            {
+                client.Dispose(); failure = error;
+                Console.Error.WriteLine($"[connect] {address}:{port}: {error.Message}");
+            }
+            catch { client.Dispose(); throw; }
+        }
+        throw new IOException($"Cannot connect to {host}:{port}.", failure);
+    }
+}
+
 // Source: FfmpegPresentation.cs
 public sealed class ConfirmedVideoView : NativeControlHost
 {
@@ -3702,9 +3745,7 @@ sealed class RemoteConnection : IDisposable
 
     public static async Task<RemoteConnection> ConnectAsync(RemoteOptions options, CancellationToken token)
     {
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
-        try { await client.ConnectAsync(options.Host, options.Port, token); return new(client); }
-        catch { client.Dispose(); throw; }
+        return new(await FrdNetwork.ConnectAsync(options.Host, options.Port, token));
     }
 
     public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token)
@@ -3785,8 +3826,10 @@ public sealed partial class DemoSession
 
     async Task StartRemoteAsync()
     {
-        receiver = new(); receiver.VideoReceived += ReceiveVideo;
+        receiver = new(dualStack: true); receiver.VideoReceived += ReceiveVideo;
+        receiver.Failed += error => ReportError("UDP 接收", error);
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
+        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
         var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
@@ -3825,10 +3868,9 @@ public sealed partial class DemoSession
     public async Task<RemoteInputClient> ConnectRemoteInputAsync(CancellationToken token)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -3840,10 +3882,9 @@ public sealed partial class DemoSession
     public async Task<ClipboardSyncSession> ConnectRemoteClipboardAsync(IClipboardAccess clipboard, CancellationToken token, string? cacheRoot = null)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("clipboard", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -3856,6 +3897,7 @@ public sealed partial class DemoSession
     {
         diagnosticDestination = diagnostics;
         sender = new(video, config.Simulation); sender.SetEncoderBitrateKbps(config.InitialBitrateKbps);
+        sender.Failed += error => ReportError("UDP 发送/反馈", error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
@@ -3866,10 +3908,9 @@ public sealed partial class DemoSession
     public async Task<CursorClient> ConnectRemoteCursorAsync(Action<CursorUpdate> received, Action<Exception> failed, CancellationToken token)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("cursor", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -3963,7 +4004,7 @@ sealed class RemoteHost : IAsyncDisposable
 {
     readonly AppConfiguration config;
     readonly string token;
-    readonly TcpListener listener;
+    readonly TcpListener[] listeners;
     readonly CancellationTokenSource stop = new();
     readonly ConcurrentDictionary<int, Task> peers = new();
     readonly object gate = new();
@@ -3975,21 +4016,32 @@ sealed class RemoteHost : IAsyncDisposable
     int peerId;
     Task? acceptTask;
     public event Action<string>? Status;
-    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token)
+    public event Action<Exception>? Failed;
+    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token) { }
+    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        this.config = config; this.token = token; listener = new(address, port);
+        this.config = config; this.token = token;
+        listeners = addresses.Select(address =>
+        {
+            var listener = new TcpListener(address, port);
+            if (address.AddressFamily == AddressFamily.InterNetworkV6) listener.Server.DualMode = address.Equals(IPAddress.IPv6Any);
+            return listener;
+        }).ToArray();
     }
 
     public void Start(nint clipboardOwner = 0)
     {
         this.clipboardOwner = clipboardOwner;
-        listener.Start(8); acceptTask = Task.Run(AcceptAsync);
-        Console.Error.WriteLine($"Remote listener ready: {listener.LocalEndpoint}");
-        Status?.Invoke($"被控端正在监听 {listener.LocalEndpoint}\n等待主控连接；关闭此窗口停止监听。");
+        try { foreach (var listener in listeners) listener.Start(8); }
+        catch { foreach (var listener in listeners) listener.Stop(); throw; }
+        acceptTask = Task.WhenAll(listeners.Select(listener => Task.Run(() => AcceptAsync(listener))));
+        var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
+        Console.Error.WriteLine($"Remote listener ready: {endpoints}");
+        Status?.Invoke($"被控端正在监听 {endpoints}\n等待主控连接；关闭此窗口停止监听。");
     }
 
-    async Task AcceptAsync()
+    async Task AcceptAsync(TcpListener listener)
     {
         try
         {
@@ -4002,7 +4054,7 @@ sealed class RemoteHost : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote listener stopped."); }
-        catch (Exception error) { Console.Error.WriteLine(error); Status?.Invoke(error.Message); }
+        catch (Exception error) { Console.Error.WriteLine(error); Status?.Invoke(error.Message); Failed?.Invoke(error); }
     }
 
     async Task HandleAsync(TcpClient client)
@@ -4019,7 +4071,7 @@ sealed class RemoteHost : IAsyncDisposable
                 if (string.IsNullOrWhiteSpace(hello.Token) ||
                     !CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(hello.Token)), SHA256.HashData(Encoding.UTF8.GetBytes(token))))
                 { await RemoteWire.WriteAsync(stream, new RemoteReply(false, "连接口令错误。"), timeout.Token); return; }
-                var address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
+                var address = FrdNetwork.Canonical(((IPEndPoint)client.Client.RemoteEndPoint!).Address);
                 if (hello.Kind == "cursor")
                 {
                     CancellationToken cursorToken;
@@ -4086,10 +4138,10 @@ sealed class RemoteHost : IAsyncDisposable
                 }
                 try
                 {
-                    using var capture = new DesktopStreamSource(config.TransmissionScale);
-                    capture.Capture();
+                    using var capture = CreateCapture();
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
                     using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                    session.Failed += error => { lifetime.Cancel(); Failed?.Invoke(error); };
                     session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
                     var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
                         capture.SourceWidth, capture.SourceHeight,
@@ -4134,22 +4186,37 @@ sealed class RemoteHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        stop.Cancel(); listener.Stop();
+        stop.Cancel(); foreach (var listener in listeners) listener.Stop();
         if (acceptTask != null) await acceptTask;
         await Task.WhenAll(peers.Values); stop.Dispose();
+    }
+
+    DesktopStreamSource CreateCapture()
+    {
+        DesktopStreamSource? capture = null;
+        try { capture = new(config.TransmissionScale); capture.Capture(); return capture; }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine(error);
+            try { capture?.Dispose(); }
+            finally { Failed?.Invoke(error); }
+            throw;
+        }
     }
 }
 
 static class RemoteLaunch
 {
     static int hostExitCode;
-    public const string Usage = "FRD CLI\n被控：FRD.exe --host --port 5000 --token 自定口令 [--listen 0.0.0.0]\n主控：FRD.exe --connect 被控IPv4或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --token；没有默认或保存的口令。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
+    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
     public static void Help(bool window)
     {
         Console.WriteLine(Usage);
         if (window) ShowMessage(Usage);
     }
-    public static int Run(AppConfiguration config, string[] args)
+    public sealed record Options(bool Host, string? Peer, IPAddress[] Addresses, int Port, string Token,
+        int Seconds, string? Report, string? InteractionScript);
+    public static Options Parse(string[] args)
     {
         var host = args[0] == "--host";
         if (!host && args.Length < 2) throw new ArgumentException(Usage);
@@ -4165,14 +4232,25 @@ static class RemoteLaunch
             throw new ArgumentException(Usage);
         if (!host)
         {
-            FfmpegUi.InteractionScriptPath = values.GetValueOrDefault("--interaction-script");
+            if (values.ContainsKey("--listen") || string.IsNullOrWhiteSpace(args[1])) throw new ArgumentException(Usage);
             var seconds = int.Parse(values.GetValueOrDefault("--test-seconds", "0"));
             if (seconds is < 0 or > 3600) throw new ArgumentException("Invalid test duration.");
-            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return Environment.ExitCode;
+            return new(false, args[1], [], port, token, seconds, values.GetValueOrDefault("--report"), values.GetValueOrDefault("--interaction-script"));
         }
-        var address = IPAddress.Parse(values.GetValueOrDefault("--listen", "0.0.0.0"));
-        if (address.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("目前支持 IPv4。");
-        HostApplication.Factory = () => new HostWindow(config, address, port, token);
+        if (!values.TryGetValue("--listen", out var listen) || string.IsNullOrWhiteSpace(listen))
+            throw new ArgumentException("被控端必须通过 --listen 明确指定 localhost 或 IPv4/IPv6 监听地址；不默认监听所有网卡。\n" + Usage);
+        if (values.Keys.Any(key => key is "--test-seconds" or "--report" or "--interaction-script")) throw new ArgumentException(Usage);
+        return new(true, null, FrdNetwork.ListenAddresses(listen), port, token, 0, null, null);
+    }
+    public static int Run(AppConfiguration config, Options options)
+    {
+        if (!options.Host)
+        {
+            FfmpegUi.InteractionScriptPath = options.InteractionScript;
+            FfmpegUi.Run(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
+            return Environment.ExitCode;
+        }
+        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token);
         hostExitCode = 0;
         AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return hostExitCode;
     }
@@ -4199,12 +4277,14 @@ static class RemoteLaunch
     {
         readonly RemoteHost server;
         bool closing, finished;
-        public HostWindow(AppConfiguration config, IPAddress address, int port, string token)
+        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token)
         {
             Title = $"FRD 被控端 · TCP {port}"; Width = 600; Height = 200;
             var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
-            Content = status; server = new(config, address, port, token);
+            Content = status; server = new(config, addresses, port, token);
             server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
+            server.Failed += error => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            { Console.Error.WriteLine(error); hostExitCode = 1; Close(); });
             Opened += (_, _) =>
             {
                 try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); }
@@ -4219,7 +4299,7 @@ static class RemoteLaunch
                 if (finished) return;
                 e.Cancel = true; if (closing) return; closing = true;
                 try { await server.DisposeAsync(); }
-                catch (Exception error) { Console.Error.WriteLine(error); }
+                catch (Exception error) { Console.Error.WriteLine(error); hostExitCode = 1; }
                 finally { finished = true; Avalonia.Threading.Dispatcher.UIThread.Post(Close); }
             };
         }
@@ -4278,7 +4358,8 @@ static class VideoDatagram
 
 public sealed class UdpVideoSender : IDisposable
 {
-    readonly Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    readonly Socket socket;
+    readonly int wireOverhead;
     readonly SafeWaitHandle pacingTimer = CreatePacingTimer();
     readonly IPEndPoint destination;
     readonly CancellationTokenSource shutdown = new();
@@ -4319,13 +4400,13 @@ public sealed class UdpVideoSender : IDisposable
 
     public UdpVideoSender(IPEndPoint destination, NetworkSimulation? simulation = null)
     {
-        if (destination.AddressFamily != AddressFamily.InterNetwork)
-            throw new ArgumentException("The 1200-byte MTU budget currently requires IPv4.", nameof(destination));
-        this.destination = destination;
+        this.destination = new(FrdNetwork.Canonical(destination.Address), destination.Port);
+        wireOverhead = FrdNetwork.UdpOverhead(this.destination.Address);
+        socket = new(this.destination.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
         this.simulation = ValidateSimulation(simulation ?? new());
         socket.SendBufferSize = 1024 * 1024;
         socket.ReceiveBufferSize = 1024 * 1024;
-        socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+        socket.Bind(new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0));
         feedbackThread = new(ReceiveFeedback) { IsBackground = true, Name = "FRD UDP feedback" };
         delayedThread = new(DeliverDelayed) { IsBackground = true, Name = "FRD simulated packet delay" };
         feedbackThread.Start();
@@ -4334,6 +4415,7 @@ public sealed class UdpVideoSender : IDisposable
 
     public int ActualPort => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public event Action<int, long, VideoSendTiming>? FrameSending;
+    public event Action<Exception>? Failed;
     public void SetLimitKbps(int kbps)
     {
         if (kbps is < 1 or > 1_000_000) throw new ArgumentOutOfRangeException(nameof(kbps));
@@ -4382,7 +4464,7 @@ public sealed class UdpVideoSender : IDisposable
                 BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(28), offset);
                 BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(32), (ushort)count);
                 video.Data.AsSpan(offset, count).CopyTo(packet.AsSpan(VideoDatagram.Header));
-                var wait = Pace(packet.Length + 28, token);
+                var wait = Pace(packet.Length + wireOverhead, token);
                 plannedWaitMs += wait.PlannedMs;
                 wakeupOverrunMs += wait.OverrunMs;
                 var now = VideoDatagram.Now;
@@ -4392,7 +4474,7 @@ public sealed class UdpVideoSender : IDisposable
                 {
                     stamps[seq % stamps.Length] = new(seq, now);
                     sentPackets++;
-                    rates.Enqueue((now, packet.Length + 28, 0));
+                    rates.Enqueue((now, packet.Length + wireOverhead, 0));
                     TrimRates(now);
                 }
                 if (offset + count == video.Data.Length)
@@ -4406,19 +4488,20 @@ public sealed class UdpVideoSender : IDisposable
     public void SendDiagnostic(byte[] packet, IPEndPoint diagnosticDestination, CancellationToken token)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
-        if (packet.Length is <= 0 or > VideoDatagram.MaxSize || diagnosticDestination.AddressFamily != AddressFamily.InterNetwork || diagnosticDestination.Equals(destination))
-            throw new ArgumentException("Diagnostics require a separate IPv4 destination and at most 1172 UDP payload bytes.");
+        diagnosticDestination = new(FrdNetwork.Canonical(diagnosticDestination.Address), diagnosticDestination.Port);
+        if (packet.Length is <= 0 or > VideoDatagram.MaxSize || diagnosticDestination.AddressFamily != socket.AddressFamily || diagnosticDestination.Equals(destination))
+            throw new ArgumentException("Diagnostics require a separate destination in the same address family and at most 1172 UDP payload bytes.");
         lock (sendGate)
         {
             token.ThrowIfCancellationRequested();
             shutdown.Token.ThrowIfCancellationRequested();
-            Pace(packet.Length + 28, token);
+            Pace(packet.Length + wireOverhead, token);
             var now = VideoDatagram.Now;
             lock (statsGate)
             {
                 diagnosticPackets++;
-                diagnosticRates.Enqueue((now, packet.Length + 28));
-                rates.Enqueue((now, packet.Length + 28, 0));
+                diagnosticRates.Enqueue((now, packet.Length + wireOverhead));
+                rates.Enqueue((now, packet.Length + wireOverhead, 0));
                 TrimRates(now);
             }
             RoutePacket(packet, diagnosticDestination, now);
@@ -4503,7 +4586,7 @@ public sealed class UdpVideoSender : IDisposable
         }
         catch (ObjectDisposedException) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Delayed sender stopped."); }
         catch (SocketException error) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Delayed sender stopped", error); }
-        catch (Exception error) { VideoDatagram.Log("Delayed sender failed", error); }
+        catch (Exception error) { VideoDatagram.Log("Delayed sender failed", error); Failed?.Invoke(error); }
     }
 
     void ReceiveFeedback()
@@ -4513,7 +4596,7 @@ public sealed class UdpVideoSender : IDisposable
         {
             while (!shutdown.IsCancellationRequested)
             {
-                EndPoint peer = new IPEndPoint(IPAddress.Any, 0);
+                EndPoint peer = new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0);
                 int length;
                 try
                 {
@@ -4570,7 +4653,7 @@ public sealed class UdpVideoSender : IDisposable
         }
         catch (ObjectDisposedException) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Feedback listener stopped."); }
         catch (SocketException error) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Feedback listener stopped", error); }
-        catch (Exception error) { VideoDatagram.Log("Feedback listener failed", error); }
+        catch (Exception error) { VideoDatagram.Log("Feedback listener failed", error); Failed?.Invoke(error); }
     }
 
     void TrimRates(long now)
@@ -4597,7 +4680,7 @@ public sealed class UdpVideoSender : IDisposable
                     delayTrend > 2 ? "queue growing; advisory only" : "observed delivery; measured lower bound";
                 return new(sent, received, stale ? 0 : deliveryEstimate, delayTrend, lossRate, sentPackets, receivedPackets, state)
                     { DiagnosticMbps = diagnostics, DiagnosticPackets = diagnosticPackets, SendBudgetKbps = rateLimited ? Volatile.Read(ref limitKbps) : 0,
-                        BurstBudgetWireBytes = rateLimited ? 1200 : 0, SimulatedCapacityMbps = Volatile.Read(ref simulation).CapacityMbps };
+                        BurstBudgetWireBytes = rateLimited ? VideoDatagram.MaxSize + wireOverhead : 0, SimulatedCapacityMbps = Volatile.Read(ref simulation).CapacityMbps };
             }
         }
     }
@@ -4618,7 +4701,7 @@ public sealed class UdpVideoSender : IDisposable
 
 public sealed class UdpVideoReceiver : IDisposable
 {
-    readonly Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    readonly Socket socket;
     readonly CancellationTokenSource shutdown = new();
     readonly Thread receiveThread, dispatchThread;
     readonly Channel<ReceivedVideo> completed = Channel.CreateBounded<ReceivedVideo>(new BoundedChannelOptions(32)
@@ -4641,9 +4724,11 @@ public sealed class UdpVideoReceiver : IDisposable
         public int Count;
     }
 
-    public UdpVideoReceiver(int port = 0)
+    public UdpVideoReceiver(int port = 0, bool dualStack = false)
     {
-        socket.Bind(new IPEndPoint(IPAddress.Any, port));
+        socket = new(dualStack ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        if (dualStack) socket.DualMode = true;
+        socket.Bind(new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), port));
         socket.ReceiveBufferSize = 1024 * 1024;
         receiveThread = new(Receive) { IsBackground = true, Name = "FRD UDP receive and feedback" };
         dispatchThread = new(Dispatch) { IsBackground = true, Name = "FRD decoded-stream dispatch" };
@@ -4653,6 +4738,7 @@ public sealed class UdpVideoReceiver : IDisposable
 
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public event Action<ReceivedVideo>? VideoReceived;
+    public event Action<Exception>? Failed;
     public void SetExpectedSource(IPEndPoint endpoint)
     {
         Volatile.Write(ref expectedSource, endpoint);
@@ -4666,7 +4752,7 @@ public sealed class UdpVideoReceiver : IDisposable
         {
             while (!shutdown.IsCancellationRequested)
             {
-                EndPoint peer = new IPEndPoint(IPAddress.Any, 0);
+                EndPoint peer = new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0);
                 int length;
                 try
                 {
@@ -4677,7 +4763,7 @@ public sealed class UdpVideoReceiver : IDisposable
                         continue;
                     }
                     length = socket.ReceiveFrom(bytes, ref peer);
-                    if (Volatile.Read(ref expectedSource) is { } expected && !expected.Equals(peer)) continue;
+                    if (Volatile.Read(ref expectedSource) is { } expected && !FrdNetwork.SameEndpoint(expected, peer)) continue;
                 }
                 catch (SocketException error) when (!shutdown.IsCancellationRequested && VideoDatagram.Recoverable(error, "Video receive"))
                 {
@@ -4707,9 +4793,10 @@ public sealed class UdpVideoReceiver : IDisposable
                 lastSequence = seq;
                 lastReceiveTick = now;
                 batchPackets++;
-                batchWireBytes += (uint)(length + 28);
+                var wireOverhead = FrdNetwork.UdpOverhead(((IPEndPoint)peer).Address);
+                batchWireBytes += (uint)(length + wireOverhead);
                 totalPackets++;
-                totalWireBytes += length + 28;
+                totalWireBytes += length + wireOverhead;
                 if (generation < currentGeneration) { MaybeFlushFeedback(now); continue; }
                 if (generation > currentGeneration)
                 {
@@ -4758,7 +4845,7 @@ public sealed class UdpVideoReceiver : IDisposable
         }
         catch (ObjectDisposedException) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Receiver stopped."); }
         catch (SocketException error) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Receiver stopped", error); }
-        catch (Exception error) { VideoDatagram.Log("Receiver failed", error); }
+        catch (Exception error) { VideoDatagram.Log("Receiver failed", error); Failed?.Invoke(error); }
         finally { completed.Writer.TryComplete(); }
     }
 
@@ -4812,7 +4899,7 @@ public sealed class UdpVideoReceiver : IDisposable
                 {
                     Interlocked.Add(ref queuedBytes, -video.Data.Length);
                     try { VideoReceived?.Invoke(video); }
-                    catch (Exception error) { VideoDatagram.Log("Video callback failed", error); }
+                    catch (Exception error) { VideoDatagram.Log("Video callback failed", error); Failed?.Invoke(error); }
                 }
         }
         catch (OperationCanceledException) when (shutdown.IsCancellationRequested) { VideoDatagram.Log("Video dispatch stopped."); }
@@ -5140,6 +5227,7 @@ static partial class FfmpegUi
                     session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
                 }
                 else session = new(config, remoteOptions);
+                session.Failed += error => Dispatcher.UIThread.Post(() => ReportError(error));
                 session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(frame); };
                 session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
                 await session.StartAsync();
@@ -5184,7 +5272,7 @@ static partial class FfmpegUi
             {
                 ReportError(ex);
                 regressionExitCode = 1;
-                if (autoCloseSeconds > 0) Close();
+                Close();
             }
         }
 
@@ -5444,6 +5532,8 @@ static partial class FfmpegUi
         void ReportError(Exception ex)
         {
             Console.Error.WriteLine(ex); errors.Add(ex.ToString()); operation.Text = "错误：" + ex.Message;
+            regressionExitCode = 1;
+            if (!stopping) Dispatcher.UIThread.Post(Close);
         }
 
         void WriteReport()

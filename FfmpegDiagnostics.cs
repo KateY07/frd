@@ -63,7 +63,7 @@ public static class FrameDiagnosticProtocol
 
 public sealed class UdpFrameDiagnosticsReceiver : IDisposable
 {
-    readonly Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    readonly Socket socket;
     readonly CancellationTokenSource stop = new();
     readonly Thread worker;
     long receivedPackets;
@@ -72,11 +72,14 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public long ReceivedPackets => Interlocked.Read(ref receivedPackets);
     public event Action<FrameDiagnostic>? Received;
+    public event Action<Exception>? Failed;
 
     public UdpFrameDiagnosticsReceiver(int port = 0, bool remote = false)
     {
+        socket = new(remote ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        if (remote) socket.DualMode = true;
         socket.ReceiveBufferSize = 256 * 1024;
-        socket.Bind(new IPEndPoint(remote ? IPAddress.Any : IPAddress.Loopback, port));
+        socket.Bind(new IPEndPoint(remote ? IPAddress.IPv6Any : IPAddress.Loopback, port));
         worker = new(Read) { IsBackground = true, Name = "FRD separate frame diagnostics" };
         worker.Start();
     }
@@ -98,20 +101,20 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
                 try
                 {
                     if (!socket.Poll(100_000, SelectMode.SelectRead)) continue;
-                    EndPoint source = new IPEndPoint(IPAddress.Any, 0);
+                    EndPoint source = new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0);
                     length = socket.ReceiveFrom(bytes, ref source);
-                    if (Volatile.Read(ref expectedSource) is { } expected && !expected.Equals(source)) continue;
+                    if (Volatile.Read(ref expectedSource) is { } expected && !FrdNetwork.SameEndpoint(expected, source)) continue;
                 }
                 catch (SocketException error) when (!stop.IsCancellationRequested && VideoDatagram.Recoverable(error, "Diagnostic receive")) { continue; }
                 if (!FrameDiagnosticProtocol.TryDecode(bytes.AsSpan(0, length), out var frame)) continue;
                 Interlocked.Increment(ref receivedPackets);
                 try { Received?.Invoke(frame!); }
-                catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); }
+                catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); Failed?.Invoke(error); }
             }
         }
         catch (ObjectDisposedException) when (stop.IsCancellationRequested) { VideoDatagram.Log("Diagnostic receiver stopped."); }
         catch (SocketException error) when (stop.IsCancellationRequested) { VideoDatagram.Log("Diagnostic receiver stopped", error); }
-        catch (Exception error) { VideoDatagram.Log("Diagnostic receiver failed", error); }
+        catch (Exception error) { VideoDatagram.Log("Diagnostic receiver failed", error); Failed?.Invoke(error); }
     }
 
     public void Dispose()

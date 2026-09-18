@@ -53,9 +53,7 @@ sealed class RemoteConnection : IDisposable
 
     public static async Task<RemoteConnection> ConnectAsync(RemoteOptions options, CancellationToken token)
     {
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
-        try { await client.ConnectAsync(options.Host, options.Port, token); return new(client); }
-        catch { client.Dispose(); throw; }
+        return new(await FrdNetwork.ConnectAsync(options.Host, options.Port, token));
     }
 
     public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token)
@@ -136,8 +134,10 @@ public sealed partial class DemoSession
 
     async Task StartRemoteAsync()
     {
-        receiver = new(); receiver.VideoReceived += ReceiveVideo;
+        receiver = new(dualStack: true); receiver.VideoReceived += ReceiveVideo;
+        receiver.Failed += error => ReportError("UDP 接收", error);
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
+        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
         var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
@@ -176,10 +176,9 @@ public sealed partial class DemoSession
     public async Task<RemoteInputClient> ConnectRemoteInputAsync(CancellationToken token)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -191,10 +190,9 @@ public sealed partial class DemoSession
     public async Task<ClipboardSyncSession> ConnectRemoteClipboardAsync(IClipboardAccess clipboard, CancellationToken token, string? cacheRoot = null)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("clipboard", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -207,6 +205,7 @@ public sealed partial class DemoSession
     {
         diagnosticDestination = diagnostics;
         sender = new(video, config.Simulation); sender.SetEncoderBitrateKbps(config.InitialBitrateKbps);
+        sender.Failed += error => ReportError("UDP 发送/反馈", error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
@@ -217,10 +216,9 @@ public sealed partial class DemoSession
     public async Task<CursorClient> ConnectRemoteCursorAsync(Action<CursorUpdate> received, Action<Exception> failed, CancellationToken token)
     {
         if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
-        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("cursor", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
@@ -314,7 +312,7 @@ sealed class RemoteHost : IAsyncDisposable
 {
     readonly AppConfiguration config;
     readonly string token;
-    readonly TcpListener listener;
+    readonly TcpListener[] listeners;
     readonly CancellationTokenSource stop = new();
     readonly ConcurrentDictionary<int, Task> peers = new();
     readonly object gate = new();
@@ -326,21 +324,32 @@ sealed class RemoteHost : IAsyncDisposable
     int peerId;
     Task? acceptTask;
     public event Action<string>? Status;
-    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token)
+    public event Action<Exception>? Failed;
+    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token) { }
+    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        this.config = config; this.token = token; listener = new(address, port);
+        this.config = config; this.token = token;
+        listeners = addresses.Select(address =>
+        {
+            var listener = new TcpListener(address, port);
+            if (address.AddressFamily == AddressFamily.InterNetworkV6) listener.Server.DualMode = address.Equals(IPAddress.IPv6Any);
+            return listener;
+        }).ToArray();
     }
 
     public void Start(nint clipboardOwner = 0)
     {
         this.clipboardOwner = clipboardOwner;
-        listener.Start(8); acceptTask = Task.Run(AcceptAsync);
-        Console.Error.WriteLine($"Remote listener ready: {listener.LocalEndpoint}");
-        Status?.Invoke($"被控端正在监听 {listener.LocalEndpoint}\n等待主控连接；关闭此窗口停止监听。");
+        try { foreach (var listener in listeners) listener.Start(8); }
+        catch { foreach (var listener in listeners) listener.Stop(); throw; }
+        acceptTask = Task.WhenAll(listeners.Select(listener => Task.Run(() => AcceptAsync(listener))));
+        var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
+        Console.Error.WriteLine($"Remote listener ready: {endpoints}");
+        Status?.Invoke($"被控端正在监听 {endpoints}\n等待主控连接；关闭此窗口停止监听。");
     }
 
-    async Task AcceptAsync()
+    async Task AcceptAsync(TcpListener listener)
     {
         try
         {
@@ -353,7 +362,7 @@ sealed class RemoteHost : IAsyncDisposable
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote listener stopped."); }
-        catch (Exception error) { Console.Error.WriteLine(error); Status?.Invoke(error.Message); }
+        catch (Exception error) { Console.Error.WriteLine(error); Status?.Invoke(error.Message); Failed?.Invoke(error); }
     }
 
     async Task HandleAsync(TcpClient client)
@@ -370,7 +379,7 @@ sealed class RemoteHost : IAsyncDisposable
                 if (string.IsNullOrWhiteSpace(hello.Token) ||
                     !CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(hello.Token)), SHA256.HashData(Encoding.UTF8.GetBytes(token))))
                 { await RemoteWire.WriteAsync(stream, new RemoteReply(false, "连接口令错误。"), timeout.Token); return; }
-                var address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
+                var address = FrdNetwork.Canonical(((IPEndPoint)client.Client.RemoteEndPoint!).Address);
                 if (hello.Kind == "cursor")
                 {
                     CancellationToken cursorToken;
@@ -437,10 +446,10 @@ sealed class RemoteHost : IAsyncDisposable
                 }
                 try
                 {
-                    using var capture = new DesktopStreamSource(config.TransmissionScale);
-                    capture.Capture();
+                    using var capture = CreateCapture();
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
                     using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                    session.Failed += error => { lifetime.Cancel(); Failed?.Invoke(error); };
                     session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
                     var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
                         capture.SourceWidth, capture.SourceHeight,
@@ -485,22 +494,37 @@ sealed class RemoteHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        stop.Cancel(); listener.Stop();
+        stop.Cancel(); foreach (var listener in listeners) listener.Stop();
         if (acceptTask != null) await acceptTask;
         await Task.WhenAll(peers.Values); stop.Dispose();
+    }
+
+    DesktopStreamSource CreateCapture()
+    {
+        DesktopStreamSource? capture = null;
+        try { capture = new(config.TransmissionScale); capture.Capture(); return capture; }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine(error);
+            try { capture?.Dispose(); }
+            finally { Failed?.Invoke(error); }
+            throw;
+        }
     }
 }
 
 static class RemoteLaunch
 {
     static int hostExitCode;
-    public const string Usage = "FRD CLI\n被控：FRD.exe --host --port 5000 --token 自定口令 [--listen 0.0.0.0]\n主控：FRD.exe --connect 被控IPv4或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --token；没有默认或保存的口令。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
+    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
     public static void Help(bool window)
     {
         Console.WriteLine(Usage);
         if (window) ShowMessage(Usage);
     }
-    public static int Run(AppConfiguration config, string[] args)
+    public sealed record Options(bool Host, string? Peer, IPAddress[] Addresses, int Port, string Token,
+        int Seconds, string? Report, string? InteractionScript);
+    public static Options Parse(string[] args)
     {
         var host = args[0] == "--host";
         if (!host && args.Length < 2) throw new ArgumentException(Usage);
@@ -516,14 +540,25 @@ static class RemoteLaunch
             throw new ArgumentException(Usage);
         if (!host)
         {
-            FfmpegUi.InteractionScriptPath = values.GetValueOrDefault("--interaction-script");
+            if (values.ContainsKey("--listen") || string.IsNullOrWhiteSpace(args[1])) throw new ArgumentException(Usage);
             var seconds = int.Parse(values.GetValueOrDefault("--test-seconds", "0"));
             if (seconds is < 0 or > 3600) throw new ArgumentException("Invalid test duration.");
-            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return Environment.ExitCode;
+            return new(false, args[1], [], port, token, seconds, values.GetValueOrDefault("--report"), values.GetValueOrDefault("--interaction-script"));
         }
-        var address = IPAddress.Parse(values.GetValueOrDefault("--listen", "0.0.0.0"));
-        if (address.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("目前支持 IPv4。");
-        HostApplication.Factory = () => new HostWindow(config, address, port, token);
+        if (!values.TryGetValue("--listen", out var listen) || string.IsNullOrWhiteSpace(listen))
+            throw new ArgumentException("被控端必须通过 --listen 明确指定 localhost 或 IPv4/IPv6 监听地址；不默认监听所有网卡。\n" + Usage);
+        if (values.Keys.Any(key => key is "--test-seconds" or "--report" or "--interaction-script")) throw new ArgumentException(Usage);
+        return new(true, null, FrdNetwork.ListenAddresses(listen), port, token, 0, null, null);
+    }
+    public static int Run(AppConfiguration config, Options options)
+    {
+        if (!options.Host)
+        {
+            FfmpegUi.InteractionScriptPath = options.InteractionScript;
+            FfmpegUi.Run(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
+            return Environment.ExitCode;
+        }
+        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token);
         hostExitCode = 0;
         AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return hostExitCode;
     }
@@ -550,12 +585,14 @@ static class RemoteLaunch
     {
         readonly RemoteHost server;
         bool closing, finished;
-        public HostWindow(AppConfiguration config, IPAddress address, int port, string token)
+        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token)
         {
             Title = $"FRD 被控端 · TCP {port}"; Width = 600; Height = 200;
             var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
-            Content = status; server = new(config, address, port, token);
+            Content = status; server = new(config, addresses, port, token);
             server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
+            server.Failed += error => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            { Console.Error.WriteLine(error); hostExitCode = 1; Close(); });
             Opened += (_, _) =>
             {
                 try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); }
@@ -570,7 +607,7 @@ static class RemoteLaunch
                 if (finished) return;
                 e.Cancel = true; if (closing) return; closing = true;
                 try { await server.DisposeAsync(); }
-                catch (Exception error) { Console.Error.WriteLine(error); }
+                catch (Exception error) { Console.Error.WriteLine(error); hostExitCode = 1; }
                 finally { finished = true; Avalonia.Threading.Dispatcher.UIThread.Post(Close); }
             };
         }

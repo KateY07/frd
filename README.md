@@ -7,13 +7,13 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 ## 五分钟入门
 
 1. 将完整便携包解压到两台 Windows x64 机器，保留 `FRD.exe`、`codec-config.json` 和 `ffmpeg/`。无需另装 .NET。
-2. 在被控机器的普通已登录桌面启动服务端，并指定监听端口和本次口令：
+2. 在被控机器的普通已登录桌面启动服务端，并明确指定监听地址、端口和本次口令；地址替换为被控端实际网卡 IPv4 或 IPv6 地址：
 
 ```powershell
-.\FRD.exe --host --port 5000 --token "请替换为双方约定的口令"
+.\FRD.exe --host --listen 192.168.1.20 --port 5000 --token "请替换为双方约定的口令"
 ```
 
-3. 在主控机器连接，地址替换为被控机器的 IPv4 地址或主机名：
+3. 在主控机器连接，地址替换为被控机器的 IPv4/IPv6 地址或主机名：
 
 ```powershell
 .\FRD.exe --connect 192.168.1.20 --port 5000 --token "与被控端本次启动相同的口令"
@@ -21,13 +21,13 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 
 4. 在主控窗口选择编码预设、码率上限、传输比例；键鼠和剪贴板同步需手动开启。Esc 退出键鼠控制。
 
-**被控端每次启动必须显式传入 `--token`。** 缺失、空字符串或纯空白口令直接启动失败，不开始监听；无默认口令，不自动生成，不保存上次口令，也不从 JSON 读取口令。只有匹配口令的客户端能建立会话；键鼠、鼠标状态和剪贴板附属连接还需匹配当前会话。口令区分大小写。
+**被控端每次启动必须显式传入 `--token`。** 缺失、空字符串或纯空白口令时，在加载配置和编解码库前向 stderr 输出原因并以退出码 1 退出，不开启窗口或监听；无默认口令，不自动生成，不保存上次口令，也不从 JSON 读取口令。只有匹配口令的客户端能建立会话；键鼠、鼠标状态和剪贴板附属连接还需匹配当前会话。口令区分大小写。
 
 ## CLI 接口
 
 | 调用 | 行为 |
 | --- | --- |
-| `FRD.exe --host --port PORT --token TOKEN [--listen IPv4]` | 被控端：捕获、编码并监听，默认监听 `0.0.0.0` |
+| `FRD.exe --host --listen ADDRESS --port PORT --token TOKEN` | 被控端：捕获、编码并监听；三个参数每次启动均必填 |
 | `FRD.exe --connect HOST --port PORT --token TOKEN` | 主控端：连接、解码、显示与控制 |
 | `FRD.exe --help` | 输出文本帮助并退出，不开启窗口或加载编解码库 |
 | `FRD.exe --version` | 输出版本并退出 |
@@ -35,7 +35,8 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 | `FRD.exe` | 本机 localhost 真实桌面演示 |
 
 - `--port` 为必填 TCP 监听端口，范围 1–65535；视频、诊断和反馈使用协商的 UDP 端口。两端须允许相应网络通信。
-- 运行中的主控/被控进程持续存活。正常关闭窗口后退出码为 0；参数错误、口令拒绝导致启动失败、配置/启动失败返回 1。运行期状态和错误同时通过界面及 stderr 日志呈现。
+- 被控端 `--listen` 必填，没有默认地址。本机测试使用 `localhost`（同时监听 `127.0.0.1` 和 `::1`，仅限本机）；指定 `::` 使用单个 IPv6 双栈 Socket，接受所有网卡的 IPv4/IPv6 连接。`0.0.0.0` 仅监听所有 IPv4 接口；具体 IP 仅绑定该地址，`::1` 仅限 IPv6 回环。IPv6 地址与 `--port` 分开传入，无需方括号；链路本地地址可带 `%接口索引`。
+- 运行中的主控/被控进程持续存活。正常关闭窗口后退出码为 0；参数错误、口令拒绝导致启动失败、配置/启动失败返回 1。不可恢复的运行期错误同样写入 stderr，清理资源并以退出码 1 退出；错误口令/无效请求仅拒绝对应连接，预期 UDP 丢包不终止服务。
 - 被控监听成功的日志包含 `Remote listener ready:`。集成端应持续读取重定向的 stdout/stderr，避免管道填满阻塞子进程。日志用于诊断，不作为稳定 JSON 协议。
 - `--connect` 可附加 `--test-seconds N --report PATH`（1–3600 秒）进行限时演示并输出 JSON 报告；它是开发验证入口，正常会话不必设置。
 - 正常退出优先关闭进程主窗口并等待结束，保证捕获、网络及输入状态得到清理。CLI 当前承载在交互式 Windows 桌面中，适合由上层应用管理；被控端不能作为锁屏/安全桌面的无人值守捕获服务。
@@ -58,7 +59,7 @@ var info = new ProcessStartInfo(executable)
 };
 // 由上层程序获取本次口令，不把真实口令写进源码或日志。
 var token = GetTokenForThisLaunch();
-foreach (var arg in new[] { "--host", "--port", "5000", "--token", token })
+foreach (var arg in new[] { "--host", "--listen", "127.0.0.1", "--port", "5000", "--token", token })
     info.ArgumentList.Add(arg);
 using var process = Process.Start(info) ?? throw new IOException("FRD 启动失败");
 process.OutputDataReceived += (_, e) => { if (e.Data != null) Console.WriteLine(e.Data); };
@@ -83,6 +84,6 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 
 安装 .NET 10 SDK 和 7-Zip 后，在仓库执行 `Get-FFmpeg.ps1` 获取固定版本依赖，再执行 `Publish.ps1` 生成全新便携包；`Build-SingleFileDemo.ps1` 同步生成 `demo/FrdDemo.cs`，该文件不单独维护。工程化源码适度拆分，保留单文件示例供参考。
 
-当前为 IPv4、单主控、可信局域网原型，无 NAT 穿透；口令认证不等于传输加密。静止画面不保证零带宽或无损；跨机延迟包含时钟估算误差，GPU 完成不等于物理屏幕扫描完成。键鼠已人工确认，自动键鼠回归保持暂停。
+当前支持 IPv4/IPv6 双栈，为单主控、可信局域网原型，无 NAT 穿透；口令认证不等于传输加密。静止画面不保证零带宽或无损；跨机延迟包含时钟估算误差，GPU 完成不等于物理屏幕扫描完成。键鼠已人工确认，自动键鼠回归保持暂停。
 
 进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre3-发布说明.md)、[静态检查](docs/v1.pre3-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。

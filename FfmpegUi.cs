@@ -320,6 +320,7 @@ static partial class FfmpegUi
                     session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
                 }
                 else session = new(config, remoteOptions);
+                session.Failed += error => Dispatcher.UIThread.Post(() => ReportError(error));
                 session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(frame); };
                 session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
                 await session.StartAsync();
@@ -364,7 +365,7 @@ static partial class FfmpegUi
             {
                 ReportError(ex);
                 regressionExitCode = 1;
-                if (autoCloseSeconds > 0) Close();
+                Close();
             }
         }
 
@@ -624,6 +625,8 @@ static partial class FfmpegUi
         void ReportError(Exception ex)
         {
             Console.Error.WriteLine(ex); errors.Add(ex.ToString()); operation.Text = "错误：" + ex.Message;
+            regressionExitCode = 1;
+            if (!stopping) Dispatcher.UIThread.Post(Close);
         }
 
         void WriteReport()

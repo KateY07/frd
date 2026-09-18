@@ -24,6 +24,32 @@ FrameDiagnostic Timing(long id) => new(1, id, 100, 120, 150, Stopwatch.Frequency
 
 try
 {
+    foreach (var address in new[] { IPAddress.Loopback, IPAddress.IPv6Loopback })
+    {
+        using var dualVideo = new UdpVideoReceiver(dualStack: true);
+        using var dualDiagnostic = new UdpFrameDiagnosticsReceiver(remote: true);
+        using var dualSender = new UdpVideoSender(new(address, dualVideo.Port));
+        dualVideo.SetExpectedSource(new(address, dualSender.ActualPort));
+        dualDiagnostic.SetExpectedSource(new(address, dualSender.ActualPort));
+        // Initial UDP loss is permitted; establish the return path before checking payload fidelity.
+        for (var attempt = 0; attempt < 10 && dualSender.Snapshot.ReceivedPackets == 0; attempt++)
+        {
+            dualSender.Send(new(1, attempt, true, new byte[1]), CancellationToken.None);
+            await Task.Delay(50);
+        }
+        Check(dualSender.Snapshot.ReceivedPackets > 0, address + ": initial UDP return path", dualSender.Snapshot);
+        var received = new TaskCompletionSource<ReceivedVideo>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var timing = new TaskCompletionSource<FrameDiagnostic>(TaskCreationOptions.RunContinuationsAsynchronously);
+        dualVideo.VideoReceived += video => received.TrySetResult(video);
+        dualDiagnostic.Received += value => timing.TrySetResult(value);
+        var payload = Enumerable.Range(0, 3000).Select(index => (byte)index).ToArray();
+        dualSender.Send(new(1, 0, true, payload), CancellationToken.None);
+        dualSender.SendDiagnostic(FrameDiagnosticProtocol.Encode(Timing(0)), new(address, dualDiagnostic.Port), CancellationToken.None);
+        Check((await received.Task.WaitAsync(TimeSpan.FromSeconds(2))).Data.SequenceEqual(payload), address + ": dual-stack video and canonical source filter", new { Bytes = payload.Length });
+        Check(await timing.Task.WaitAsync(TimeSpan.FromSeconds(2)) == Timing(0), address + ": dual-stack separate diagnostics", new { });
+        await Until(() => dualSender.Snapshot.ReceivedMbps > 0);
+        Check(dualSender.Snapshot.ReceivedMbps > 0, address + ": UDP feedback returns to sender", dualSender.Snapshot);
+    }
     using (var peer = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
     using (var videoPort = new UdpVideoReceiver())
     using (var diagnosticPort = new UdpFrameDiagnosticsReceiver())

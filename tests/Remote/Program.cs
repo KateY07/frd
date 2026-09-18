@@ -2,6 +2,12 @@ using System.Diagnostics;
 using System.Text.Json;
 using Frd;
 
+if (args is ["--dual-stack", var dualExecutable, var dualConfig, var dualReport])
+{
+    await Frd.Tests.DualStackRegression.Run(dualExecutable, dualConfig, dualReport);
+    return;
+}
+
 if (args is ["--auth-only", var executable, var authReport])
 {
     await Frd.Tests.AuthenticationRegression.Run(executable, authReport);
