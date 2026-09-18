@@ -24,6 +24,24 @@ FrameDiagnostic Timing(long id) => new(1, id, 100, 120, 150, Stopwatch.Frequency
 
 try
 {
+    using (var peer = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+    using (var videoPort = new UdpVideoReceiver())
+    using (var diagnosticPort = new UdpFrameDiagnosticsReceiver())
+    {
+        peer.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        var target = (IPEndPoint)peer.LocalEndPoint!;
+        foreach (var (kind, port, register) in new (string, int, Action<IPEndPoint>)[]
+            { ("video", videoPort.Port, videoPort.SetExpectedSource), ("diagnostic", diagnosticPort.Port, diagnosticPort.SetExpectedSource) })
+        {
+            register(target);
+            if (!peer.Poll(1_000_000, SelectMode.SelectRead)) throw new TimeoutException("Missing UDP registration");
+            var bytes = new byte[64];
+            EndPoint source = new IPEndPoint(IPAddress.Any, 0);
+            var length = peer.ReceiveFrom(bytes, ref source);
+            Check(length == 8 && bytes[4] == 3 && ((IPEndPoint)source).Port == port,
+                kind + " receive socket opens its own UDP return path", new { Bytes = length, SourcePort = port });
+        }
+    }
     var extended = Timing(22) with { Sending = new(2000, 2, 170, 190, 9.6, .2) };
     var extendedBytes = FrameDiagnosticProtocol.Encode(extended);
     Check(extendedBytes.Length == 88 && FrameDiagnosticProtocol.TryDecode(extendedBytes, out var restored) && restored == extended,

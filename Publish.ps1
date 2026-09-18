@@ -8,4 +8,5 @@ if ($LASTEXITCODE -ne 0) { throw 'Publish failed.' }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.md') -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/使用.md') -Destination $output
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/v1.pre1-验证.md') -Destination $output
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/双机补充验证.md') -Destination $output
 Write-Output ('Run FRD.exe in: ' + $output)

@@ -425,7 +425,7 @@ static class RemoteLaunch
         {
             var seconds = int.Parse(values.GetValueOrDefault("--test-seconds", "0"));
             if (seconds is < 0 or > 3600) throw new ArgumentException("Invalid test duration.");
-            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return 0;
+            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return Environment.ExitCode;
         }
         var address = IPAddress.Parse(values.GetValueOrDefault("--listen", "0.0.0.0"));
         if (address.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("目前支持 IPv4。");

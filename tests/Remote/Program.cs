@@ -2,10 +2,12 @@ using System.Diagnostics;
 using System.Text.Json;
 using Frd;
 
-if (args.Length < 2) throw new ArgumentException("CONFIG_PATH REPORT_PATH [--qsv]; host must listen on 127.0.0.1:45170 with token regression-local-45170");
+if (args.Length < 2) throw new ArgumentException("CONFIG_PATH REPORT_PATH [--qsv|--nvenc]; optional FRD_TEST_HOST, FRD_TEST_PORT, FRD_TEST_TOKEN environment variables");
 var config = AppConfiguration.Load(Path.GetFullPath(args[0]));
 List<object> steps = new();
-var options = new RemoteOptions("127.0.0.1", 45170, "regression-local-45170");
+var options = new RemoteOptions(Environment.GetEnvironmentVariable("FRD_TEST_HOST") ?? "127.0.0.1",
+    int.Parse(Environment.GetEnvironmentVariable("FRD_TEST_PORT") ?? "45170"),
+    Environment.GetEnvironmentVariable("FRD_TEST_TOKEN") ?? "regression-local-45170");
 using (var rejected = new DemoSession(config, options with { Token = "incorrect" }))
 {
     var refused = false;
@@ -34,6 +36,11 @@ for (var connection = 0; connection < 2; connection++)
     steps.Add(new { Case = "Authenticated separate input channel; no user input injected", Passed = true });
     var presets = new List<(string, int)> { ("h264_fast", 1000), ("h264_fast", 500) };
     if (args.Contains("--qsv")) presets.AddRange([("h264_qsv", 1000), ("h264_qsv_swdec", 1000)]);
+    if (args.Contains("--nvenc"))
+    {
+        presets.AddRange(new[] { 1000, 2000, 3000, 4000, 5000, 500 }.Select(cap => ("h264_nvenc_swdec", cap)));
+        presets.AddRange([("av1_nvenc_swdec", 1000), ("hevc_nvenc_swdec", 1000)]);
+    }
     presets.AddRange([("h264_lowdelay", 1000), ("h264", 2000)]);
     foreach (var (preset, cap) in presets)
     {

@@ -14,18 +14,23 @@ namespace Frd;
 
 static class FfmpegUi
 {
+    static int regressionExitCode;
     static Func<Window>? createWindow;
 
     public static void Run(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null)
     {
+        regressionExitCode = 0;
         createWindow = () => new DesktopWindow(config, autoCloseSeconds, reportPath, remote);
         AppBuilder.Configure<DemoApplication>().UsePlatformDetect().LogToTrace().StartWithClassicDesktopLifetime([]);
+        if (regressionExitCode != 0) Environment.ExitCode = regressionExitCode;
     }
 
     public static void RunPresentationRegression(AppConfiguration config, string reportPath)
     {
+        regressionExitCode = 0;
         createWindow = () => new PresentationTestWindow(config, reportPath);
         AppBuilder.Configure<DemoApplication>().UsePlatformDetect().LogToTrace().StartWithClassicDesktopLifetime([]);
+        if (regressionExitCode != 0) Environment.ExitCode = regressionExitCode;
     }
 
     sealed class DemoApplication : Application
@@ -550,9 +555,9 @@ static class FfmpegUi
                     Capture = captureBackend, CaptureStatistics = captureStatistics,
                     Render = "D3D11 upload → Present(0) → event query GPU completion; physical scan-out is not timed"
                 }, new JsonSerializerOptions { WriteIndented = true }));
-                if (autoCloseSeconds > 0 && !passed) Environment.ExitCode = 1;
+                if (autoCloseSeconds > 0 && !passed) regressionExitCode = 1;
             }
-            catch (Exception ex) { Console.Error.WriteLine($"[UI report] {ex}"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[UI report] {ex}"); regressionExitCode = 1; }
         }
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -625,9 +630,9 @@ static class FfmpegUi
                         DurationSeconds = elapsed.Elapsed.TotalSeconds, ExpectedGpuCounts = new[] { 1, 1, 2, 2 },
                         PresentedFrameIds = presentedIds, Assertions = assertions, Errors = errors
                     }, AppConfiguration.JsonOptions));
-                    Environment.ExitCode = passed ? 0 : 1;
+                    regressionExitCode = passed ? 0 : 1;
                 }
-                catch (Exception ex) { Console.Error.WriteLine(ex); Environment.ExitCode = 1; }
+                catch (Exception ex) { Console.Error.WriteLine(ex); regressionExitCode = 1; }
                 Close(); cancellation.Dispose();
             }
         }

@@ -8,6 +8,7 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
 $hostLog = Join-Path $output 'remote-host.stderr.log'
 $hostProcess = $null
 $controller = $null
+$negative = $null
 try {
     $hostProcess = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable) -ArgumentList '--host --listen 127.0.0.1 --port 45170 --token regression-local-45170' -WindowStyle Normal -RedirectStandardError $hostLog -RedirectStandardOutput (Join-Path $output 'remote-host.stdout.log') -PassThru
     $deadline = [DateTime]::UtcNow.AddSeconds(12)
@@ -27,10 +28,13 @@ try {
     $controller = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable) -ArgumentList ('--connect 127.0.0.1 --port 45170 --token regression-local-45170 --test-seconds 4 --report "' + $report + '"') -WindowStyle Normal -RedirectStandardError (Join-Path $output 'remote-ui.stderr.log') -RedirectStandardOutput (Join-Path $output 'remote-ui.stdout.log') -PassThru
     if (-not $controller.WaitForExit(25000)) { throw 'Remote UI regression timed out.' }
     if ($controller.ExitCode -ne 0 -or -not (Get-Content -LiteralPath $report -Raw | ConvertFrom-Json).Passed) { throw 'Remote GPU presentation regression failed.' }
+    $failedReport = Join-Path $output 'remote-ui-rejected.json'
+    $negative = Start-Process -FilePath $Executable -WorkingDirectory (Split-Path $Executable) -ArgumentList ('--connect 127.0.0.1 --port 45170 --token invalid-regression-token --test-seconds 1 --report "' + $failedReport + '"') -WindowStyle Normal -PassThru
+    if (-not $negative.WaitForExit(15000) -or $negative.ExitCode -ne 1 -or (Get-Content -LiteralPath $failedReport -Raw | ConvertFrom-Json).Passed) { throw 'Rejected UI connection did not return failure.' }
     Write-Output 'Remote control and real desktop GPU presentation: PASS'
 }
 finally {
-    foreach ($process in @($controller, $hostProcess)) {
+    foreach ($process in @($negative, $controller, $hostProcess)) {
         if ($null -eq $process -or $process.HasExited) { continue }
         [void]$process.CloseMainWindow()
         if (-not $process.WaitForExit(8000)) { Write-Warning ('Regression process did not close: ' + $process.Id); $process.Kill(); $process.WaitForExit() }

@@ -38,6 +38,16 @@ static class VideoDatagram
     public static void Log(string message, Exception? error = null) =>
         Console.Error.WriteLine($"[UDP] {message}{(error is null ? "" : $": {error}")}");
 
+    public static void OpenReturnPath(Socket socket, IPEndPoint peer)
+    {
+        // The receiving socket initiates its UDP flow so stateful firewalls can admit replies.
+        Span<byte> registration = stackalloc byte[8];
+        registration.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(registration, Magic);
+        registration[4] = 3;
+        socket.SendTo(registration, SocketFlags.None, peer);
+    }
+
     public static bool Recoverable(SocketException error, string operation)
     {
         if (error.SocketErrorCode is not (SocketError.ConnectionReset or SocketError.ConnectionRefused or
@@ -426,7 +436,11 @@ public sealed class UdpVideoReceiver : IDisposable
 
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public event Action<ReceivedVideo>? VideoReceived;
-    public void SetExpectedSource(IPEndPoint endpoint) => Volatile.Write(ref expectedSource, endpoint);
+    public void SetExpectedSource(IPEndPoint endpoint)
+    {
+        Volatile.Write(ref expectedSource, endpoint);
+        VideoDatagram.OpenReturnPath(socket, endpoint);
+    }
 
     void Receive()
     {

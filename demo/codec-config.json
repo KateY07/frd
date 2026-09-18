@@ -54,17 +54,17 @@
     },
     "h264_nvenc": {
       "label": "H.264 / NVIDIA NVENC · 限码率质量优先",
-      "encoderArguments": "-c:v h264_nvenc -preset p3 -tune ull -rc vbr -cq 22 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "encoderArguments": "-c:v h264_nvenc -preset p3 -tune ull -rc vbr -cq 22 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
       "decoderArguments": "-hwaccel cuda -c:v h264"
     },
     "av1_nvenc": {
       "label": "AV1 / NVIDIA NVENC · 限码率质量优先",
-      "encoderArguments": "-c:v av1_nvenc -preset p3 -tune ull -rc vbr -cq 28 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "encoderArguments": "-c:v av1_nvenc -preset p3 -tune ull -rc vbr -cq 28 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
       "decoderArguments": "-hwaccel cuda -c:v av1"
     },
     "hevc_nvenc": {
       "label": "HEVC / NVIDIA NVENC · 限码率质量优先",
-      "encoderArguments": "-c:v hevc_nvenc -preset p3 -tune ull -rc vbr -cq 24 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k",
+      "encoderArguments": "-c:v hevc_nvenc -preset p3 -tune ull -rc vbr -cq 24 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
       "decoderArguments": "-hwaccel cuda -c:v hevc"
     },
     "vp9_nvdec": {
@@ -78,6 +78,21 @@
       "unavailableReason": "当前分发的 FFmpeg 没有 AV2 编解码器；不会回退为其他编码冒充 AV2。后续构建提供后，可在这里填写其真实 -c:v 名称。",
       "encoderArguments": "",
       "decoderArguments": ""
+    },
+    "h264_nvenc_swdec": {
+      "decoderArguments": "-c:v h264 -threads 1",
+      "encoderArguments": "-c:v h264_nvenc -preset p3 -tune ull -rc vbr -cq 22 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
+      "label": "H264 / NVIDIA 硬编 + 软件解码"
+    },
+    "av1_nvenc_swdec": {
+      "decoderArguments": "-c:v libdav1d -threads 1",
+      "encoderArguments": "-c:v av1_nvenc -preset p3 -tune ull -rc vbr -cq 28 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
+      "label": "AV1 / NVIDIA 硬编 + 软件解码"
+    },
+    "hevc_nvenc_swdec": {
+      "decoderArguments": "-c:v hevc -threads 1",
+      "encoderArguments": "-c:v hevc_nvenc -preset p3 -tune ull -rc vbr -cq 24 -bf 0 -g 300 -rc-lookahead 0 -zerolatency 1 -bufsize 100k -delay 0 -forced-idr 1",
+      "label": "HEVC / NVIDIA 硬编 + 软件解码"
     }
   }
 }

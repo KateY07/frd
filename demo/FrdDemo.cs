@@ -228,6 +228,8 @@ public sealed partial class DemoSession : IDisposable
         await controlGate.WaitAsync(stop.Token);
         try
         {
+            if (enabled && remote != null && welcome != null)
+                diagnosticsReceiver?.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
             var result = await ExchangeAsync(new("diagnostics", AppliedGeneration, activePreset, appliedLimit, enabled));
             changes.Enqueue(new { Kind = "Independent diagnostic UDP", Enabled = enabled, Result = result });
             return result;
@@ -1708,7 +1710,11 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
         worker.Start();
     }
 
-    public void SetExpectedSource(IPEndPoint endpoint) => Volatile.Write(ref expectedSource, endpoint);
+    public void SetExpectedSource(IPEndPoint endpoint)
+    {
+        Volatile.Write(ref expectedSource, endpoint);
+        VideoDatagram.OpenReturnPath(socket, endpoint);
+    }
 
     void Read()
     {
@@ -3215,7 +3221,7 @@ static class RemoteLaunch
         {
             var seconds = int.Parse(values.GetValueOrDefault("--test-seconds", "0"));
             if (seconds is < 0 or > 3600) throw new ArgumentException("Invalid test duration.");
-            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return 0;
+            FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return Environment.ExitCode;
         }
         var address = IPAddress.Parse(values.GetValueOrDefault("--listen", "0.0.0.0"));
         if (address.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("目前支持 IPv4。");
@@ -3292,6 +3298,16 @@ static class VideoDatagram
     public static double Seconds(long ticks) => (double)ticks / Stopwatch.Frequency;
     public static void Log(string message, Exception? error = null) =>
         Console.Error.WriteLine($"[UDP] {message}{(error is null ? "" : $": {error}")}");
+
+    public static void OpenReturnPath(Socket socket, IPEndPoint peer)
+    {
+        // The receiving socket initiates its UDP flow so stateful firewalls can admit replies.
+        Span<byte> registration = stackalloc byte[8];
+        registration.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(registration, Magic);
+        registration[4] = 3;
+        socket.SendTo(registration, SocketFlags.None, peer);
+    }
 
     public static bool Recoverable(SocketException error, string operation)
     {
@@ -3681,7 +3697,11 @@ public sealed class UdpVideoReceiver : IDisposable
 
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public event Action<ReceivedVideo>? VideoReceived;
-    public void SetExpectedSource(IPEndPoint endpoint) => Volatile.Write(ref expectedSource, endpoint);
+    public void SetExpectedSource(IPEndPoint endpoint)
+    {
+        Volatile.Write(ref expectedSource, endpoint);
+        VideoDatagram.OpenReturnPath(socket, endpoint);
+    }
 
     void Receive()
     {
@@ -3858,18 +3878,23 @@ public sealed class UdpVideoReceiver : IDisposable
 // Source: FfmpegUi.cs
 static class FfmpegUi
 {
+    static int regressionExitCode;
     static Func<Window>? createWindow;
 
     public static void Run(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null)
     {
+        regressionExitCode = 0;
         createWindow = () => new DesktopWindow(config, autoCloseSeconds, reportPath, remote);
         AppBuilder.Configure<DemoApplication>().UsePlatformDetect().LogToTrace().StartWithClassicDesktopLifetime([]);
+        if (regressionExitCode != 0) Environment.ExitCode = regressionExitCode;
     }
 
     public static void RunPresentationRegression(AppConfiguration config, string reportPath)
     {
+        regressionExitCode = 0;
         createWindow = () => new PresentationTestWindow(config, reportPath);
         AppBuilder.Configure<DemoApplication>().UsePlatformDetect().LogToTrace().StartWithClassicDesktopLifetime([]);
+        if (regressionExitCode != 0) Environment.ExitCode = regressionExitCode;
     }
 
     sealed class DemoApplication : Application
@@ -4394,9 +4419,9 @@ static class FfmpegUi
                     Capture = captureBackend, CaptureStatistics = captureStatistics,
                     Render = "D3D11 upload → Present(0) → event query GPU completion; physical scan-out is not timed"
                 }, new JsonSerializerOptions { WriteIndented = true }));
-                if (autoCloseSeconds > 0 && !passed) Environment.ExitCode = 1;
+                if (autoCloseSeconds > 0 && !passed) regressionExitCode = 1;
             }
-            catch (Exception ex) { Console.Error.WriteLine($"[UI report] {ex}"); }
+            catch (Exception ex) { Console.Error.WriteLine($"[UI report] {ex}"); regressionExitCode = 1; }
         }
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -4469,9 +4494,9 @@ static class FfmpegUi
                         DurationSeconds = elapsed.Elapsed.TotalSeconds, ExpectedGpuCounts = new[] { 1, 1, 2, 2 },
                         PresentedFrameIds = presentedIds, Assertions = assertions, Errors = errors
                     }, AppConfiguration.JsonOptions));
-                    Environment.ExitCode = passed ? 0 : 1;
+                    regressionExitCode = passed ? 0 : 1;
                 }
-                catch (Exception ex) { Console.Error.WriteLine(ex); Environment.ExitCode = 1; }
+                catch (Exception ex) { Console.Error.WriteLine(ex); regressionExitCode = 1; }
                 Close(); cancellation.Dispose();
             }
         }

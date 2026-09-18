@@ -196,6 +196,8 @@ public sealed partial class DemoSession : IDisposable
         await controlGate.WaitAsync(stop.Token);
         try
         {
+            if (enabled && remote != null && welcome != null)
+                diagnosticsReceiver?.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
             var result = await ExchangeAsync(new("diagnostics", AppliedGeneration, activePreset, appliedLimit, enabled));
             changes.Enqueue(new { Kind = "Independent diagnostic UDP", Enabled = enabled, Result = result });
             return result;

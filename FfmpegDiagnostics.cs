@@ -81,7 +81,11 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
         worker.Start();
     }
 
-    public void SetExpectedSource(IPEndPoint endpoint) => Volatile.Write(ref expectedSource, endpoint);
+    public void SetExpectedSource(IPEndPoint endpoint)
+    {
+        Volatile.Write(ref expectedSource, endpoint);
+        VideoDatagram.OpenReturnPath(socket, endpoint);
+    }
 
     void Read()
     {
