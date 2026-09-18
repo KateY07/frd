@@ -22,9 +22,13 @@ public sealed record AppConfiguration
     public int SchemaVersion { get; init; } = 3;
     public int Width { get; init; } = 1280;
     public int Height { get; init; } = 720;
+    public double TransmissionScale { get; init; } = 1;
     public int FramesPerSecond { get; init; } = 30;
     public string InitialPreset { get; init; } = "h264";
     public int InitialBitrateKbps { get; init; } = 1000;
+    public double MaximumBitrateMbps { get; init; } = 100;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int MaximumBitrateKbps => checked((int)Math.Round(MaximumBitrateMbps * 1000));
     public string LibraryDirectory { get; init; } = "ffmpeg";
     public NetworkSimulation Simulation { get; init; } = new();
     public Dictionary<string, CodecPreset> Presets { get; init; } = new();
@@ -34,8 +38,11 @@ public sealed record AppConfiguration
         var config = JsonSerializer.Deserialize<AppConfiguration>(File.ReadAllText(path), JsonOptions) ?? throw new InvalidDataException("Empty codec configuration.");
         if (config.SchemaVersion != 3 || config.Width < 64 || config.Height < 64 || config.Width > 7680 || config.Height > 4320 || config.Width % 2 != 0 || config.Height % 2 != 0)
             throw new InvalidDataException("Expected schemaVersion=3 and even video dimensions between 64 and 7680×4320.");
-        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps is < 100 or > 5000 || !config.Presets.ContainsKey(config.InitialPreset))
+        if (!double.IsFinite(config.MaximumBitrateMbps) || config.MaximumBitrateMbps is < .1 or > 1000)
+            throw new InvalidDataException("maximumBitrateMbps must be between 0.1 and 1000.");
+        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
             throw new InvalidDataException("Invalid FPS, initial bitrate, or initial preset.");
+        TransmissionGeometry.ValidateScale(config.TransmissionScale);
         var directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, config.LibraryDirectory));
         FfmpegRuntime.Initialize(directory);
         return config;
@@ -75,14 +82,21 @@ public sealed record SessionStatus(string ActivePreset, int AppliedLimitKbps, do
 }
 public sealed record TransferTimings(int PayloadBytes, int Packets, double SenderMs, double PlannedWaitMs,
     double WakeupOverrunMs, double LastSendToReassemblyMs, double ReceiveQueueMs);
-public sealed record ControlResult(bool Success, string Message, int Generation);
-sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false);
+public sealed record ControlResult(bool Success, string Message, int Generation)
+{
+    public int Width { get; init; }
+    public int Height { get; init; }
+    public double TransmissionScale { get; init; } = 1;
+}
+sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null);
 sealed record PendingControl(ControlCommand Command, TaskCompletionSource<ControlResult> Completion);
 
 public sealed partial class DemoSession : IDisposable
 {
     AppConfiguration config;
     readonly Func<byte[]> capture;
+    readonly Action<int, int>? resizeCapture;
+    readonly int sourceWidth, sourceHeight;
     readonly CancellationTokenSource stop = new();
     readonly SemaphoreSlim controlGate = new(1, 1);
     readonly Channel<PendingControl> commands = Channel.CreateUnbounded<PendingControl>(new() { SingleReader = true });
@@ -139,7 +153,11 @@ public sealed partial class DemoSession : IDisposable
             Transfer / Math.Max(1, count), Decode / Math.Max(1, count), Render / Math.Max(1, count));
     }
 
-    public DemoSession(AppConfiguration config, Func<byte[]> capture) { this.config = config; this.capture = capture; }
+    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null, int sourceWidth = 0, int sourceHeight = 0)
+    {
+        this.config = config; this.capture = capture; this.resizeCapture = resizeCapture;
+        this.sourceWidth = sourceWidth; this.sourceHeight = sourceHeight;
+    }
 
     public async Task StartAsync()
     {
@@ -167,9 +185,10 @@ public sealed partial class DemoSession : IDisposable
         if (!result.Success) throw new InvalidOperationException(result.Message);
     }
 
-    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps)
+    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null)
     {
-        if (limitKbps is < 100 or > 5000) return new(false, "码率范围为 100–5000 kbps。", AppliedGeneration);
+        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "传输比例仅支持 1×、0.75×、0.5×。", AppliedGeneration);
+        if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
         if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
         if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
         await controlGate.WaitAsync(stop.Token);
@@ -180,12 +199,14 @@ public sealed partial class DemoSession : IDisposable
             try { decoder = new(preset.DecoderArguments); }
             catch (Exception ex) { Console.Error.WriteLine(ex); return new(false, ex.Message, AppliedGeneration); }
             lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = presetId; }
-            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps));
+            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale));
             if (!result.Success || result.Generation != generation)
             {
                 lock (decoderGate) { decoders.Remove(generation); presetNames.Remove(generation); decoder.Dispose(); }
             }
             changes.Enqueue(new { Preset = presetId, LimitKbps = limitKbps, Result = result });
+            if (result.Success && result.Width > 0 && result.Height > 0)
+                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale };
             return result;
         }
         finally { controlGate.Release(); }
@@ -265,19 +286,30 @@ public sealed partial class DemoSession : IDisposable
                             continue;
                         }
                         if (!config.Presets.TryGetValue(cmd.PresetId, out var preset) || !preset.Enabled) throw new InvalidDataException("Preset unavailable on sender.");
-                        if (cmd.LimitKbps is < 100 or > 5000 || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
-                        if (encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
+                        if (cmd.LimitKbps < 100 || cmd.LimitKbps > config.MaximumBitrateKbps || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
+                        var scale = cmd.Scale ?? config.TransmissionScale;
+                        TransmissionGeometry.ValidateScale(scale);
+                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) : TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
+                        if (resizeCapture == null && cmd.Scale is { } requestedScale && requestedScale != config.TransmissionScale)
+                            throw new InvalidOperationException("This capture source cannot change transmission scale.");
+                        var resize = dimensions.Width != config.Width || dimensions.Height != config.Height;
+                        ControlResult Applied(string text, int revision) => new(true, text, revision)
+                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
+                        if (!resize && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
                         {
                             sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, cmd.LimitKbps);
-                            pending.Completion.TrySetResult(new(true, "发送端已在原会话更新码率上限", AppliedGeneration));
+                            pending.Completion.TrySetResult(Applied("发送端已在原会话更新码率上限", AppliedGeneration));
                             continue;
                         }
-                        var replacement = new FfmpegEncoder(preset.EncoderArguments, config.Width, config.Height, config.FramesPerSecond, cmd.LimitKbps);
+                        var replacement = new FfmpegEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height, config.FramesPerSecond, cmd.LimitKbps);
+                        try { if (resize) resizeCapture!(dimensions.Width, dimensions.Height); }
+                        catch { replacement.Dispose(); throw; }
                         encoder?.Dispose(); encoder = replacement;
+                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
                         sender!.SetEncoderBitrateKbps(cmd.LimitKbps);
                         activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, cmd.LimitKbps); Volatile.Write(ref appliedGeneration, cmd.Generation);
                         force = true; message = "手动控制；带宽估计仅参考";
-                        pending.Completion.TrySetResult(new(true, "发送端已应用；等待新预设首帧", cmd.Generation));
+                        pending.Completion.TrySetResult(Applied("发送端已应用；等待新预设首帧", cmd.Generation));
                     }
                     catch (Exception ex) { Console.Error.WriteLine(ex); pending.Completion.TrySetResult(new(false, ex.Message, AppliedGeneration)); }
                 }

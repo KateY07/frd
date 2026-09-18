@@ -251,6 +251,7 @@ public sealed class RemoteInputClient : IDisposable
 
 public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
 {
+    static readonly bool traceInput = Environment.GetEnvironmentVariable("FRD_TRACE_INPUT") == "1";
     public const nuint InjectionMarker = 0x46524449;
     readonly ConcurrentDictionary<nint, byte> controllers = new();
     readonly HashSet<(int ScanCode, bool Extended)> keys = new();
@@ -263,6 +264,8 @@ public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
 
     public RemoteInputResult Inject(RemoteInputEvent input)
     {
+        if (traceInput && input.Kind != RemoteInputKind.MouseMove)
+            Console.Error.WriteLine($"[input trace] tick={Environment.TickCount64} kind={input.Kind} scan={input.ScanCode} foreground={GetForegroundWindow()}");
         lock (gate)
         {
             if (input.Kind == RemoteInputKind.ReleaseAll) return ReleaseAll();
@@ -403,6 +406,34 @@ public sealed class NativeInputSource : IDisposable
     static long nextId;
     bool enabled, disposed;
     int heldButtons;
+    readonly Dictionary<long, nint> cursors = new();
+    nint remoteCursor;
+    bool hasRemoteCursor, remoteCursorVisible = true;
+
+    public void SetRemoteCursor(CursorUpdate update)
+    {
+        if (disposed) return;
+        if (update.Reset) ClearCursors();
+        if (update.Shape != null)
+        {
+            if (cursors.Count >= 64 && !cursors.ContainsKey(update.Id)) throw new InvalidDataException("Cursor cache limit exceeded.");
+            var cursor = NativeCursor.Create(update.Shape);
+            if (cursors.Remove(update.Id, out var previous)) NativeCursor.Release(previous);
+            cursors[update.Id] = cursor;
+        }
+        if (update.Id != 0 && !cursors.TryGetValue(update.Id, out remoteCursor)) throw new InvalidDataException("Unknown remote cursor shape.");
+        if (update.Id == 0) remoteCursor = 0;
+        hasRemoteCursor = true; remoteCursorVisible = update.Visible;
+        if (enabled && GetCursorPos(out var position) && WindowFromPoint(position) == hwnd)
+            NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0);
+    }
+
+    void ClearCursors()
+    {
+        if (hasRemoteCursor) NativeCursor.Set(NativeCursor.Arrow);
+        foreach (var cursor in cursors.Values) NativeCursor.Release(cursor);
+        cursors.Clear(); remoteCursor = 0; hasRemoteCursor = false;
+    }
     public event Action<RemoteInputEvent>? Input;
     public event Action? ExitRequested;
     public event Action<Exception>? Failed;
@@ -424,6 +455,7 @@ public sealed class NativeInputSource : IDisposable
         {
             heldButtons = 0;
             if (GetCapture() == hwnd) ReleaseCapture();
+            if (hasRemoteCursor && GetCursorPos(out var point) && WindowFromPoint(point) == hwnd) NativeCursor.Set(NativeCursor.Arrow);
         }
     }
 
@@ -433,6 +465,8 @@ public sealed class NativeInputSource : IDisposable
         {
             // STATIC defaults to HTTRANSPARENT, which bypasses this window's real mouse messages.
             if (enabled && message == 0x0084) return 1;
+            if (enabled && hasRemoteCursor && message == 0x0020 && ((long)lParam & 0xFFFF) == 1)
+            { NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0); return 1; }
             if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
             {
                 if (message is 0x0100 or 0x0104 && wParam == 0x1B)
@@ -489,6 +523,7 @@ public sealed class NativeInputSource : IDisposable
     {
         if (disposed) return;
         SetEnabled(false);
+        ClearCursors();
         if (!RemoveWindowSubclass(hwnd, procedure, id)) InputProtocol.Log("Cannot detach preview input capture", new Win32Exception(Marshal.GetLastWin32Error()));
         disposed = true;
     }
@@ -496,6 +531,8 @@ public sealed class NativeInputSource : IDisposable
     [StructLayout(LayoutKind.Sequential)] struct NativePoint { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct NativeRect { public int Left, Top, Right, Bottom; }
     delegate nint SubclassProcedure(nint hwnd, uint message, nuint wParam, nint lParam, nuint subclassId, nuint reference);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out NativePoint point);
+    [DllImport("user32.dll")] static extern nint WindowFromPoint(NativePoint point);
     [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool SetWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id, nuint reference);
     [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool RemoveWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id);
     [DllImport("comctl32.dll")] static extern nint DefSubclassProc(nint hwnd, uint message, nuint wParam, nint lParam);

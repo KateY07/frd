@@ -33,6 +33,9 @@ public sealed class ConfirmedVideoView : NativeControlHost
     public event Action<RemoteInputEvent>? Input;
     public event Action? InputExitRequested;
     public nint SourceWindow => sourceWindow;
+    public int VideoWidth => Volatile.Read(ref sourceWidth);
+    public int VideoHeight => Volatile.Read(ref sourceHeight);
+    public void SetRemoteCursor(CursorUpdate update) => inputSource?.SetRemoteCursor(update);
 
     public void SetInputEnabled(bool enabled)
     {

@@ -12,10 +12,11 @@ using Avalonia.Threading;
 
 namespace Frd;
 
-static class FfmpegUi
+static partial class FfmpegUi
 {
     static int regressionExitCode;
     static Func<Window>? createWindow;
+    internal static string? InteractionScriptPath;
 
     public static void Run(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null)
     {
@@ -47,27 +48,33 @@ static class FfmpegUi
         }
     }
 
-    sealed class DesktopWindow : Window
+    sealed partial class DesktopWindow : Window
     {
         AppConfiguration config;
         readonly RemoteOptions? remoteOptions;
         readonly string? reportPath;
         readonly int autoCloseSeconds;
         readonly ComboBox presets = new() { Name = "EncoderPreset", HorizontalAlignment = HorizontalAlignment.Stretch };
-        readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = 100, Maximum = 5000, TickFrequency = 50, IsSnapToTickEnabled = true };
-        readonly TextBlock bitrateLabel = new();
-        readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 15 };
+        readonly ComboBox transmissionScale = new() { Name = "TransmissionScale", Width = 165, IsEnabled = false };
+        readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = .1, Maximum = 100, TickFrequency = .1, IsSnapToTickEnabled = true };
+        readonly NumericUpDown bitrateLabel = new() { Name = "BitrateValueMbps", Minimum = .1m, Maximum = 100m, Increment = .1m, FormatString = "0.0##", Width = 115 };
+        bool updatingBitrate;
+        readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
         readonly TextBlock operation = new() { TextWrapping = TextWrapping.Wrap };
         readonly TextBlock captureDetails = new() { TextWrapping = TextWrapping.Wrap, Opacity = .8, Margin = new Thickness(0, 4, 0, 6) };
         readonly TextBlock summary = new() { Text = "FRD · 真实屏幕 / FFmpeg / UDP", VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
         readonly TextBlock[] timings = Enumerable.Range(0, 6).Select(_ => new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 8, 3) }).ToArray();
-        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto,Auto,Auto,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+        readonly DiagnosticWatermark watermark = new();
+        readonly TextBlock controlTitle = new() { Text = "FRD 控制", VerticalAlignment = VerticalAlignment.Center };
         readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Esc 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
         readonly CheckBox packetDiagnostics = new() { Name = "PacketDiagnostics", Content = "诊断包", IsEnabled = false, Margin = new Thickness(8, 0) };
+        readonly CheckBox clipboardEnabled = new() { Name = "ClipboardSync", Content = "剪贴板同步（文本、文件、目录）", IsEnabled = false };
+        readonly TextBlock clipboardMessage = new() { Text = "关闭；开启后同步两端新复制的内容", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 0) };
         readonly Button collapse = new() { Name = "CollapseDiagnostics", Content = "收起 ▴", MinWidth = 72 };
         readonly Window overlay = new()
         {
-            Title = "FRD 控制与诊断", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
+            Title = "FRD 控制栏", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
             ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.Height,
             RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark,
             Background = Brushes.Transparent, TransparencyLevelHint = [WindowTransparencyLevel.Transparent]
@@ -83,11 +90,15 @@ static class FfmpegUi
         readonly CancellationTokenSource inputStop = new();
         readonly List<string> errors = new();
         readonly DateTime startedUtc = DateTime.UtcNow;
-        DesktopCapture? capture;
+        DesktopStreamSource? capture;
         DemoSession? session;
         Win32InputInjector? inputInjector;
         RemoteInputServer? inputServer;
         RemoteInputClient? inputClient;
+        ClipboardSyncSession? clipboardSync;
+        CursorClient? cursorClient;
+        readonly SemaphoreSlim clipboardTransition = new(1, 1);
+        bool updatingClipboard;
         Task? inputWorker;
         string? lastInputMessage, captureBackend;
         DesktopCaptureStatistics? captureStatistics;
@@ -115,7 +126,7 @@ static class FfmpegUi
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Content = new Border { Background = Brushes.Black, Child = preview };
             var header = new Grid { ColumnDefinitions = new("*,Auto,Auto,Auto") };
-            header.Children.Add(summary); Grid.SetColumn(inputEnabled, 1); header.Children.Add(inputEnabled);
+            header.Children.Add(controlTitle); Grid.SetColumn(inputEnabled, 1); header.Children.Add(inputEnabled);
             Grid.SetColumn(packetDiagnostics, 2); header.Children.Add(packetDiagnostics);
             Grid.SetColumn(collapse, 3); header.Children.Add(collapse);
             var panel = new StackPanel(); panel.Children.Add(header); panel.Children.Add(details);
@@ -125,26 +136,44 @@ static class FfmpegUi
                 BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Child = panel
             };
             overlay.Foreground = Brushes.Gainsboro;
-            var controls = new Grid { ColumnDefinitions = new("280,20,*,90"), RowDefinitions = new("Auto,Auto"), Margin = new Thickness(0, 0, 0, 8) };
+            var controls = new Grid { ColumnDefinitions = new("260,16,*,125"), RowDefinitions = new("Auto,Auto"), Margin = new Thickness(0, 0, 0, 8) };
             controls.Children.Add(new TextBlock { Text = "主控端手动选择编码预设", Margin = new Thickness(0, 0, 0, 5) });
             Grid.SetRow(presets, 1); controls.Children.Add(presets);
-            var capTitle = new TextBlock { Text = "编码码率上限（kbps）· 拖动后自动应用", Margin = new Thickness(0, 0, 0, 5) };
+            var capTitle = new TextBlock { Text = "编码码率上限（Mbps）· 可拖动或直接输入", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) };
             Grid.SetColumn(capTitle, 2); Grid.SetColumnSpan(capTitle, 2); controls.Children.Add(capTitle);
             Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 1); controls.Children.Add(bitrate);
             bitrateLabel.VerticalAlignment = VerticalAlignment.Center; bitrateLabel.HorizontalAlignment = HorizontalAlignment.Right;
             Grid.SetColumn(bitrateLabel, 3); Grid.SetRow(bitrateLabel, 1); controls.Children.Add(bitrateLabel);
             Add(details, controls, 0);
+            var diagnostics = new StackPanel { IsHitTestVisible = false, Opacity = .8 };
+            diagnostics.Children.Add(summary);
+            watermark.FontSize = 12; watermark.Foreground = Brushes.White;
+            watermark.Content = new Border
+            {
+                Background = new SolidColorBrush(Color.Parse("#6017202B")),
+                CornerRadius = new CornerRadius(6), Padding = new Thickness(10), Child = diagnostics,
+                IsHitTestVisible = false, ClipToBounds = true
+            };
             metrics.Margin = new Thickness(0, 4, 0, 5); metrics.Text = "正在启动真实捕获与 FFmpeg…";
-            Add(details, metrics, 1);
-            Add(details, new TextBlock { Text = "分层耗时：最近一帧 / 近 1 秒平均（ms）；无新样本显示 —", Opacity = .8 }, 2);
+            diagnostics.Children.Add(metrics);
+            diagnostics.Children.Add(new TextBlock { Text = "分层耗时：最近一帧 / 近 1 秒平均（ms）；无新样本显示 —", Opacity = .8 });
             var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
             for (var i = 0; i < timings.Length; i++) { Grid.SetRow(timings[i], i / 3); Grid.SetColumn(timings[i], i % 3); timingGrid.Children.Add(timings[i]); }
-            Add(details, timingGrid, 3); Add(details, captureDetails, 4); Add(details, operation, 5);
-            Add(details, new TextBlock
+            diagnostics.Children.Add(timingGrid); diagnostics.Children.Add(captureDetails); Add(details, operation, 1);
+            var clipboardRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 5, 0, 0) };
+            clipboardRow.Children.Add(clipboardEnabled); Grid.SetColumn(clipboardMessage, 1); clipboardRow.Children.Add(clipboardMessage);
+            Add(details, clipboardRow, 2);
+            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale => new ComboBoxItem { Content = scale == 1 ? "1× 原始分辨率" : $"{scale}× 宽高", Tag = scale }).ToArray();
+            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
+            var scaleRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 6, 0, 0) };
+            scaleRow.Children.Add(transmissionScale);
+            var scaleHelp = new TextBlock { Text = "传输比例 · 与主控窗口缩放无关", Margin = new Thickness(12, 0), VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
+            Grid.SetColumn(scaleHelp, 1); scaleRow.Children.Add(scaleHelp); Add(details, scaleRow, 3);
+            diagnostics.Children.Add(new TextBlock
             {
                 Text = "带宽估计仅供参考。传输含限速与重组，渲染含等待绘制；GPU 完成不等于物理扫描。相同像素保持显示，静止绘制 FPS 可为 0。",
                 TextWrapping = TextWrapping.Wrap, Opacity = .7, Margin = new Thickness(0, 8, 0, 0)
-            }, 6);
+            });
 
             var entries = config.Presets.Select(pair =>
             {
@@ -154,37 +183,57 @@ static class FfmpegUi
             }).ToArray();
             presets.ItemsSource = entries;
             presets.SelectedItem = entries.FirstOrDefault(item => Equals(item.Tag, config.InitialPreset));
-            bitrate.Value = Math.Clamp(config.InitialBitrateKbps, 100, 5000); UpdateBitrateLabel();
-            presets.IsEnabled = bitrate.IsEnabled = false;
+            bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+            bitrate.Value = Math.Clamp(config.InitialBitrateKbps / 1000d, .1, config.MaximumBitrateMbps); UpdateBitrateLabel();
+            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = false;
             presets.SelectionChanged += (_, _) => ScheduleApply();
+            transmissionScale.SelectionChanged += (_, _) => ScheduleApply();
             bitrate.PropertyChanged += (_, args) =>
             {
                 if (args.Property == Slider.ValueProperty) { UpdateBitrateLabel(); ScheduleApply(); }
+            };
+            bitrateLabel.ValueChanged += (_, _) =>
+            {
+                if (updatingBitrate || bitrateLabel.Value is not { } value) return;
+                bitrate.Value = Math.Clamp((double)value, bitrate.Minimum, bitrate.Maximum);
             };
             refresh.Tick += (_, _) => RefreshStatus();
             debounce.Tick += (_, _) => ApplySelection();
             autoClose.Tick += (_, _) => { autoClose.Stop(); Close(); };
             collapse.Click += (_, _) => ToggleDetails();
             inputEnabled.IsCheckedChanged += (_, _) => ChangeInputToggle();
+            clipboardEnabled.IsCheckedChanged += async (_, _) =>
+            {
+                if (updatingClipboard || stopping) return;
+                try { await SetClipboardAsync(clipboardEnabled.IsChecked == true); }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine("[clipboard] " + error); clipboardMessage.Text = error.Message;
+                    updatingClipboard = true; clipboardEnabled.IsChecked = false; updatingClipboard = false;
+                }
+            };
             packetDiagnostics.IsCheckedChanged += (_, _) => ChangeDiagnostics();
             AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
             overlay.AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "诊断浮层"); PositionOverlay(); };
+            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "控制栏"); PositionOverlay(); };
+            watermark.Opened += (_, _) => { ExcludeFromCapture(watermark, "诊断水印"); PositionOverlay(); };
+            overlay.SizeChanged += (_, _) => PositionOverlay();
+            watermark.SizeChanged += (_, _) => PositionOverlay();
             overlay.Closing += Shutdown;
             PositionChanged += (_, _) => PositionOverlay();
             PropertyChanged += (_, args) =>
             {
                 if (args.Property == ClientSizeProperty || args.Property == BoundsProperty) PositionOverlay();
-                if (args.Property == WindowStateProperty && overlay.IsVisible && WindowState == WindowState.Minimized) overlay.Hide();
+                if (args.Property == WindowStateProperty && WindowState == WindowState.Minimized) { overlay.Hide(); watermark.Hide(); }
                 else if (args.Property == WindowStateProperty && started && !stopping && WindowState != WindowState.Minimized)
-                { if (!overlay.IsVisible) overlay.Show(this); PositionOverlay(); }
+                { if (!watermark.IsVisible) watermark.Show(this); if (!overlay.IsVisible) overlay.Show(this); PositionOverlay(); }
             };
             Opened += Start;
             Closing += Shutdown;
         }
 
         static void Add(Grid grid, Control child, int row) { Grid.SetRow(child, row); grid.Children.Add(child); }
-        void UpdateBitrateLabel() => bitrateLabel.Text = $"{(int)Math.Round(bitrate.Value):N0}";
+        void UpdateBitrateLabel() { updatingBitrate = true; bitrateLabel.Value = (decimal)bitrate.Value; updatingBitrate = false; }
 
         void ExitInputOnEscape(object? sender, Avalonia.Input.KeyEventArgs args)
         {
@@ -211,8 +260,9 @@ static class FfmpegUi
             ToggleDetails(); await Task.Delay(100);
             if (stopping) return;
             var nativeOwner = GetWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0, 4) == (TryGetPlatformHandle()?.Handle ?? 0);
-            overlayPassed = nativeOwner && keptToggle && folded > 0 && folded < expanded && details.IsVisible && expandedBounds.Passed && foldedBounds.Passed;
-            overlayCheck = new { Passed = overlayPassed, NativeOwnedWindow = nativeOwner, ExpandedHeight = expanded, CollapsedHeight = folded, CollapseButtonRemainsVisible = keptToggle, ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds };
+            var passThrough = watermark.VerifyPassThrough(preview.SourceWindow);
+            overlayPassed = nativeOwner && passThrough && keptToggle && folded > 0 && folded < expanded && details.IsVisible && expandedBounds.Passed && foldedBounds.Passed;
+            overlayCheck = new { Passed = overlayPassed, WatermarkMouseTransparent = passThrough, WatermarkCannotActivate = passThrough, WatermarkOpacity = .8, NativeOwnedWindow = nativeOwner, ExpandedHeight = expanded, CollapsedHeight = folded, CollapseButtonRemainsVisible = keptToggle, ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds };
             if (!overlayPassed) throw new InvalidOperationException("真实浮层或折叠布局验证失败");
         }
 
@@ -227,7 +277,7 @@ static class FfmpegUi
             var inside = origin.X >= outerOrigin.X - 1 && origin.Y >= outerOrigin.Y - 1 &&
                 origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
                 origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
-            Control[] controls = expanded ? [summary, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel, metrics, captureDetails, .. timings] : [summary, inputEnabled, packetDiagnostics, collapse];
+            Control[] controls = expanded ? [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel, clipboardEnabled, transmissionScale] : [controlTitle, inputEnabled, packetDiagnostics, collapse];
             var contentInside = controls.All(control =>
             {
                 var point = control.PointToScreen(new Point());
@@ -243,6 +293,12 @@ static class FfmpegUi
             if (!overlay.IsVisible || ClientSize.Width <= 0) return;
             overlay.Width = Math.Max(340, Math.Min(details.IsVisible ? 1100 : 750, ClientSize.Width - 24));
             overlay.Position = this.PointToScreen(new Point(Math.Max(12, (ClientSize.Width - overlay.Width) / 2), 12));
+            if (watermark.IsVisible)
+            {
+                watermark.Width = Math.Max(340, Math.Min(1100, ClientSize.Width - 24));
+                watermark.MaxHeight = Math.Max(40, ClientSize.Height - overlay.ClientSize.Height - 36);
+                watermark.Position = this.PointToScreen(new Point(12, Math.Max(12, ClientSize.Height - watermark.ClientSize.Height - 12)));
+            }
         }
 
         void ExcludeFromCapture(Window window, string description)
@@ -254,11 +310,15 @@ static class FfmpegUi
         async void Start(object? sender, EventArgs args)
         {
             ExcludeFromCapture(this, "预览窗口");
-            overlay.Show(this); PositionOverlay();
+            watermark.Show(this); overlay.Show(this); PositionOverlay();
             refresh.Start();
             try
             {
-                if (remoteOptions == null) { capture = new(config.Width, config.Height); session = new(config, capture.Capture); }
+                if (remoteOptions == null)
+                {
+                    capture = new(config.TransmissionScale); config = config with { Width = capture.Width, Height = capture.Height };
+                    session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                }
                 else session = new(config, remoteOptions);
                 session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(frame); };
                 session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
@@ -266,16 +326,32 @@ static class FfmpegUi
                 if (remoteOptions != null)
                 {
                     config = session.Configuration;
-                    bitrate.Value = config.InitialBitrateKbps;
+                    bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+                    bitrate.Value = config.InitialBitrateKbps / 1000d;
                     presets.ItemsSource = config.Presets.Select(entry => new ComboBoxItem
                         { Content = entry.Value.Label, Tag = entry.Key, IsEnabled = entry.Value.Enabled }).ToArray();
                     presets.SelectedItem = presets.Items.Cast<ComboBoxItem>().FirstOrDefault(item => (string?)item.Tag == config.InitialPreset);
+                    transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
                 }
                 if (stopping) return;
                 await StartInputAsync();
+                if (session.IsRemote)
+                    cursorClient = await session.ConnectRemoteCursorAsync(update => Dispatcher.UIThread.Post(() =>
+                    {
+                        if (stopping) return;
+                        try { preview.SetRemoteCursor(update); if (InteractionScriptPath != null) interactionCursors.Add(update); }
+                        catch (Exception error) { ReportError(error); }
+                    }), error => Dispatcher.UIThread.Post(() => ReportError(error)), inputStop.Token);
                 if (stopping) return;
-                started = true; presets.IsEnabled = bitrate.IsEnabled = true;
+                started = true; presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
+                clipboardEnabled.IsEnabled = session.IsRemote;
+                if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
+                if (InteractionScriptPath != null)
+                {
+                    await VerifyOverlayAsync();
+                    await RunInteractionAsync(InteractionScriptPath); return;
+                }
                 if (autoCloseSeconds > 0)
                 {
                     await VerifyOverlayAsync();
@@ -307,6 +383,7 @@ static class FfmpegUi
             inputInjector = new();
             inputInjector.RegisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
             inputInjector.RegisterControllerWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0);
+            inputInjector.RegisterControllerWindow(watermark.TryGetPlatformHandle()?.Handle ?? 0);
             inputInjector.RegisterControllerWindow(preview.SourceWindow);
             inputServer = new(inputInjector);
             inputServer.Failed += ex => Dispatcher.UIThread.Post(() => ReportError(ex));
@@ -314,6 +391,27 @@ static class FfmpegUi
             if (stopping || inputStop.IsCancellationRequested) { client.Dispose(); return; }
             inputClient = client;
             inputWorker = Task.Run(SendInputLoopAsync);
+        }
+
+        async Task SetClipboardAsync(bool enabled)
+        {
+            await clipboardTransition.WaitAsync();
+            try
+            {
+                clipboardEnabled.IsEnabled = false;
+                if (clipboardSync != null) { await clipboardSync.DisposeAsync(); clipboardSync = null; }
+                if (enabled)
+                {
+                    clipboardSync = await session!.ConnectRemoteClipboardAsync(new WindowsClipboard(TryGetPlatformHandle()?.Handle ?? 0), inputStop.Token);
+                    clipboardSync.Status += status => Dispatcher.UIThread.Post(() =>
+                    {
+                        clipboardMessage.Text = status.Message;
+                        if (!status.Connected && !stopping) clipboardEnabled.IsChecked = false;
+                    });
+                }
+                clipboardMessage.Text = enabled ? "已开启；同步两端新复制的内容" : "已关闭剪贴板同步";
+            }
+            finally { clipboardEnabled.IsEnabled = !stopping && session?.IsRemote == true; clipboardTransition.Release(); }
         }
 
         async void ChangeDiagnostics()
@@ -372,8 +470,8 @@ static class FfmpegUi
         {
             if (stopping || inputClient?.Enabled != true) return;
             var source = capture?.Statistics;
-            var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, config.Width, config.Height, session.RemoteSourceWidth, session.RemoteSourceHeight) :
-                source == null ? input : InputCoordinates.MapFromVideo(input, config.Width, config.Height, source.SourceWidth, source.SourceHeight);
+            var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, session.RemoteSourceWidth, session.RemoteSourceHeight) :
+                source == null ? input : InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, source.SourceWidth, source.SourceHeight);
             if (mapped == null) return;
             lock (inputGate)
             {
@@ -448,13 +546,15 @@ static class FfmpegUi
             if (applying) { applyAgain = true; return; }
             if (presets.SelectedItem is not ComboBoxItem { Tag: string presetId }) return;
             applying = true;
-            var limit = (int)Math.Round(bitrate.Value);
-            operation.Text = $"正在请求被控端应用 {presetId} / {limit:N0} kbps…";
+            var limit = (int)Math.Round(bitrate.Value * 1000);
+            operation.Text = $"正在请求被控端应用 {presetId} / {limit / 1000d:0.###} Mbps…";
             try
             {
-                var result = await session.ApplyAsync(presetId, limit);
+                var scale = transmissionScale.SelectedItem is ComboBoxItem { Tag: double selectedScale } ? selectedScale : config.TransmissionScale;
+                var result = await session.ApplyAsync(presetId, limit, scale);
+                config = session.Configuration;
                 if (result.Success) successfulChanges++;
-                operation.Text = result.Success ? $"已应用：{presetId} / {limit:N0} kbps（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
+                operation.Text = result.Success ? $"已应用：{presetId} / {limit / 1000d:0.###} Mbps / {config.TransmissionScale}× {config.Width}×{config.Height}（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
                 if (!result.Success) Console.Error.WriteLine($"[UI control] {result.Message}");
             }
             catch (Exception ex) { ReportError(ex); }
@@ -473,7 +573,7 @@ static class FfmpegUi
             {
                 string Mean(double value) => currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming ? $"{value:F2}" : "—";
                 var latency = currentStatus.HasRenderTiming ? $"最近 {currentStatus.CaptureToRenderMs:F1} / 近 1 秒平均 {Mean(currentStatus.MeanCaptureToRenderMs)} ms（{currentStatus.RenderTimingSamples} 帧）" : "等待首次 GPU 确认";
-                summary.Text = $"{currentStatus.ActivePreset} · {currentStatus.AppliedLimitKbps:N0} kbps · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
+                summary.Text = $"{currentStatus.ActivePreset} · {currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
                 metrics.Text = $"发送 {currentStatus.SentMbps:F3} / 接收 {currentStatus.ReceivedMbps:F3} Mbps  |  带宽估计 {currentStatus.EstimatedMbps:F3} Mbps（参考）\n诊断包：{(currentStatus.PacketDiagnosticsEnabled ? "开" : "关")}，开销 {currentStatus.DiagnosticMbps * 1000:F2} kbps（已计入流量）\n捕获 → GPU 完成：{latency}  |  绘制 {currentStatus.RenderedFps:F1} / 解码 {currentStatus.DecodedFps:F1} FPS\n网络延迟趋势 {currentStatus.DelayTrendMs:+0.00;-0.00;0.00} ms  |  丢包 {currentStatus.LossRate:P1}  |  {currentStatus.Message}";
                 if (!changingDiagnostics) { updatingDiagnostics = true; packetDiagnostics.IsChecked = currentStatus.PacketDiagnosticsEnabled; updatingDiagnostics = false; }
                 metrics.Text += "\n" + currentStatus.TimingDescription;
@@ -502,7 +602,9 @@ static class FfmpegUi
             args.Cancel = true;
             if (stopping) return;
             stopping = true; debounce.Stop(); autoClose.Stop();
-            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            try { await SetClipboardAsync(false); } catch (Exception ex) { ReportError(ex); }
+            try { if (cursorClient != null) await cursorClient.DisposeAsync(); } catch (Exception ex) { ReportError(ex); }
             try { await StopInputAsync(); } catch (Exception ex) { ReportError(ex); }
             try { if (session != null) await session.StopAsync(); }
             catch (Exception ex) { ReportError(ex); }
@@ -514,7 +616,7 @@ static class FfmpegUi
                 captureBackend = capture?.Backend; captureStatistics = capture?.Statistics;
                 try { capture?.Dispose(); } catch (Exception ex) { ReportError(ex); }
                 WriteReport(); allowClose = true;
-                Dispatcher.UIThread.Post(() => { overlay.Close(); Close(); });
+                Dispatcher.UIThread.Post(() => { watermark.Close(); overlay.Close(); Close(); });
             }
         }
 
@@ -546,7 +648,8 @@ static class FfmpegUi
                     Passed = passed, Technology = "Avalonia", RealDesktopCapture = true, RemoteController = session?.IsRemote == true, CanResize, Started = started,
                     DurationSeconds = (DateTime.UtcNow - startedUtc).TotalSeconds,
                     ReceivedFrames = frames, GpuConfirmedFrames = presented, SuccessfulManualChanges = successfulChanges,
-                    ManualLimitMinimumKbps = bitrate.Minimum, ManualLimitMaximumKbps = bitrate.Maximum,
+                    ManualLimitMinimumMbps = bitrate.Minimum, ManualLimitMaximumMbps = bitrate.Maximum,
+                    ManualLimitMinimumKbps = bitrate.Minimum * 1000, ManualLimitMaximumKbps = bitrate.Maximum * 1000,
                     Overlay = new { OwnedByPreview = overlay.Owner == this, Visible = overlay.IsVisible, Expanded = details.IsVisible, overlay.Width, Height = overlay.ClientSize.Height, Position = overlay.Position.ToString() },
                     OverlayRegression = overlayCheck, FinalOverlayBounds = finalOverlayBounds,
                     TimingRegression = new { Passed = timingPassed, TransferBreakdownPassed = transportPassed, LatestStageSumMs = stageSum, LatestTotalMs = status?.CaptureToRenderMs, MeanStageSumMs = meanStageSum, MeanTotalMs = status?.MeanCaptureToRenderMs },

@@ -20,6 +20,7 @@ using Microsoft.Win32.SafeHandles;
 using SwsContext = FFmpeg.AutoGen.SwsContext;
 using SwsFlags = FFmpeg.AutoGen.SwsFlags;
 using System.Buffers.Binary;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -54,9 +55,13 @@ public sealed record AppConfiguration
     public int SchemaVersion { get; init; } = 3;
     public int Width { get; init; } = 1280;
     public int Height { get; init; } = 720;
+    public double TransmissionScale { get; init; } = 1;
     public int FramesPerSecond { get; init; } = 30;
     public string InitialPreset { get; init; } = "h264";
     public int InitialBitrateKbps { get; init; } = 1000;
+    public double MaximumBitrateMbps { get; init; } = 100;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int MaximumBitrateKbps => checked((int)Math.Round(MaximumBitrateMbps * 1000));
     public string LibraryDirectory { get; init; } = "ffmpeg";
     public NetworkSimulation Simulation { get; init; } = new();
     public Dictionary<string, CodecPreset> Presets { get; init; } = new();
@@ -66,8 +71,11 @@ public sealed record AppConfiguration
         var config = JsonSerializer.Deserialize<AppConfiguration>(File.ReadAllText(path), JsonOptions) ?? throw new InvalidDataException("Empty codec configuration.");
         if (config.SchemaVersion != 3 || config.Width < 64 || config.Height < 64 || config.Width > 7680 || config.Height > 4320 || config.Width % 2 != 0 || config.Height % 2 != 0)
             throw new InvalidDataException("Expected schemaVersion=3 and even video dimensions between 64 and 7680×4320.");
-        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps is < 100 or > 5000 || !config.Presets.ContainsKey(config.InitialPreset))
+        if (!double.IsFinite(config.MaximumBitrateMbps) || config.MaximumBitrateMbps is < .1 or > 1000)
+            throw new InvalidDataException("maximumBitrateMbps must be between 0.1 and 1000.");
+        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
             throw new InvalidDataException("Invalid FPS, initial bitrate, or initial preset.");
+        TransmissionGeometry.ValidateScale(config.TransmissionScale);
         var directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, config.LibraryDirectory));
         FfmpegRuntime.Initialize(directory);
         return config;
@@ -107,14 +115,21 @@ public sealed record SessionStatus(string ActivePreset, int AppliedLimitKbps, do
 }
 public sealed record TransferTimings(int PayloadBytes, int Packets, double SenderMs, double PlannedWaitMs,
     double WakeupOverrunMs, double LastSendToReassemblyMs, double ReceiveQueueMs);
-public sealed record ControlResult(bool Success, string Message, int Generation);
-sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false);
+public sealed record ControlResult(bool Success, string Message, int Generation)
+{
+    public int Width { get; init; }
+    public int Height { get; init; }
+    public double TransmissionScale { get; init; } = 1;
+}
+sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null);
 sealed record PendingControl(ControlCommand Command, TaskCompletionSource<ControlResult> Completion);
 
 public sealed partial class DemoSession : IDisposable
 {
     AppConfiguration config;
     readonly Func<byte[]> capture;
+    readonly Action<int, int>? resizeCapture;
+    readonly int sourceWidth, sourceHeight;
     readonly CancellationTokenSource stop = new();
     readonly SemaphoreSlim controlGate = new(1, 1);
     readonly Channel<PendingControl> commands = Channel.CreateUnbounded<PendingControl>(new() { SingleReader = true });
@@ -171,7 +186,11 @@ public sealed partial class DemoSession : IDisposable
             Transfer / Math.Max(1, count), Decode / Math.Max(1, count), Render / Math.Max(1, count));
     }
 
-    public DemoSession(AppConfiguration config, Func<byte[]> capture) { this.config = config; this.capture = capture; }
+    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null, int sourceWidth = 0, int sourceHeight = 0)
+    {
+        this.config = config; this.capture = capture; this.resizeCapture = resizeCapture;
+        this.sourceWidth = sourceWidth; this.sourceHeight = sourceHeight;
+    }
 
     public async Task StartAsync()
     {
@@ -199,9 +218,10 @@ public sealed partial class DemoSession : IDisposable
         if (!result.Success) throw new InvalidOperationException(result.Message);
     }
 
-    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps)
+    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null)
     {
-        if (limitKbps is < 100 or > 5000) return new(false, "码率范围为 100–5000 kbps。", AppliedGeneration);
+        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "传输比例仅支持 1×、0.75×、0.5×。", AppliedGeneration);
+        if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
         if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
         if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
         await controlGate.WaitAsync(stop.Token);
@@ -212,12 +232,14 @@ public sealed partial class DemoSession : IDisposable
             try { decoder = new(preset.DecoderArguments); }
             catch (Exception ex) { Console.Error.WriteLine(ex); return new(false, ex.Message, AppliedGeneration); }
             lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = presetId; }
-            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps));
+            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale));
             if (!result.Success || result.Generation != generation)
             {
                 lock (decoderGate) { decoders.Remove(generation); presetNames.Remove(generation); decoder.Dispose(); }
             }
             changes.Enqueue(new { Preset = presetId, LimitKbps = limitKbps, Result = result });
+            if (result.Success && result.Width > 0 && result.Height > 0)
+                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale };
             return result;
         }
         finally { controlGate.Release(); }
@@ -297,19 +319,30 @@ public sealed partial class DemoSession : IDisposable
                             continue;
                         }
                         if (!config.Presets.TryGetValue(cmd.PresetId, out var preset) || !preset.Enabled) throw new InvalidDataException("Preset unavailable on sender.");
-                        if (cmd.LimitKbps is < 100 or > 5000 || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
-                        if (encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
+                        if (cmd.LimitKbps < 100 || cmd.LimitKbps > config.MaximumBitrateKbps || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
+                        var scale = cmd.Scale ?? config.TransmissionScale;
+                        TransmissionGeometry.ValidateScale(scale);
+                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) : TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
+                        if (resizeCapture == null && cmd.Scale is { } requestedScale && requestedScale != config.TransmissionScale)
+                            throw new InvalidOperationException("This capture source cannot change transmission scale.");
+                        var resize = dimensions.Width != config.Width || dimensions.Height != config.Height;
+                        ControlResult Applied(string text, int revision) => new(true, text, revision)
+                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
+                        if (!resize && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
                         {
                             sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, cmd.LimitKbps);
-                            pending.Completion.TrySetResult(new(true, "发送端已在原会话更新码率上限", AppliedGeneration));
+                            pending.Completion.TrySetResult(Applied("发送端已在原会话更新码率上限", AppliedGeneration));
                             continue;
                         }
-                        var replacement = new FfmpegEncoder(preset.EncoderArguments, config.Width, config.Height, config.FramesPerSecond, cmd.LimitKbps);
+                        var replacement = new FfmpegEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height, config.FramesPerSecond, cmd.LimitKbps);
+                        try { if (resize) resizeCapture!(dimensions.Width, dimensions.Height); }
+                        catch { replacement.Dispose(); throw; }
                         encoder?.Dispose(); encoder = replacement;
+                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
                         sender!.SetEncoderBitrateKbps(cmd.LimitKbps);
                         activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, cmd.LimitKbps); Volatile.Write(ref appliedGeneration, cmd.Generation);
                         force = true; message = "手动控制；带宽估计仅参考";
-                        pending.Completion.TrySetResult(new(true, "发送端已应用；等待新预设首帧", cmd.Generation));
+                        pending.Completion.TrySetResult(Applied("发送端已应用；等待新预设首帧", cmd.Generation));
                     }
                     catch (Exception ex) { Console.Error.WriteLine(ex); pending.Completion.TrySetResult(new(false, ex.Message, AppliedGeneration)); }
                 }
@@ -1632,6 +1665,633 @@ sealed class GdiDesktopCapture : IDisposable
     [DllImport("gdi32.dll", SetLastError = true)][return: MarshalAs(UnmanagedType.Bool)] static extern bool DeleteDC(nint dc);
 }
 
+// Source: FfmpegClipboard.cs
+public sealed record ClipboardContents(string? Text = null, string[]? Paths = null, string? Origin = null);
+public interface IClipboardAccess
+{
+    uint Sequence { get; }
+    ClipboardContents? Read();
+    void Write(ClipboardContents contents);
+}
+
+public sealed class WindowsClipboard(nint owner) : IClipboardAccess
+{
+    const uint UnicodeText = 13, FileDrop = 15;
+    static readonly uint originFormat = RegisterClipboardFormat("FRD.Clipboard.Origin.v1");
+    static readonly uint dropEffect = RegisterClipboardFormat("Preferred DropEffect");
+    public uint Sequence => GetClipboardSequenceNumber();
+
+    public ClipboardContents? Read()
+    {
+        Open();
+        try
+        {
+            var origin = ReadString(originFormat, 256);
+            if (IsClipboardFormatAvailable(FileDrop))
+            {
+                var handle = GetClipboardData(FileDrop);
+                var count = DragQueryFile(handle, uint.MaxValue, null, 0);
+                if (count > 128) throw new InvalidDataException("剪贴板最多支持 128 个顶层文件或目录。");
+                var paths = new string[count];
+                for (uint i = 0; i < count; i++)
+                {
+                    var length = DragQueryFile(handle, i, null, 0);
+                    if (length is 0 or > 32767) throw new InvalidDataException("Invalid clipboard path length.");
+                    var name = new StringBuilder((int)length + 1);
+                    if (DragQueryFile(handle, i, name, length + 1) != length) throw new Win32Exception(Marshal.GetLastWin32Error());
+                    paths[i] = name.ToString();
+                }
+                return paths.Length == 0 ? null : new(Paths: paths, Origin: origin);
+            }
+            var text = ReadString(UnicodeText, ClipboardSyncSession.MaximumTextBytes * 2);
+            return text == null ? null : new(Text: text, Origin: origin);
+        }
+        finally { Close(); }
+    }
+
+    public void Write(ClipboardContents contents)
+    {
+        if (owner == 0) throw new InvalidOperationException("Clipboard owner window is not available.");
+        byte[] data;
+        uint format;
+        if (contents.Paths is { Length: > 0 } paths)
+        {
+            var names = Encoding.Unicode.GetBytes(string.Join('\0', paths.Select(Path.GetFullPath)) + "\0\0");
+            data = new byte[20 + names.Length];
+            BinaryPrimitives.WriteInt32LittleEndian(data, 20);
+            BinaryPrimitives.WriteInt32LittleEndian(data.AsSpan(16), 1);
+            names.CopyTo(data, 20); format = FileDrop;
+        }
+        else if (contents.Text != null) { data = Encoding.Unicode.GetBytes(contents.Text + '\0'); format = UnicodeText; }
+        else throw new ArgumentException("Clipboard must contain text or file paths.");
+        Open();
+        try
+        {
+            if (!EmptyClipboard()) throw new Win32Exception(Marshal.GetLastWin32Error());
+            SetBytes(format, data);
+            if (format == FileDrop) SetBytes(dropEffect, [1, 0, 0, 0]);
+            if (contents.Origin != null) SetBytes(originFormat, Encoding.Unicode.GetBytes(contents.Origin + '\0'));
+        }
+        finally { Close(); }
+    }
+
+    void Open()
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            if (OpenClipboard(owner)) return;
+            Thread.Sleep(15);
+        }
+        throw new Win32Exception(Marshal.GetLastWin32Error(), "Clipboard is busy.");
+    }
+    static void Close() { if (!CloseClipboard()) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+    static string? ReadString(uint format, int maximum)
+    {
+        if (!IsClipboardFormatAvailable(format)) return null;
+        var handle = GetClipboardData(format);
+        var size = checked((long)GlobalSize(handle));
+        if (size < 2 || size > maximum) throw new InvalidDataException("Clipboard text exceeds the supported size.");
+        var pointer = GlobalLock(handle);
+        if (pointer == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try
+        {
+            var value = Marshal.PtrToStringUni(pointer, (int)size / 2)!;
+            var end = value.IndexOf('\0');
+            return end < 0 ? value : value[..end];
+        }
+        finally { GlobalUnlock(handle); }
+    }
+    internal static void SetBytes(uint format, byte[] bytes)
+    {
+        var handle = GlobalAlloc(2, (nuint)bytes.Length);
+        if (handle == 0) throw new OutOfMemoryException();
+        var transferred = false;
+        try
+        {
+            var pointer = GlobalLock(handle);
+            if (pointer == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            try { Marshal.Copy(bytes, 0, pointer, bytes.Length); }
+            finally { GlobalUnlock(handle); }
+            if (SetClipboardData(format, handle) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            transferred = true;
+        }
+        finally { if (!transferred) GlobalFree(handle); }
+    }
+    [DllImport("user32.dll")] static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool OpenClipboard(nint owner);
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool CloseClipboard();
+    [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll", SetLastError = true)] static extern nint GetClipboardData(uint format);
+    [DllImport("user32.dll", SetLastError = true)] static extern nint SetClipboardData(uint format, nint data);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern uint RegisterClipboardFormat(string format);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint DragQueryFile(nint drop, uint index, StringBuilder? path, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern nint GlobalAlloc(uint flags, nuint size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern nint GlobalLock(nint handle);
+    [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool GlobalUnlock(nint handle);
+    [DllImport("kernel32.dll")] static extern nuint GlobalSize(nint handle);
+    [DllImport("kernel32.dll")] static extern nint GlobalFree(nint handle);
+}
+
+public sealed record ClipboardEntry(string Path, bool Directory, long Length);
+public sealed record ClipboardManifest(string Kind, Guid Id, int TextBytes, string[] Roots, ClipboardEntry[] Entries);
+public sealed record ClipboardSyncStatus(long Sent, long Received, long SentBytes, long ReceivedBytes, string Message, bool Connected);
+
+public sealed class ClipboardSyncSession : IAsyncDisposable
+{
+    public const int MaximumTextBytes = 4 * 1024 * 1024, MaximumEntries = 10000;
+    public const long MaximumFileBytes = 2L * 1024 * 1024 * 1024;
+    readonly TcpClient client;
+    readonly IClipboardAccess clipboard;
+    const string OriginPrefix = "FRD.clipboard:";
+    readonly string cacheRoot, marker = OriginPrefix + Guid.NewGuid().ToString("N");
+    readonly CancellationTokenSource stop;
+    readonly object clipboardGate = new();
+    readonly Channel<ClipboardContents> outbound = Channel.CreateBounded<ClipboardContents>(new BoundedChannelOptions(1)
+        { FullMode = BoundedChannelFullMode.DropOldest, SingleReader = true, SingleWriter = true });
+    readonly Task work;
+    uint lastSequence;
+    long sent, received, sentBytes, receivedBytes;
+    int disposed;
+    public event Action<ClipboardSyncStatus>? Status;
+    ClipboardSyncStatus snapshot = new(0, 0, 0, 0, "等待新复制的文本或文件", true);
+    public ClipboardSyncStatus Snapshot => Volatile.Read(ref snapshot);
+    public Task Completion => work;
+
+    public ClipboardSyncSession(TcpClient client, IClipboardAccess clipboard, string? cacheRoot = null, CancellationToken token = default)
+    {
+        this.client = client; this.clipboard = clipboard;
+        this.cacheRoot = Path.GetFullPath(cacheRoot ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FRD", "Clipboard"));
+        stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        lastSequence = clipboard.Sequence;
+        work = Task.WhenAll(Run(WatchAsync), Run(SendAsync), Run(ReceiveAsync));
+    }
+
+    async Task Run(Func<Task> action)
+    {
+        try { await Task.Run(action); }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("[clipboard] Synchronization stopped."); }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("[clipboard] " + error);
+            Publish(stop.IsCancellationRequested ? "剪贴板同步已关闭" : "剪贴板同步断开：" + error.Message, false);
+        }
+        finally { stop.Cancel(); client.Dispose(); }
+    }
+
+    async Task WatchAsync()
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            lock (clipboardGate)
+            {
+                var sequence = clipboard.Sequence;
+                if (sequence != lastSequence)
+                {
+                    try
+                    {
+                        var contents = clipboard.Read(); lastSequence = sequence;
+                        if (contents != null && contents.Origin?.StartsWith(OriginPrefix, StringComparison.Ordinal) != true) outbound.Writer.TryWrite(contents);
+                    }
+                    catch (Win32Exception error) { Console.Error.WriteLine("[clipboard] Busy, will retry: " + error.Message); }
+                    catch (InvalidDataException error)
+                    { lastSequence = sequence; Console.Error.WriteLine("[clipboard] " + error); Publish("复制未同步：" + error.Message); }
+                }
+            }
+            await Task.Delay(150, stop.Token);
+        }
+    }
+
+    async Task SendAsync()
+    {
+        var stream = client.GetStream();
+        await foreach (var contents in outbound.Reader.ReadAllAsync(stop.Token))
+        {
+            var files = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            ClipboardManifest manifest;
+            byte[]? text = null;
+            try
+            {
+                if (contents.Paths is { Length: > 0 } paths) manifest = PrepareFiles(paths, files);
+                else
+                {
+                    text = Encoding.UTF8.GetBytes(contents.Text ?? "");
+                    manifest = new("text", Guid.NewGuid(), text.Length, [], []);
+                }
+                Validate(manifest);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+            { Console.Error.WriteLine("[clipboard] Copy rejected: " + error); Publish("复制未同步：" + error.Message); continue; }
+            Publish(manifest.Kind == "text" ? "正在同步文本" : $"正在同步 {manifest.Entries.Count(x => !x.Directory)} 个文件");
+            var header = JsonSerializer.SerializeToUtf8Bytes(manifest);
+            if (header.Length > 2 * 1024 * 1024) throw new InvalidDataException("Clipboard manifest is too large.");
+            var prefix = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(prefix, header.Length);
+            await stream.WriteAsync(prefix, stop.Token); await stream.WriteAsync(header, stop.Token);
+            if (text != null) { await stream.WriteAsync(text, stop.Token); Interlocked.Add(ref sentBytes, text.Length); }
+            else foreach (var entry in manifest.Entries.Where(entry => !entry.Directory))
+            {
+                var path = files[entry.Path]; RejectReparse(path);
+                await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                if (file.Length != entry.Length) throw new IOException("复制过程中源文件发生变化。");
+                var hash = await TransferAsync(file, stream, entry.Length);
+                await stream.WriteAsync(hash, stop.Token); Interlocked.Add(ref sentBytes, entry.Length);
+            }
+            Interlocked.Increment(ref sent); Publish("剪贴板内容已发送");
+        }
+    }
+
+    async Task ReceiveAsync()
+    {
+        var stream = client.GetStream();
+        while (!stop.IsCancellationRequested)
+        {
+            var prefix = new byte[4]; await stream.ReadExactlyAsync(prefix, stop.Token);
+            var length = BinaryPrimitives.ReadInt32LittleEndian(prefix);
+            if (length is < 2 or > 2 * 1024 * 1024) throw new InvalidDataException("Invalid clipboard manifest size.");
+            var bytes = new byte[length]; await stream.ReadExactlyAsync(bytes, stop.Token);
+            var manifest = JsonSerializer.Deserialize<ClipboardManifest>(bytes) ?? throw new InvalidDataException("Missing clipboard manifest.");
+            Validate(manifest);
+            uint sequence;
+            lock (clipboardGate) sequence = clipboard.Sequence;
+            ClipboardContents contents;
+            string? directory = null;
+            var committed = false;
+            try
+            {
+                if (manifest.Kind == "text")
+                {
+                    var text = new byte[manifest.TextBytes]; await stream.ReadExactlyAsync(text, stop.Token);
+                    contents = new(new UTF8Encoding(false, true).GetString(text), Origin: marker);
+                    Interlocked.Add(ref receivedBytes, text.Length);
+                }
+                else
+                {
+                    Directory.CreateDirectory(cacheRoot); RejectReparse(cacheRoot);
+                    var used = Directory.EnumerateFiles(cacheRoot, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }).Sum(path => new FileInfo(path).Length);
+                    var incoming = manifest.Entries.Sum(entry => entry.Length);
+                    if (used + incoming > MaximumFileBytes * 2) throw new IOException("剪贴板缓存超过 4 GiB，请在粘贴完成后清理 FRD/Clipboard 缓存。");
+                    directory = Path.Combine(cacheRoot, Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(directory);
+                    foreach (var entry in manifest.Entries)
+                    {
+                        var destination = Resolve(directory, entry.Path);
+                        if (entry.Directory) { Directory.CreateDirectory(destination); continue; }
+                        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                        await using (var file = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.Asynchronous))
+                        {
+                            var actual = await TransferAsync(stream, file, entry.Length);
+                            var expected = new byte[32]; await stream.ReadExactlyAsync(expected, stop.Token);
+                            if (!CryptographicOperations.FixedTimeEquals(actual, expected)) throw new InvalidDataException("剪贴板文件 SHA-256 校验失败。");
+                        }
+                        Interlocked.Add(ref receivedBytes, entry.Length);
+                    }
+                    contents = new(Paths: manifest.Roots.Select(path => Resolve(directory, path)).ToArray(), Origin: marker);
+                }
+                lock (clipboardGate)
+                {
+                    // Do not overwrite a newer local copy made while a large incoming transfer was running.
+                    if (clipboard.Sequence == sequence)
+                    {
+                        clipboard.Write(contents); lastSequence = clipboard.Sequence; committed = true;
+                        Interlocked.Increment(ref received);
+                    }
+                }
+                Publish(committed ? "已接收，可在本机粘贴" : "跳过旧传输：本机已有新的复制内容");
+            }
+            finally
+            {
+                if (!committed && directory != null && Path.GetDirectoryName(Path.GetFullPath(directory)) == cacheRoot)
+                    Directory.Delete(directory, true);
+            }
+        }
+    }
+
+    async Task<byte[]> TransferAsync(Stream source, Stream destination, long length)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(65536);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        try
+        {
+            for (long remaining = length; remaining > 0;)
+            {
+                var count = (int)Math.Min(buffer.Length, remaining);
+                await source.ReadExactlyAsync(buffer.AsMemory(0, count), stop.Token);
+                hash.AppendData(buffer, 0, count);
+                await destination.WriteAsync(buffer.AsMemory(0, count), stop.Token);
+                remaining -= count;
+            }
+            return hash.GetHashAndReset();
+        }
+        finally { ArrayPool<byte>.Shared.Return(buffer); }
+    }
+
+    static ClipboardManifest PrepareFiles(string[] paths, Dictionary<string, string> files)
+    {
+        if (paths.Length is < 1 or > 128) throw new InvalidDataException("最多同步 128 个顶层文件或目录。");
+        List<ClipboardEntry> entries = new(); List<string> roots = new();
+        long total = 0;
+        void Visit(string source, string relative)
+        {
+            RejectReparse(source);
+            var directory = Directory.Exists(source);
+            var length = directory ? 0 : new FileInfo(source).Length;
+            total = checked(total + length);
+            if (entries.Count >= MaximumEntries || total > MaximumFileBytes) throw new InvalidDataException("单次复制上限为 10000 项、2 GiB。");
+            entries.Add(new(relative, directory, length));
+            if (directory) foreach (var child in Directory.EnumerateFileSystemEntries(source)) Visit(child, relative + "/" + Path.GetFileName(child));
+            else files.Add(relative, source);
+        }
+        for (var i = 0; i < paths.Length; i++)
+        {
+            var full = Path.GetFullPath(paths[i]);
+            var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(full));
+            if (string.IsNullOrEmpty(name)) throw new InvalidDataException("请复制文件或目录，不支持整个驱动器。");
+            var relative = $"item-{i:D3}/" + name;
+            roots.Add(relative); Visit(full, relative);
+        }
+        return new("files", Guid.NewGuid(), 0, roots.ToArray(), entries.ToArray());
+    }
+
+    public static void Validate(ClipboardManifest manifest)
+    {
+        if (manifest.Roots == null || manifest.Entries == null || manifest.Id == Guid.Empty) throw new InvalidDataException("Invalid clipboard manifest.");
+        if (manifest.Kind == "text")
+        {
+            if (manifest.TextBytes is < 0 or > MaximumTextBytes || manifest.Roots.Length != 0 || manifest.Entries.Length != 0) throw new InvalidDataException("Invalid clipboard text size.");
+            return;
+        }
+        if (manifest.Kind != "files" || manifest.TextBytes != 0 || manifest.Roots.Length is < 1 or > 128 || manifest.Entries.Length is < 1 or > MaximumEntries)
+            throw new InvalidDataException("Invalid clipboard file manifest.");
+        HashSet<string> paths = new(StringComparer.OrdinalIgnoreCase);
+        long total = 0;
+        foreach (var entry in manifest.Entries)
+        {
+            if (entry == null) throw new InvalidDataException("Null clipboard entry.");
+            ValidPath(entry.Path);
+            if (!paths.Add(entry.Path) || entry.Length < 0 || entry.Directory && entry.Length != 0 || entry.Length > MaximumFileBytes)
+                throw new InvalidDataException("Invalid clipboard file entry.");
+            total = checked(total + entry.Length);
+            if (total > MaximumFileBytes) throw new InvalidDataException("Clipboard transfer exceeds 2 GiB.");
+            if (!manifest.Roots.Any(root => entry.Path.Equals(root, StringComparison.OrdinalIgnoreCase) || entry.Path.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException("File is outside the copied roots.");
+        }
+        if (manifest.Roots.Distinct(StringComparer.OrdinalIgnoreCase).Count() != manifest.Roots.Length || manifest.Roots.Any(root => !paths.Contains(root)))
+            throw new InvalidDataException("Missing or duplicate clipboard root.");
+        foreach (var root in manifest.Roots) ValidPath(root);
+    }
+    static void ValidPath(string path)
+    {
+        if (string.IsNullOrEmpty(path) || path.Length > 2048 || path.Contains('\\') || Path.IsPathRooted(path)) throw new InvalidDataException("Invalid relative clipboard path.");
+        foreach (var part in path.Split('/'))
+        {
+            var stem = part.Split('.')[0].ToUpperInvariant();
+            if (part is "" or "." or ".." || part.EndsWith(' ') || part.EndsWith('.') || part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+                stem is "CON" or "PRN" or "AUX" or "NUL" || stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) && stem[3] is >= '1' and <= '9')
+                throw new InvalidDataException("Unsafe clipboard filename.");
+        }
+    }
+    static string Resolve(string root, string path)
+    {
+        ValidPath(path);
+        var full = Path.GetFullPath(Path.Combine(root, path.Replace('/', Path.DirectorySeparatorChar)));
+        if (!full.StartsWith(Path.TrimEndingDirectorySeparator(root) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Clipboard path escaped its destination.");
+        return full;
+    }
+    static void RejectReparse(string path)
+    {
+        for (var current = Path.GetFullPath(path); !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new IOException("不自动跟随剪贴板文件中的符号链接或目录联接。");
+    }
+    void Publish(string message, bool connected = true)
+    {
+        Volatile.Write(ref snapshot, new(Interlocked.Read(ref sent), Interlocked.Read(ref received), Interlocked.Read(ref sentBytes), Interlocked.Read(ref receivedBytes), message, connected));
+        try { Status?.Invoke(Snapshot); }
+        catch (Exception error) { Console.Error.WriteLine("[clipboard] Status callback: " + error); }
+    }
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        stop.Cancel(); client.Dispose(); await work; stop.Dispose();
+    }
+}
+
+// Source: FfmpegCursor.cs
+public sealed record CursorShape(int Width, int Height, int HotX, int HotY, byte[] Color, byte[] Mask);
+public sealed record CursorUpdate(long Id, bool Visible, double X, double Y, CursorShape? Shape = null, bool Reset = false);
+
+public static class CursorWire
+{
+    public static async Task WriteAsync(NetworkStream stream, CursorUpdate update, CancellationToken token)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(update);
+        if (bytes.Length > 524288) throw new InvalidDataException("Cursor message too large.");
+        var header = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
+        await stream.WriteAsync(header, token); await stream.WriteAsync(bytes, token);
+    }
+    public static async Task<CursorUpdate> ReadAsync(NetworkStream stream, CancellationToken token)
+    {
+        var header = new byte[4]; await stream.ReadExactlyAsync(header, token);
+        var length = BinaryPrimitives.ReadInt32LittleEndian(header);
+        if (length is < 1 or > 524288) throw new InvalidDataException("Invalid cursor message length.");
+        var bytes = new byte[length]; await stream.ReadExactlyAsync(bytes, token);
+        var update = JsonSerializer.Deserialize<CursorUpdate>(bytes) ?? throw new InvalidDataException("Empty cursor message.");
+        if (update.Id < 0 || !double.IsFinite(update.X) || !double.IsFinite(update.Y)) throw new InvalidDataException("Invalid cursor state.");
+        if (update.Shape != null) NativeCursor.Validate(update.Shape);
+        return update;
+    }
+    public static async Task ServeAsync(TcpClient client, CancellationToken token)
+    {
+        Dictionary<string, long> known = new();
+        CursorUpdate? previous = null;
+        long nextId = 0;
+        nint previousHandle = 0;
+        var bounds = Win32InputInjector.ReadPrimaryMonitor();
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(16));
+        do
+        {
+            var state = NativeCursor.ReadState();
+            CursorShape? shape = null;
+            var reset = false;
+            var id = previous?.Id ?? 0;
+            if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
+            {
+                shape = NativeCursor.ReadShape(state.Handle);
+                var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
+                if (known.TryGetValue(fingerprint, out id)) shape = null;
+                else
+                {
+                    if (known.Count >= 64) { known.Clear(); reset = true; }
+                    id = ++nextId; known[fingerprint] = id;
+                }
+            }
+            if (state.Handle == 0) id = 0;
+            var update = new CursorUpdate(id, state.Visible, (state.X - bounds.Left) / (double)Math.Max(1, bounds.Width - 1),
+                (state.Y - bounds.Top) / (double)Math.Max(1, bounds.Height - 1), shape, reset);
+            if (previous == null || update.Id != previous.Id || update.Visible != previous.Visible || update.X != previous.X || update.Y != previous.Y || shape != null)
+                await WriteAsync(client.GetStream(), update, token);
+            previous = update;
+            previousHandle = state.Handle;
+        } while (await timer.WaitForNextTickAsync(token));
+    }
+}
+
+public sealed class CursorClient : IAsyncDisposable
+{
+    readonly TcpClient client;
+    readonly CancellationTokenSource stop;
+    readonly Task reader;
+    public long Updates { get; internal set; }
+    public long Shapes { get; internal set; }
+    public CursorClient(TcpClient client, Action<CursorUpdate> received, Action<Exception> failed, CancellationToken token)
+    {
+        this.client = client; stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        reader = Task.Run(async () =>
+        {
+            try
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    var update = await CursorWire.ReadAsync(client.GetStream(), stop.Token);
+                    Updates++; if (update.Shape != null) Shapes++;
+                    received(update);
+                }
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Cursor feedback stopped."); }
+            catch (Exception error) { Console.Error.WriteLine("[cursor] " + error); if (!stop.IsCancellationRequested) failed(error); }
+        });
+    }
+    public async ValueTask DisposeAsync() { stop.Cancel(); client.Dispose(); await reader; stop.Dispose(); }
+}
+
+public static class NativeCursor
+{
+    public static (nint Handle, bool Visible, int X, int Y) ReadState()
+    {
+        var state = new CursorInfo { Size = Marshal.SizeOf<CursorInfo>() };
+        if (!GetCursorInfo(ref state)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return (state.Handle, (state.Flags & 1) != 0, state.X, state.Y);
+    }
+    public static CursorShape ReadShape(nint handle)
+    {
+        if (!GetIconInfo(handle, out var icon)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try
+        {
+            if (GetObject(icon.Mask, Marshal.SizeOf<Bitmap>(), out var mask) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var height = icon.Color == 0 ? mask.Height / 2 : mask.Height;
+            if (mask.Width is < 1 or > 256 || height is < 1 or > 256) throw new InvalidDataException("Unsupported cursor dimensions.");
+            var result = new CursorShape(mask.Width, height, checked((int)icon.HotX), checked((int)icon.HotY),
+                icon.Color == 0 ? [] : ReadBits(icon.Color, mask.Width, height, 32), ReadBits(icon.Mask, mask.Width, mask.Height, 1));
+            Validate(result); return result;
+        }
+        finally { if (icon.Color != 0) DeleteObject(icon.Color); if (icon.Mask != 0) DeleteObject(icon.Mask); }
+    }
+    public static void Validate(CursorShape shape)
+    {
+        if (shape.Width is < 1 or > 256 || shape.Height is < 1 or > 256 || shape.HotX < 0 || shape.HotX >= shape.Width || shape.HotY < 0 || shape.HotY >= shape.Height ||
+            shape.Color == null || shape.Mask == null || shape.Color.Length != 0 && shape.Color.Length != shape.Width * shape.Height * 4 ||
+            shape.Mask.Length != ((shape.Width + 31) / 32 * 4) * shape.Height * (shape.Color.Length == 0 ? 2 : 1))
+            throw new InvalidDataException("Invalid cursor bitmap, mask or hotspot.");
+    }
+    public static nint Create(CursorShape shape)
+    {
+        Validate(shape);
+        nint color = 0, mask = 0;
+        try
+        {
+            if (shape.Color.Length != 0) color = CreateBits(shape.Width, shape.Height, 32, shape.Color);
+            mask = CreateBits(shape.Width, shape.Height * (shape.Color.Length == 0 ? 2 : 1), 1, shape.Mask);
+            var icon = new IconInfo { HotX = (uint)shape.HotX, HotY = (uint)shape.HotY, Color = color, Mask = mask };
+            var cursor = CreateIconIndirect(ref icon);
+            if (cursor == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return cursor;
+        }
+        finally { if (color != 0) DeleteObject(color); if (mask != 0) DeleteObject(mask); }
+    }
+    static BitmapInfo Info(int width, int height, ushort depth) => new()
+        { Size = 40, Width = width, Height = height, Planes = 1, BitCount = depth, White = 0x00FFFFFF };
+    static byte[] ReadBits(nint bitmap, int width, int height, ushort depth)
+    {
+        var bytes = new byte[((width * depth + 31) / 32 * 4) * height];
+        var info = Info(width, height, depth);
+        var dc = GetDC(0);
+        if (dc == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try { if (GetDIBits(dc, bitmap, 0, (uint)height, bytes, ref info, 0) != height) throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        finally { ReleaseDC(0, dc); }
+        return bytes;
+    }
+    static nint CreateBits(int width, int height, ushort depth, byte[] bytes)
+    {
+        var info = Info(width, height, depth);
+        var bitmap = CreateDIBSection(0, ref info, 0, out var bits, 0, 0);
+        if (bitmap == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+        Marshal.Copy(bytes, 0, bits, bytes.Length); return bitmap;
+    }
+    public static void Release(nint cursor) { if (cursor != 0 && !DestroyCursor(cursor)) Console.Error.WriteLine("[cursor] DestroyCursor: " + Marshal.GetLastWin32Error()); }
+    public static nint Arrow => LoadCursor(0, 32512);
+    public static void Set(nint cursor) => SetCursor(cursor);
+    [StructLayout(LayoutKind.Sequential)] struct CursorInfo { public int Size, Flags; public nint Handle; public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] struct IconInfo { public int IsIcon; public uint HotX, HotY; public nint Mask, Color; }
+    [StructLayout(LayoutKind.Sequential)] struct Bitmap { public int Type, Width, Height, WidthBytes; public ushort Planes, BitsPixel; public nint Bits; }
+    [StructLayout(LayoutKind.Sequential)] struct BitmapInfo
+    { public uint Size; public int Width, Height; public ushort Planes, BitCount; public uint Compression, SizeImage; public int XPels, YPels; public uint Used, Important, Black, White; }
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetCursorInfo(ref CursorInfo info);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetIconInfo(nint icon, out IconInfo info);
+    [DllImport("user32.dll", SetLastError = true)] static extern nint CreateIconIndirect(ref IconInfo info);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool DestroyCursor(nint cursor);
+    [DllImport("user32.dll")] static extern nint LoadCursor(nint instance, nint name);
+    [DllImport("user32.dll")] static extern nint SetCursor(nint cursor);
+    [DllImport("user32.dll")] static extern nint GetDC(nint hwnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(nint hwnd, nint dc);
+    [DllImport("gdi32.dll", SetLastError = true)] static extern int GetObject(nint obj, int size, out Bitmap bitmap);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(nint obj);
+    [DllImport("gdi32.dll", SetLastError = true)] static extern int GetDIBits(nint dc, nint bitmap, uint start, uint lines, byte[] bytes, ref BitmapInfo info, uint usage);
+    [DllImport("gdi32.dll", SetLastError = true)] static extern nint CreateDIBSection(nint dc, ref BitmapInfo info, uint usage, out nint bits, nint section, uint offset);
+}
+
+// Source: FfmpegDesktopSource.cs
+public static class TransmissionGeometry
+{
+    public static bool IsValidScale(double scale) => scale is 1 or .75 or .5;
+    public static void ValidateScale(double scale)
+    {
+        if (!IsValidScale(scale)) throw new ArgumentOutOfRangeException(nameof(scale), "Transmission scale must be 1, 0.75 or 0.5.");
+    }
+    public static (int Width, int Height) Dimensions(int width, int height, double scale)
+    {
+        ValidateScale(scale);
+        if (width < 64 || height < 64 || width > 8192 || height > 8192) throw new ArgumentOutOfRangeException(nameof(width));
+        return (Math.Max(2, (int)(width * scale) & ~1), Math.Max(2, (int)(height * scale) & ~1));
+    }
+}
+
+sealed class DesktopStreamSource : IDisposable
+{
+    readonly object gate = new();
+    DesktopCapture capture;
+    public int SourceWidth { get; }
+    public int SourceHeight { get; }
+    public int Width { get; }
+    public int Height { get; }
+    public DesktopCaptureStatistics? Statistics { get { lock (gate) return capture.Statistics; } }
+    public string Backend { get { lock (gate) return capture.Backend; } }
+    public DesktopStreamSource(double scale)
+    {
+        var bounds = Win32InputInjector.ReadPrimaryMonitor();
+        SourceWidth = bounds.Width; SourceHeight = bounds.Height;
+        (Width, Height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
+        capture = new(Width, Height);
+    }
+    public byte[] Capture() { lock (gate) return capture.Capture(); }
+    public void Resize(int width, int height)
+    {
+        var replacement = new DesktopCapture(width, height);
+        try { replacement.Capture(); }
+        catch { replacement.Dispose(); throw; }
+        lock (gate) { var previous = capture; capture = replacement; previous.Dispose(); }
+    }
+    public void Dispose() { lock (gate) capture.Dispose(); }
+}
+
 // Source: FfmpegDiagnostics.cs
 public sealed record FrameDiagnostic(int Generation, long FrameId, long CaptureStarted, long CaptureCompleted, long EncodeCompleted, long Frequency)
 {
@@ -1997,6 +2657,7 @@ public sealed class RemoteInputClient : IDisposable
 
 public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
 {
+    static readonly bool traceInput = Environment.GetEnvironmentVariable("FRD_TRACE_INPUT") == "1";
     public const nuint InjectionMarker = 0x46524449;
     readonly ConcurrentDictionary<nint, byte> controllers = new();
     readonly HashSet<(int ScanCode, bool Extended)> keys = new();
@@ -2009,6 +2670,8 @@ public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
 
     public RemoteInputResult Inject(RemoteInputEvent input)
     {
+        if (traceInput && input.Kind != RemoteInputKind.MouseMove)
+            Console.Error.WriteLine($"[input trace] tick={Environment.TickCount64} kind={input.Kind} scan={input.ScanCode} foreground={GetForegroundWindow()}");
         lock (gate)
         {
             if (input.Kind == RemoteInputKind.ReleaseAll) return ReleaseAll();
@@ -2149,6 +2812,34 @@ public sealed class NativeInputSource : IDisposable
     static long nextId;
     bool enabled, disposed;
     int heldButtons;
+    readonly Dictionary<long, nint> cursors = new();
+    nint remoteCursor;
+    bool hasRemoteCursor, remoteCursorVisible = true;
+
+    public void SetRemoteCursor(CursorUpdate update)
+    {
+        if (disposed) return;
+        if (update.Reset) ClearCursors();
+        if (update.Shape != null)
+        {
+            if (cursors.Count >= 64 && !cursors.ContainsKey(update.Id)) throw new InvalidDataException("Cursor cache limit exceeded.");
+            var cursor = NativeCursor.Create(update.Shape);
+            if (cursors.Remove(update.Id, out var previous)) NativeCursor.Release(previous);
+            cursors[update.Id] = cursor;
+        }
+        if (update.Id != 0 && !cursors.TryGetValue(update.Id, out remoteCursor)) throw new InvalidDataException("Unknown remote cursor shape.");
+        if (update.Id == 0) remoteCursor = 0;
+        hasRemoteCursor = true; remoteCursorVisible = update.Visible;
+        if (enabled && GetCursorPos(out var position) && WindowFromPoint(position) == hwnd)
+            NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0);
+    }
+
+    void ClearCursors()
+    {
+        if (hasRemoteCursor) NativeCursor.Set(NativeCursor.Arrow);
+        foreach (var cursor in cursors.Values) NativeCursor.Release(cursor);
+        cursors.Clear(); remoteCursor = 0; hasRemoteCursor = false;
+    }
     public event Action<RemoteInputEvent>? Input;
     public event Action? ExitRequested;
     public event Action<Exception>? Failed;
@@ -2170,6 +2861,7 @@ public sealed class NativeInputSource : IDisposable
         {
             heldButtons = 0;
             if (GetCapture() == hwnd) ReleaseCapture();
+            if (hasRemoteCursor && GetCursorPos(out var point) && WindowFromPoint(point) == hwnd) NativeCursor.Set(NativeCursor.Arrow);
         }
     }
 
@@ -2179,6 +2871,8 @@ public sealed class NativeInputSource : IDisposable
         {
             // STATIC defaults to HTTRANSPARENT, which bypasses this window's real mouse messages.
             if (enabled && message == 0x0084) return 1;
+            if (enabled && hasRemoteCursor && message == 0x0020 && ((long)lParam & 0xFFFF) == 1)
+            { NativeCursor.Set(remoteCursorVisible ? remoteCursor : 0); return 1; }
             if (enabled && GetMessageExtraInfo() != (nint)Win32InputInjector.InjectionMarker)
             {
                 if (message is 0x0100 or 0x0104 && wParam == 0x1B)
@@ -2235,6 +2929,7 @@ public sealed class NativeInputSource : IDisposable
     {
         if (disposed) return;
         SetEnabled(false);
+        ClearCursors();
         if (!RemoveWindowSubclass(hwnd, procedure, id)) InputProtocol.Log("Cannot detach preview input capture", new Win32Exception(Marshal.GetLastWin32Error()));
         disposed = true;
     }
@@ -2242,6 +2937,8 @@ public sealed class NativeInputSource : IDisposable
     [StructLayout(LayoutKind.Sequential)] struct NativePoint { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct NativeRect { public int Left, Top, Right, Bottom; }
     delegate nint SubclassProcedure(nint hwnd, uint message, nuint wParam, nint lParam, nuint subclassId, nuint reference);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out NativePoint point);
+    [DllImport("user32.dll")] static extern nint WindowFromPoint(NativePoint point);
     [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool SetWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id, nuint reference);
     [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool RemoveWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id);
     [DllImport("comctl32.dll")] static extern nint DefSubclassProc(nint hwnd, uint message, nuint wParam, nint lParam);
@@ -2252,6 +2949,149 @@ public sealed class NativeInputSource : IDisposable
     [DllImport("user32.dll")] static extern nint GetMessageExtraInfo();
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool GetClientRect(nint hwnd, out NativeRect rect);
     [DllImport("user32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ScreenToClient(nint hwnd, ref NativePoint point);
+}
+
+// Source: FfmpegInteractionRegression.cs
+static partial class FfmpegUi
+{
+    sealed record InteractionScript(int SourceWidth, int SourceHeight, int Left, int Top, int Width, int Height,
+        string Report, string? HoldUntilFile = null, bool Clipboard = false, long FixtureWindow = 0, bool Input = true);
+
+    sealed partial class DesktopWindow
+    {
+        readonly List<CursorUpdate> interactionCursors = new();
+        readonly List<object> interactionInputTrace = new();
+        async Task RunInteractionAsync(string path)
+        {
+            List<object> checks = new(); List<object> expected = new();
+            var script = JsonSerializer.Deserialize<InteractionScript>(File.ReadAllText(path), AppConfiguration.JsonOptions) ?? throw new InvalidDataException("Missing interaction script.");
+            void Check(bool passed, string name, object? evidence = null)
+            {
+                checks.Add(new { Name = name, Passed = passed, Evidence = evidence });
+                if (!passed) throw new InvalidOperationException("Interaction regression: " + name);
+            }
+            async Task Until(Func<bool> condition)
+            {
+                var started = Stopwatch.GetTimestamp();
+                while (!condition())
+                {
+                    if (Stopwatch.GetElapsedTime(started).TotalSeconds > 12) throw new TimeoutException("Interaction test condition not reached.");
+                    await Task.Delay(20);
+                }
+            }
+            try
+            {
+                preview.Input += input => interactionInputTrace.Add(new { Tick = Environment.TickCount64, input.Kind, input.ScanCode });
+                Check(script.SourceWidth == session!.RemoteSourceWidth && script.SourceHeight == session.RemoteSourceHeight, "Fixture/source desktop dimensions agree");
+                await Until(() => preview.VideoWidth == session.Configuration.Width && receivedFrames >= 3);
+                foreach (var cap in new[] { .5m, 5m, 10m, 20m, 5m })
+                {
+                    if (cap > bitrateLabel.Maximum) continue;
+                    var before = receivedFrames;
+                    bitrateLabel.Value = cap;
+                    await Until(() => !applying && pendingStatus?.AppliedLimitKbps == (int)(cap * 1000) && receivedFrames > before);
+                    Check(Math.Abs(bitrate.Value - (double)cap) < .00001 && bitrateLabel.Value == cap,
+                        "Mbps numeric input, slider and sender acknowledgement " + cap, new { Mbps = cap, SenderKbps = pendingStatus?.AppliedLimitKbps });
+                }
+                if (details.IsVisible) ToggleDetails();
+                var bounds = Win32InputInjector.ReadPrimaryMonitor();
+                foreach (var (size, scale) in new[] { (new Size(780, 520), 1d), (new Size(1060, 640), .75), (new Size(900, 820), .5) })
+                {
+                    Width = size.Width; Height = size.Height;
+                    Position = new PixelPoint(Math.Max(0, bounds.Width - (int)(size.Width * RenderScaling) - 16), 16);
+                    transmissionScale.SelectedIndex = scale == 1 ? 0 : scale == .75 ? 1 : 2;
+                    var dimensions = TransmissionGeometry.Dimensions(script.SourceWidth, script.SourceHeight, scale);
+                    await Until(() => !applying && session.Configuration.TransmissionScale == scale && preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height);
+                    await Task.Delay(200);
+                    Check(preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height, "Real decoded dimensions at " + scale + "×", new { size, dimensions.Width, dimensions.Height });
+                    var watermarkOrigin = watermark.PointToScreen(new Point());
+                    var clientOrigin = this.PointToScreen(new Point());
+                    Check(watermark.VerifyPassThrough(preview.SourceWindow) && watermarkOrigin.X >= clientOrigin.X && watermarkOrigin.Y >= clientOrigin.Y &&
+                        watermarkOrigin.X + watermark.ClientSize.Width * RenderScaling <= clientOrigin.X + ClientSize.Width * RenderScaling + 1 &&
+                        watermarkOrigin.Y + watermark.ClientSize.Height * RenderScaling <= clientOrigin.Y + ClientSize.Height * RenderScaling + 1,
+                        "Click-through, non-activating watermark stays inside resized preview", new { size, watermark.ClientSize });
+                    if (!script.Input) continue;
+                    await SetInputAsync(true);
+                    for (var point = 0; point < 3; point++)
+                    {
+                        var targetX = script.Left + script.Width * (point + .5) / 3;
+                        var targetY = script.Top + script.Height * .55;
+                        GetClientRect(preview.SourceWindow, out var rectangle);
+                        var x = (int)Math.Round(targetX / (script.SourceWidth - 1) * (rectangle.Right - 1));
+                        var y = (int)Math.Round(targetY / (script.SourceHeight - 1) * (rectangle.Bottom - 1));
+                        var lp = (nint)((y << 16) | (x & 0xFFFF));
+                        var before = Interlocked.Read(ref inputSent);
+                        SendMessage(preview.SourceWindow, 0x0200, 0, lp);
+                        await Until(() => Interlocked.Read(ref inputSent) > before);
+                        await Task.Delay(120);
+                        SendMessage(preview.SourceWindow, 0x0201, 1, lp); await Task.Delay(70);
+                        SendMessage(preview.SourceWindow, 0x0202, 0, lp); await Task.Delay(70);
+                        if (script.FixtureWindow != 0 && remoteOptions?.Host == "127.0.0.1")
+                        {
+                            // A shared desktop moves focus away from the controller; isolate keyboard routing to our owned test fixture.
+                            if (!SetForegroundWindow((nint)script.FixtureWindow)) throw new InvalidOperationException("Cannot focus local input fixture.");
+                            await Task.Delay(60);
+                        }
+                        SendMessage(preview.SourceWindow, 0x0100, 0x58, (nint)(0x2D << 16 | 1));
+                        SendMessage(preview.SourceWindow, 0x0101, 0x58, unchecked((nint)(long)(0xC0000001u | 0x2Du << 16)));
+                        var screen = new InteractionPoint { X = x, Y = y }; ClientToScreen(preview.SourceWindow, ref screen);
+                        SendMessage(preview.SourceWindow, 0x020A, (nuint)(120 << 16), (nint)((screen.Y << 16) | (screen.X & 0xFFFF)));
+                        await Task.Delay(100);
+                        expected.Add(new { Scale = scale, WindowWidth = size.Width, WindowHeight = size.Height, TargetX = targetX, TargetY = targetY,
+                            PixelTolerance = Math.Ceiling(Math.Max(script.SourceWidth / (double)rectangle.Right, script.SourceHeight / (double)rectangle.Bottom)) + 2 });
+                    }
+                    await SetInputAsync(false);
+                }
+                var invalid = await session.ApplyAsync(config.InitialPreset, (int)Math.Round(bitrate.Value * 1000), .25);
+                Check(!invalid.Success && session.Configuration.TransmissionScale == .5, "Invalid scale preserves current stream");
+                if (script.Input)
+                {
+                await SetInputAsync(true);
+                SendMessage(preview.SourceWindow, 0x0100, 0x10, (nint)(0x2A << 16 | 1));
+                await Task.Delay(120);
+                SendMessage(preview.SourceWindow, 0x0100, 0x1B, (nint)(1 << 16 | 1));
+                await Until(() => inputClient?.Enabled == false);
+                Check(inputEnabled.IsChecked == false, "Escape exits control and releases held input");
+                Check(inputRejected == 0, "No injected input rejected", new { inputSent, inputRejected });
+                Check(cursorClient is { Updates: > 0, Shapes: >= 3 }, "Cursor shape feedback is independent of video", new { cursorClient?.Updates, cursorClient?.Shapes });
+                }
+                else Check(inputSent == 0 && inputEnabled.IsChecked != true, "Automatic keyboard/mouse tests disabled; no input sent");
+                if (script.Clipboard) { await SetClipboardAsync(true); updatingClipboard = true; clipboardEnabled.IsChecked = true; updatingClipboard = false; }
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(script.Report))!);
+                File.WriteAllText(script.Report, JsonSerializer.Serialize(new { Passed = true, Checks = checks, ExpectedInput = expected, InputTrace = interactionInputTrace,
+                    CursorShapes = interactionCursors.Where(update => update.Shape != null).Select(update => new { update.Id, update.Shape!.Width, update.Shape.Height, update.Shape.HotX, update.Shape.HotY }),
+                    ClipboardEnabled = script.Clipboard, Note = "Input delivery is verified independently against the target window event log." }, AppConfiguration.JsonOptions));
+                if (script.HoldUntilFile != null)
+                {
+                    var holdStart = Stopwatch.GetTimestamp();
+                    while (!File.Exists(script.HoldUntilFile) && !stopping)
+                    {
+                        if (Stopwatch.GetElapsedTime(holdStart).TotalMinutes > 5) throw new TimeoutException("Interaction orchestration did not finish.");
+                        await Task.Delay(100);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                ReportError(error); regressionExitCode = 1;
+                File.WriteAllText(script.Report, JsonSerializer.Serialize(new { Passed = false, Checks = checks, Error = error.ToString(), ExpectedInput = expected }, AppConfiguration.JsonOptions));
+            }
+            finally { if (!stopping) Close(); }
+        }
+        [StructLayout(LayoutKind.Sequential)] struct InteractionRect { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct InteractionPoint { public int X, Y; }
+        [DllImport("user32.dll")] static extern bool GetClientRect(nint hwnd, out InteractionRect rectangle);
+        [DllImport("user32.dll")] static extern bool ClientToScreen(nint hwnd, ref InteractionPoint point);
+        static nint SendMessage(nint hwnd, uint message, nuint wParam, nint lParam)
+        {
+            var previous = SetMessageExtraInfo(0);
+            try { return NativeSendMessage(hwnd, message, wParam, lParam); }
+            finally { SetMessageExtraInfo(previous); }
+        }
+        [DllImport("user32.dll", EntryPoint = "SendMessageW")] static extern nint NativeSendMessage(nint hwnd, uint message, nuint wParam, nint lParam);
+        [DllImport("user32.dll")] static extern nint SetMessageExtraInfo(nint value);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(nint hwnd);
+    }
 }
 
 // Source: FfmpegPresentation.cs
@@ -2271,6 +3111,9 @@ public sealed class ConfirmedVideoView : NativeControlHost
     public event Action<RemoteInputEvent>? Input;
     public event Action? InputExitRequested;
     public nint SourceWindow => sourceWindow;
+    public int VideoWidth => Volatile.Read(ref sourceWidth);
+    public int VideoHeight => Volatile.Read(ref sourceHeight);
+    public void SetRemoteCursor(CursorUpdate update) => inputSource?.SetRemoteCursor(update);
 
     public void SetInputEnabled(bool enabled)
     {
@@ -2814,7 +3657,7 @@ public sealed record RemoteOptions(string Host, int Port, string Token);
 sealed record RemoteRequest(string Kind, string Token = "", int VideoPort = 0, int DiagnosticPort = 0,
     string Session = "", ControlCommand? Command = null);
 sealed record RemoteWelcome(string Session, int SenderPort, int Width, int Height, int SourceWidth, int SourceHeight,
-    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets);
+    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1, double MaximumBitrateMbps = 100);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
     long ReceiveTick = 0, long SendTick = 0, long Frequency = 0);
@@ -2937,7 +3780,7 @@ public sealed partial class DemoSession
         var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,
-            InitialPreset = welcome.InitialPreset, InitialBitrateKbps = welcome.InitialBitrateKbps, Presets = welcome.Presets };
+            InitialPreset = welcome.InitialPreset, InitialBitrateKbps = welcome.InitialBitrateKbps, Presets = welcome.Presets, TransmissionScale = welcome.TransmissionScale, MaximumBitrateMbps = welcome.MaximumBitrateMbps };
         receiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         diagnosticsReceiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         for (var i = 0; i < 4; i++) await remote.ExchangeAsync(new("status"), stop.Token);
@@ -2983,6 +3826,21 @@ public sealed partial class DemoSession
         catch { client.Dispose(); throw; }
     }
 
+    public async Task<ClipboardSyncSession> ConnectRemoteClipboardAsync(IClipboardAccess clipboard, CancellationToken token, string? cacheRoot = null)
+    {
+        if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
+        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        try
+        {
+            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
+            await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("clipboard", remoteOptions.Token, Session: welcome.Session), token);
+            var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
+            if (!reply.Success) throw new IOException(reply.Message);
+            return new(client, clipboard, cacheRoot, token);
+        }
+        catch { client.Dispose(); throw; }
+    }
+
     internal void StartSender(IPEndPoint video, IPEndPoint diagnostics)
     {
         diagnosticDestination = diagnostics;
@@ -2992,6 +3850,21 @@ public sealed partial class DemoSession
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
         };
         encodeTask = Task.Run(EncodeLoop);
+    }
+
+    public async Task<CursorClient> ConnectRemoteCursorAsync(Action<CursorUpdate> received, Action<Exception> failed, CancellationToken token)
+    {
+        if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
+        var client = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+        try
+        {
+            await client.ConnectAsync(remoteOptions.Host, remoteOptions.Port, token);
+            await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("cursor", remoteOptions.Token, Session: welcome.Session), token);
+            var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
+            if (!reply.Success) throw new IOException(reply.Message);
+            return new(client, received, failed, token);
+        }
+        catch { client.Dispose(); throw; }
     }
 
     internal async Task<ControlResult> SubmitControlAsync(ControlCommand command, CancellationToken token)
@@ -3075,15 +3948,17 @@ sealed class RemoteHost : IAsyncDisposable
     CancellationTokenSource? activeStop;
     string sessionId = "";
     IPAddress? controller;
-    bool hasInput;
+    bool hasInput, hasClipboard, hasCursor;
+    nint clipboardOwner;
     int peerId;
     Task? acceptTask;
     public event Action<string>? Status;
     public RemoteHost(AppConfiguration config, IPAddress address, int port, string token)
     { this.config = config; this.token = token; listener = new(address, port); }
 
-    public void Start()
+    public void Start(nint clipboardOwner = 0)
     {
+        this.clipboardOwner = clipboardOwner;
         listener.Start(8); acceptTask = Task.Run(AcceptAsync);
         Console.Error.WriteLine($"Remote listener ready: {listener.LocalEndpoint}");
         Status?.Invoke($"被控端正在监听 {listener.LocalEndpoint}\n等待主控连接；关闭此窗口停止监听。");
@@ -3119,6 +3994,41 @@ sealed class RemoteHost : IAsyncDisposable
                 if (!CryptographicOperations.FixedTimeEquals(SHA256.HashData(Encoding.UTF8.GetBytes(hello.Token)), SHA256.HashData(Encoding.UTF8.GetBytes(token))))
                 { await RemoteWire.WriteAsync(stream, new RemoteReply(false, "连接口令错误。"), timeout.Token); return; }
                 var address = ((IPEndPoint)client.Client.RemoteEndPoint!).Address;
+                if (hello.Kind == "cursor")
+                {
+                    CancellationToken cursorToken;
+                    lock (gate)
+                    {
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasCursor)
+                            throw new InvalidDataException("Cursor channel does not belong to an available active session.");
+                        hasCursor = true; cursorToken = activeStop.Token;
+                    }
+                    try
+                    {
+                        await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
+                        await CursorWire.ServeAsync(client, cursorToken);
+                    }
+                    finally { lock (gate) { if (sessionId == hello.Session) hasCursor = false; } }
+                    return;
+                }
+                if (hello.Kind == "clipboard")
+                {
+                    CancellationToken clipboardToken;
+                    lock (gate)
+                    {
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasClipboard || clipboardOwner == 0)
+                            throw new InvalidDataException("Clipboard channel does not belong to an available active session.");
+                        hasClipboard = true; clipboardToken = activeStop.Token;
+                    }
+                    try
+                    {
+                        await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
+                        await using var clipboard = new ClipboardSyncSession(client, new WindowsClipboard(clipboardOwner), token: clipboardToken);
+                        await clipboard.Completion;
+                    }
+                    finally { lock (gate) { if (sessionId == hello.Session) hasClipboard = false; } }
+                    return;
+                }
                 if (hello.Kind == "input")
                 {
                     CancellationToken inputToken;
@@ -3134,7 +4044,7 @@ sealed class RemoteHost : IAsyncDisposable
                         using var injector = new Win32InputInjector();
                         await RemoteInputServer.ServePeerAsync(injector, client, inputToken);
                     }
-                    finally { lock (gate) hasInput = false; }
+                    finally { lock (gate) { if (sessionId == hello.Session) hasInput = false; } }
                     return;
                 }
                 if (hello.Kind != "hello" || hello.VideoPort is < 1 or > 65535 || hello.DiagnosticPort is < 1 or > 65535 || hello.VideoPort == hello.DiagnosticPort)
@@ -3145,17 +4055,19 @@ sealed class RemoteHost : IAsyncDisposable
                 {
                     if (activeStop != null) throw new InvalidOperationException("被控端已有主控连接。");
                     activeStop = lifetime = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
+                    hasInput = hasClipboard = hasCursor = false;
                     controller = address; sessionId = id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
                 }
                 try
                 {
-                    using var capture = new DesktopCapture(config.Width, config.Height);
+                    using var capture = new DesktopStreamSource(config.TransmissionScale);
                     capture.Capture();
-                    using var session = new DemoSession(config, capture.Capture);
+                    var streamConfig = config with { Width = capture.Width, Height = capture.Height };
+                    using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
                     session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
-                    var welcome = new RemoteWelcome(id, session.SenderPort, config.Width, config.Height,
-                        capture.Statistics?.SourceWidth ?? config.Width, capture.Statistics?.SourceHeight ?? config.Height,
-                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets);
+                    var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
+                        capture.SourceWidth, capture.SourceHeight,
+                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale, config.MaximumBitrateMbps);
                     await SendAsync(new(true, Welcome: welcome), received);
                     Status?.Invoke($"主控已连接：{address}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。");
                     while (!lifetime.IsCancellationRequested)
@@ -3178,6 +4090,7 @@ sealed class RemoteHost : IAsyncDisposable
                 finally
                 {
                     lifetime.Cancel();
+                    lifetime.Dispose();
                     lock (gate) { activeStop = null; controller = null; sessionId = ""; }
                     Status?.Invoke("主控已断开；已停止捕获发送并释放输入。等待重新连接。");
                 }
@@ -3212,13 +4125,14 @@ static class RemoteLaunch
         var values = new Dictionary<string, string>();
         for (var i = host ? 1 : 2; i < args.Length; i += 2)
         {
-            if (i + 1 >= args.Length || args[i] is not ("--port" or "--token" or "--listen" or "--test-seconds" or "--report") || !values.TryAdd(args[i], args[i + 1]))
+            if (i + 1 >= args.Length || args[i] is not ("--port" or "--token" or "--listen" or "--test-seconds" or "--report" or "--interaction-script") || !values.TryAdd(args[i], args[i + 1]))
                 throw new ArgumentException(Usage);
         }
         if (!values.TryGetValue("--port", out var portText) || !int.TryParse(portText, out var port) || port is < 1 or > 65535 ||
             !values.TryGetValue("--token", out var token) || string.IsNullOrWhiteSpace(token)) throw new ArgumentException(Usage);
         if (!host)
         {
+            FfmpegUi.InteractionScriptPath = values.GetValueOrDefault("--interaction-script");
             var seconds = int.Parse(values.GetValueOrDefault("--test-seconds", "0"));
             if (seconds is < 0 or > 3600) throw new ArgumentException("Invalid test duration.");
             FfmpegUi.Run(config, seconds, values.GetValueOrDefault("--report"), new(args[1], port, token)); return Environment.ExitCode;
@@ -3257,7 +4171,7 @@ static class RemoteLaunch
             var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
             Content = status; server = new(config, address, port, token);
             server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
-            Opened += (_, _) => { try { server.Start(); } catch (Exception error) { Console.Error.WriteLine(error); status.Text = error.Message; } };
+            Opened += (_, _) => { try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); } catch (Exception error) { Console.Error.WriteLine(error); status.Text = error.Message; } };
             Closing += async (_, e) =>
             {
                 if (finished) return;
@@ -3876,10 +4790,11 @@ public sealed class UdpVideoReceiver : IDisposable
 }
 
 // Source: FfmpegUi.cs
-static class FfmpegUi
+static partial class FfmpegUi
 {
     static int regressionExitCode;
     static Func<Window>? createWindow;
+    internal static string? InteractionScriptPath;
 
     public static void Run(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null)
     {
@@ -3911,27 +4826,33 @@ static class FfmpegUi
         }
     }
 
-    sealed class DesktopWindow : Window
+    sealed partial class DesktopWindow : Window
     {
         AppConfiguration config;
         readonly RemoteOptions? remoteOptions;
         readonly string? reportPath;
         readonly int autoCloseSeconds;
         readonly ComboBox presets = new() { Name = "EncoderPreset", HorizontalAlignment = HorizontalAlignment.Stretch };
-        readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = 100, Maximum = 5000, TickFrequency = 50, IsSnapToTickEnabled = true };
-        readonly TextBlock bitrateLabel = new();
-        readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 15 };
+        readonly ComboBox transmissionScale = new() { Name = "TransmissionScale", Width = 165, IsEnabled = false };
+        readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = .1, Maximum = 100, TickFrequency = .1, IsSnapToTickEnabled = true };
+        readonly NumericUpDown bitrateLabel = new() { Name = "BitrateValueMbps", Minimum = .1m, Maximum = 100m, Increment = .1m, FormatString = "0.0##", Width = 115 };
+        bool updatingBitrate;
+        readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
         readonly TextBlock operation = new() { TextWrapping = TextWrapping.Wrap };
         readonly TextBlock captureDetails = new() { TextWrapping = TextWrapping.Wrap, Opacity = .8, Margin = new Thickness(0, 4, 0, 6) };
         readonly TextBlock summary = new() { Text = "FRD · 真实屏幕 / FFmpeg / UDP", VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
         readonly TextBlock[] timings = Enumerable.Range(0, 6).Select(_ => new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 8, 3) }).ToArray();
-        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto,Auto,Auto,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+        readonly DiagnosticWatermark watermark = new();
+        readonly TextBlock controlTitle = new() { Text = "FRD 控制", VerticalAlignment = VerticalAlignment.Center };
         readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Esc 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
         readonly CheckBox packetDiagnostics = new() { Name = "PacketDiagnostics", Content = "诊断包", IsEnabled = false, Margin = new Thickness(8, 0) };
+        readonly CheckBox clipboardEnabled = new() { Name = "ClipboardSync", Content = "剪贴板同步（文本、文件、目录）", IsEnabled = false };
+        readonly TextBlock clipboardMessage = new() { Text = "关闭；开启后同步两端新复制的内容", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 0) };
         readonly Button collapse = new() { Name = "CollapseDiagnostics", Content = "收起 ▴", MinWidth = 72 };
         readonly Window overlay = new()
         {
-            Title = "FRD 控制与诊断", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
+            Title = "FRD 控制栏", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
             ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.Height,
             RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark,
             Background = Brushes.Transparent, TransparencyLevelHint = [WindowTransparencyLevel.Transparent]
@@ -3947,11 +4868,15 @@ static class FfmpegUi
         readonly CancellationTokenSource inputStop = new();
         readonly List<string> errors = new();
         readonly DateTime startedUtc = DateTime.UtcNow;
-        DesktopCapture? capture;
+        DesktopStreamSource? capture;
         DemoSession? session;
         Win32InputInjector? inputInjector;
         RemoteInputServer? inputServer;
         RemoteInputClient? inputClient;
+        ClipboardSyncSession? clipboardSync;
+        CursorClient? cursorClient;
+        readonly SemaphoreSlim clipboardTransition = new(1, 1);
+        bool updatingClipboard;
         Task? inputWorker;
         string? lastInputMessage, captureBackend;
         DesktopCaptureStatistics? captureStatistics;
@@ -3979,7 +4904,7 @@ static class FfmpegUi
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Content = new Border { Background = Brushes.Black, Child = preview };
             var header = new Grid { ColumnDefinitions = new("*,Auto,Auto,Auto") };
-            header.Children.Add(summary); Grid.SetColumn(inputEnabled, 1); header.Children.Add(inputEnabled);
+            header.Children.Add(controlTitle); Grid.SetColumn(inputEnabled, 1); header.Children.Add(inputEnabled);
             Grid.SetColumn(packetDiagnostics, 2); header.Children.Add(packetDiagnostics);
             Grid.SetColumn(collapse, 3); header.Children.Add(collapse);
             var panel = new StackPanel(); panel.Children.Add(header); panel.Children.Add(details);
@@ -3989,26 +4914,44 @@ static class FfmpegUi
                 BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12), Child = panel
             };
             overlay.Foreground = Brushes.Gainsboro;
-            var controls = new Grid { ColumnDefinitions = new("280,20,*,90"), RowDefinitions = new("Auto,Auto"), Margin = new Thickness(0, 0, 0, 8) };
+            var controls = new Grid { ColumnDefinitions = new("260,16,*,125"), RowDefinitions = new("Auto,Auto"), Margin = new Thickness(0, 0, 0, 8) };
             controls.Children.Add(new TextBlock { Text = "主控端手动选择编码预设", Margin = new Thickness(0, 0, 0, 5) });
             Grid.SetRow(presets, 1); controls.Children.Add(presets);
-            var capTitle = new TextBlock { Text = "编码码率上限（kbps）· 拖动后自动应用", Margin = new Thickness(0, 0, 0, 5) };
+            var capTitle = new TextBlock { Text = "编码码率上限（Mbps）· 可拖动或直接输入", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) };
             Grid.SetColumn(capTitle, 2); Grid.SetColumnSpan(capTitle, 2); controls.Children.Add(capTitle);
             Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 1); controls.Children.Add(bitrate);
             bitrateLabel.VerticalAlignment = VerticalAlignment.Center; bitrateLabel.HorizontalAlignment = HorizontalAlignment.Right;
             Grid.SetColumn(bitrateLabel, 3); Grid.SetRow(bitrateLabel, 1); controls.Children.Add(bitrateLabel);
             Add(details, controls, 0);
+            var diagnostics = new StackPanel { IsHitTestVisible = false, Opacity = .8 };
+            diagnostics.Children.Add(summary);
+            watermark.FontSize = 12; watermark.Foreground = Brushes.White;
+            watermark.Content = new Border
+            {
+                Background = new SolidColorBrush(Color.Parse("#6017202B")),
+                CornerRadius = new CornerRadius(6), Padding = new Thickness(10), Child = diagnostics,
+                IsHitTestVisible = false, ClipToBounds = true
+            };
             metrics.Margin = new Thickness(0, 4, 0, 5); metrics.Text = "正在启动真实捕获与 FFmpeg…";
-            Add(details, metrics, 1);
-            Add(details, new TextBlock { Text = "分层耗时：最近一帧 / 近 1 秒平均（ms）；无新样本显示 —", Opacity = .8 }, 2);
+            diagnostics.Children.Add(metrics);
+            diagnostics.Children.Add(new TextBlock { Text = "分层耗时：最近一帧 / 近 1 秒平均（ms）；无新样本显示 —", Opacity = .8 });
             var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
             for (var i = 0; i < timings.Length; i++) { Grid.SetRow(timings[i], i / 3); Grid.SetColumn(timings[i], i % 3); timingGrid.Children.Add(timings[i]); }
-            Add(details, timingGrid, 3); Add(details, captureDetails, 4); Add(details, operation, 5);
-            Add(details, new TextBlock
+            diagnostics.Children.Add(timingGrid); diagnostics.Children.Add(captureDetails); Add(details, operation, 1);
+            var clipboardRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 5, 0, 0) };
+            clipboardRow.Children.Add(clipboardEnabled); Grid.SetColumn(clipboardMessage, 1); clipboardRow.Children.Add(clipboardMessage);
+            Add(details, clipboardRow, 2);
+            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale => new ComboBoxItem { Content = scale == 1 ? "1× 原始分辨率" : $"{scale}× 宽高", Tag = scale }).ToArray();
+            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
+            var scaleRow = new Grid { ColumnDefinitions = new("Auto,*"), Margin = new Thickness(0, 6, 0, 0) };
+            scaleRow.Children.Add(transmissionScale);
+            var scaleHelp = new TextBlock { Text = "传输比例 · 与主控窗口缩放无关", Margin = new Thickness(12, 0), VerticalAlignment = VerticalAlignment.Center, TextWrapping = TextWrapping.Wrap };
+            Grid.SetColumn(scaleHelp, 1); scaleRow.Children.Add(scaleHelp); Add(details, scaleRow, 3);
+            diagnostics.Children.Add(new TextBlock
             {
                 Text = "带宽估计仅供参考。传输含限速与重组，渲染含等待绘制；GPU 完成不等于物理扫描。相同像素保持显示，静止绘制 FPS 可为 0。",
                 TextWrapping = TextWrapping.Wrap, Opacity = .7, Margin = new Thickness(0, 8, 0, 0)
-            }, 6);
+            });
 
             var entries = config.Presets.Select(pair =>
             {
@@ -4018,37 +4961,57 @@ static class FfmpegUi
             }).ToArray();
             presets.ItemsSource = entries;
             presets.SelectedItem = entries.FirstOrDefault(item => Equals(item.Tag, config.InitialPreset));
-            bitrate.Value = Math.Clamp(config.InitialBitrateKbps, 100, 5000); UpdateBitrateLabel();
-            presets.IsEnabled = bitrate.IsEnabled = false;
+            bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+            bitrate.Value = Math.Clamp(config.InitialBitrateKbps / 1000d, .1, config.MaximumBitrateMbps); UpdateBitrateLabel();
+            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = false;
             presets.SelectionChanged += (_, _) => ScheduleApply();
+            transmissionScale.SelectionChanged += (_, _) => ScheduleApply();
             bitrate.PropertyChanged += (_, args) =>
             {
                 if (args.Property == Slider.ValueProperty) { UpdateBitrateLabel(); ScheduleApply(); }
+            };
+            bitrateLabel.ValueChanged += (_, _) =>
+            {
+                if (updatingBitrate || bitrateLabel.Value is not { } value) return;
+                bitrate.Value = Math.Clamp((double)value, bitrate.Minimum, bitrate.Maximum);
             };
             refresh.Tick += (_, _) => RefreshStatus();
             debounce.Tick += (_, _) => ApplySelection();
             autoClose.Tick += (_, _) => { autoClose.Stop(); Close(); };
             collapse.Click += (_, _) => ToggleDetails();
             inputEnabled.IsCheckedChanged += (_, _) => ChangeInputToggle();
+            clipboardEnabled.IsCheckedChanged += async (_, _) =>
+            {
+                if (updatingClipboard || stopping) return;
+                try { await SetClipboardAsync(clipboardEnabled.IsChecked == true); }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine("[clipboard] " + error); clipboardMessage.Text = error.Message;
+                    updatingClipboard = true; clipboardEnabled.IsChecked = false; updatingClipboard = false;
+                }
+            };
             packetDiagnostics.IsCheckedChanged += (_, _) => ChangeDiagnostics();
             AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
             overlay.AddHandler(Avalonia.Input.InputElement.KeyDownEvent, ExitInputOnEscape, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "诊断浮层"); PositionOverlay(); };
+            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "控制栏"); PositionOverlay(); };
+            watermark.Opened += (_, _) => { ExcludeFromCapture(watermark, "诊断水印"); PositionOverlay(); };
+            overlay.SizeChanged += (_, _) => PositionOverlay();
+            watermark.SizeChanged += (_, _) => PositionOverlay();
             overlay.Closing += Shutdown;
             PositionChanged += (_, _) => PositionOverlay();
             PropertyChanged += (_, args) =>
             {
                 if (args.Property == ClientSizeProperty || args.Property == BoundsProperty) PositionOverlay();
-                if (args.Property == WindowStateProperty && overlay.IsVisible && WindowState == WindowState.Minimized) overlay.Hide();
+                if (args.Property == WindowStateProperty && WindowState == WindowState.Minimized) { overlay.Hide(); watermark.Hide(); }
                 else if (args.Property == WindowStateProperty && started && !stopping && WindowState != WindowState.Minimized)
-                { if (!overlay.IsVisible) overlay.Show(this); PositionOverlay(); }
+                { if (!watermark.IsVisible) watermark.Show(this); if (!overlay.IsVisible) overlay.Show(this); PositionOverlay(); }
             };
             Opened += Start;
             Closing += Shutdown;
         }
 
         static void Add(Grid grid, Control child, int row) { Grid.SetRow(child, row); grid.Children.Add(child); }
-        void UpdateBitrateLabel() => bitrateLabel.Text = $"{(int)Math.Round(bitrate.Value):N0}";
+        void UpdateBitrateLabel() { updatingBitrate = true; bitrateLabel.Value = (decimal)bitrate.Value; updatingBitrate = false; }
 
         void ExitInputOnEscape(object? sender, Avalonia.Input.KeyEventArgs args)
         {
@@ -4075,8 +5038,9 @@ static class FfmpegUi
             ToggleDetails(); await Task.Delay(100);
             if (stopping) return;
             var nativeOwner = GetWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0, 4) == (TryGetPlatformHandle()?.Handle ?? 0);
-            overlayPassed = nativeOwner && keptToggle && folded > 0 && folded < expanded && details.IsVisible && expandedBounds.Passed && foldedBounds.Passed;
-            overlayCheck = new { Passed = overlayPassed, NativeOwnedWindow = nativeOwner, ExpandedHeight = expanded, CollapsedHeight = folded, CollapseButtonRemainsVisible = keptToggle, ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds };
+            var passThrough = watermark.VerifyPassThrough(preview.SourceWindow);
+            overlayPassed = nativeOwner && passThrough && keptToggle && folded > 0 && folded < expanded && details.IsVisible && expandedBounds.Passed && foldedBounds.Passed;
+            overlayCheck = new { Passed = overlayPassed, WatermarkMouseTransparent = passThrough, WatermarkCannotActivate = passThrough, WatermarkOpacity = .8, NativeOwnedWindow = nativeOwner, ExpandedHeight = expanded, CollapsedHeight = folded, CollapseButtonRemainsVisible = keptToggle, ExpandedBounds = expandedBounds, FoldedBounds = foldedBounds };
             if (!overlayPassed) throw new InvalidOperationException("真实浮层或折叠布局验证失败");
         }
 
@@ -4091,7 +5055,7 @@ static class FfmpegUi
             var inside = origin.X >= outerOrigin.X - 1 && origin.Y >= outerOrigin.Y - 1 &&
                 origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
                 origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
-            Control[] controls = expanded ? [summary, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel, metrics, captureDetails, .. timings] : [summary, inputEnabled, packetDiagnostics, collapse];
+            Control[] controls = expanded ? [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel, clipboardEnabled, transmissionScale] : [controlTitle, inputEnabled, packetDiagnostics, collapse];
             var contentInside = controls.All(control =>
             {
                 var point = control.PointToScreen(new Point());
@@ -4107,6 +5071,12 @@ static class FfmpegUi
             if (!overlay.IsVisible || ClientSize.Width <= 0) return;
             overlay.Width = Math.Max(340, Math.Min(details.IsVisible ? 1100 : 750, ClientSize.Width - 24));
             overlay.Position = this.PointToScreen(new Point(Math.Max(12, (ClientSize.Width - overlay.Width) / 2), 12));
+            if (watermark.IsVisible)
+            {
+                watermark.Width = Math.Max(340, Math.Min(1100, ClientSize.Width - 24));
+                watermark.MaxHeight = Math.Max(40, ClientSize.Height - overlay.ClientSize.Height - 36);
+                watermark.Position = this.PointToScreen(new Point(12, Math.Max(12, ClientSize.Height - watermark.ClientSize.Height - 12)));
+            }
         }
 
         void ExcludeFromCapture(Window window, string description)
@@ -4118,11 +5088,15 @@ static class FfmpegUi
         async void Start(object? sender, EventArgs args)
         {
             ExcludeFromCapture(this, "预览窗口");
-            overlay.Show(this); PositionOverlay();
+            watermark.Show(this); overlay.Show(this); PositionOverlay();
             refresh.Start();
             try
             {
-                if (remoteOptions == null) { capture = new(config.Width, config.Height); session = new(config, capture.Capture); }
+                if (remoteOptions == null)
+                {
+                    capture = new(config.TransmissionScale); config = config with { Width = capture.Width, Height = capture.Height };
+                    session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                }
                 else session = new(config, remoteOptions);
                 session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(frame); };
                 session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
@@ -4130,16 +5104,32 @@ static class FfmpegUi
                 if (remoteOptions != null)
                 {
                     config = session.Configuration;
-                    bitrate.Value = config.InitialBitrateKbps;
+                    bitrate.Maximum = config.MaximumBitrateMbps; bitrateLabel.Maximum = (decimal)config.MaximumBitrateMbps;
+                    bitrate.Value = config.InitialBitrateKbps / 1000d;
                     presets.ItemsSource = config.Presets.Select(entry => new ComboBoxItem
                         { Content = entry.Value.Label, Tag = entry.Key, IsEnabled = entry.Value.Enabled }).ToArray();
                     presets.SelectedItem = presets.Items.Cast<ComboBoxItem>().FirstOrDefault(item => (string?)item.Tag == config.InitialPreset);
+                    transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
                 }
                 if (stopping) return;
                 await StartInputAsync();
+                if (session.IsRemote)
+                    cursorClient = await session.ConnectRemoteCursorAsync(update => Dispatcher.UIThread.Post(() =>
+                    {
+                        if (stopping) return;
+                        try { preview.SetRemoteCursor(update); if (InteractionScriptPath != null) interactionCursors.Add(update); }
+                        catch (Exception error) { ReportError(error); }
+                    }), error => Dispatcher.UIThread.Post(() => ReportError(error)), inputStop.Token);
                 if (stopping) return;
-                started = true; presets.IsEnabled = bitrate.IsEnabled = true;
+                started = true; presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
+                clipboardEnabled.IsEnabled = session.IsRemote;
+                if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
+                if (InteractionScriptPath != null)
+                {
+                    await VerifyOverlayAsync();
+                    await RunInteractionAsync(InteractionScriptPath); return;
+                }
                 if (autoCloseSeconds > 0)
                 {
                     await VerifyOverlayAsync();
@@ -4171,6 +5161,7 @@ static class FfmpegUi
             inputInjector = new();
             inputInjector.RegisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
             inputInjector.RegisterControllerWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0);
+            inputInjector.RegisterControllerWindow(watermark.TryGetPlatformHandle()?.Handle ?? 0);
             inputInjector.RegisterControllerWindow(preview.SourceWindow);
             inputServer = new(inputInjector);
             inputServer.Failed += ex => Dispatcher.UIThread.Post(() => ReportError(ex));
@@ -4178,6 +5169,27 @@ static class FfmpegUi
             if (stopping || inputStop.IsCancellationRequested) { client.Dispose(); return; }
             inputClient = client;
             inputWorker = Task.Run(SendInputLoopAsync);
+        }
+
+        async Task SetClipboardAsync(bool enabled)
+        {
+            await clipboardTransition.WaitAsync();
+            try
+            {
+                clipboardEnabled.IsEnabled = false;
+                if (clipboardSync != null) { await clipboardSync.DisposeAsync(); clipboardSync = null; }
+                if (enabled)
+                {
+                    clipboardSync = await session!.ConnectRemoteClipboardAsync(new WindowsClipboard(TryGetPlatformHandle()?.Handle ?? 0), inputStop.Token);
+                    clipboardSync.Status += status => Dispatcher.UIThread.Post(() =>
+                    {
+                        clipboardMessage.Text = status.Message;
+                        if (!status.Connected && !stopping) clipboardEnabled.IsChecked = false;
+                    });
+                }
+                clipboardMessage.Text = enabled ? "已开启；同步两端新复制的内容" : "已关闭剪贴板同步";
+            }
+            finally { clipboardEnabled.IsEnabled = !stopping && session?.IsRemote == true; clipboardTransition.Release(); }
         }
 
         async void ChangeDiagnostics()
@@ -4236,8 +5248,8 @@ static class FfmpegUi
         {
             if (stopping || inputClient?.Enabled != true) return;
             var source = capture?.Statistics;
-            var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, config.Width, config.Height, session.RemoteSourceWidth, session.RemoteSourceHeight) :
-                source == null ? input : InputCoordinates.MapFromVideo(input, config.Width, config.Height, source.SourceWidth, source.SourceHeight);
+            var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, session.RemoteSourceWidth, session.RemoteSourceHeight) :
+                source == null ? input : InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, source.SourceWidth, source.SourceHeight);
             if (mapped == null) return;
             lock (inputGate)
             {
@@ -4312,13 +5324,15 @@ static class FfmpegUi
             if (applying) { applyAgain = true; return; }
             if (presets.SelectedItem is not ComboBoxItem { Tag: string presetId }) return;
             applying = true;
-            var limit = (int)Math.Round(bitrate.Value);
-            operation.Text = $"正在请求被控端应用 {presetId} / {limit:N0} kbps…";
+            var limit = (int)Math.Round(bitrate.Value * 1000);
+            operation.Text = $"正在请求被控端应用 {presetId} / {limit / 1000d:0.###} Mbps…";
             try
             {
-                var result = await session.ApplyAsync(presetId, limit);
+                var scale = transmissionScale.SelectedItem is ComboBoxItem { Tag: double selectedScale } ? selectedScale : config.TransmissionScale;
+                var result = await session.ApplyAsync(presetId, limit, scale);
+                config = session.Configuration;
                 if (result.Success) successfulChanges++;
-                operation.Text = result.Success ? $"已应用：{presetId} / {limit:N0} kbps（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
+                operation.Text = result.Success ? $"已应用：{presetId} / {limit / 1000d:0.###} Mbps / {config.TransmissionScale}× {config.Width}×{config.Height}（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
                 if (!result.Success) Console.Error.WriteLine($"[UI control] {result.Message}");
             }
             catch (Exception ex) { ReportError(ex); }
@@ -4337,7 +5351,7 @@ static class FfmpegUi
             {
                 string Mean(double value) => currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming ? $"{value:F2}" : "—";
                 var latency = currentStatus.HasRenderTiming ? $"最近 {currentStatus.CaptureToRenderMs:F1} / 近 1 秒平均 {Mean(currentStatus.MeanCaptureToRenderMs)} ms（{currentStatus.RenderTimingSamples} 帧）" : "等待首次 GPU 确认";
-                summary.Text = $"{currentStatus.ActivePreset} · {currentStatus.AppliedLimitKbps:N0} kbps · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
+                summary.Text = $"{currentStatus.ActivePreset} · {currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
                 metrics.Text = $"发送 {currentStatus.SentMbps:F3} / 接收 {currentStatus.ReceivedMbps:F3} Mbps  |  带宽估计 {currentStatus.EstimatedMbps:F3} Mbps（参考）\n诊断包：{(currentStatus.PacketDiagnosticsEnabled ? "开" : "关")}，开销 {currentStatus.DiagnosticMbps * 1000:F2} kbps（已计入流量）\n捕获 → GPU 完成：{latency}  |  绘制 {currentStatus.RenderedFps:F1} / 解码 {currentStatus.DecodedFps:F1} FPS\n网络延迟趋势 {currentStatus.DelayTrendMs:+0.00;-0.00;0.00} ms  |  丢包 {currentStatus.LossRate:P1}  |  {currentStatus.Message}";
                 if (!changingDiagnostics) { updatingDiagnostics = true; packetDiagnostics.IsChecked = currentStatus.PacketDiagnosticsEnabled; updatingDiagnostics = false; }
                 metrics.Text += "\n" + currentStatus.TimingDescription;
@@ -4366,7 +5380,9 @@ static class FfmpegUi
             args.Cancel = true;
             if (stopping) return;
             stopping = true; debounce.Stop(); autoClose.Stop();
-            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            presets.IsEnabled = bitrate.IsEnabled = bitrateLabel.IsEnabled = transmissionScale.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            try { await SetClipboardAsync(false); } catch (Exception ex) { ReportError(ex); }
+            try { if (cursorClient != null) await cursorClient.DisposeAsync(); } catch (Exception ex) { ReportError(ex); }
             try { await StopInputAsync(); } catch (Exception ex) { ReportError(ex); }
             try { if (session != null) await session.StopAsync(); }
             catch (Exception ex) { ReportError(ex); }
@@ -4378,7 +5394,7 @@ static class FfmpegUi
                 captureBackend = capture?.Backend; captureStatistics = capture?.Statistics;
                 try { capture?.Dispose(); } catch (Exception ex) { ReportError(ex); }
                 WriteReport(); allowClose = true;
-                Dispatcher.UIThread.Post(() => { overlay.Close(); Close(); });
+                Dispatcher.UIThread.Post(() => { watermark.Close(); overlay.Close(); Close(); });
             }
         }
 
@@ -4410,7 +5426,8 @@ static class FfmpegUi
                     Passed = passed, Technology = "Avalonia", RealDesktopCapture = true, RemoteController = session?.IsRemote == true, CanResize, Started = started,
                     DurationSeconds = (DateTime.UtcNow - startedUtc).TotalSeconds,
                     ReceivedFrames = frames, GpuConfirmedFrames = presented, SuccessfulManualChanges = successfulChanges,
-                    ManualLimitMinimumKbps = bitrate.Minimum, ManualLimitMaximumKbps = bitrate.Maximum,
+                    ManualLimitMinimumMbps = bitrate.Minimum, ManualLimitMaximumMbps = bitrate.Maximum,
+                    ManualLimitMinimumKbps = bitrate.Minimum * 1000, ManualLimitMaximumKbps = bitrate.Maximum * 1000,
                     Overlay = new { OwnedByPreview = overlay.Owner == this, Visible = overlay.IsVisible, Expanded = details.IsVisible, overlay.Width, Height = overlay.ClientSize.Height, Position = overlay.Position.ToString() },
                     OverlayRegression = overlayCheck, FinalOverlayBounds = finalOverlayBounds,
                     TimingRegression = new { Passed = timingPassed, TransferBreakdownPassed = transportPassed, LatestStageSumMs = stageSum, LatestTotalMs = status?.CaptureToRenderMs, MeanStageSumMs = meanStageSum, MeanTotalMs = status?.MeanCaptureToRenderMs },
@@ -4527,4 +5544,66 @@ static class FfmpegUi
             if (!passed) throw new InvalidOperationException($"{stage}: rendered view has aspect {actual}, expected {expected}.");
         }
     }
+}
+
+// Source: FfmpegWatermark.cs
+sealed class DiagnosticWatermark : Window
+{
+    const int ExtendedStyle = -20, NoActivate = 0x08000000;
+    readonly SubclassProcedure procedure;
+    nint handle;
+
+    public DiagnosticWatermark()
+    {
+        procedure = WindowProcedure;
+        Title = "FRD 诊断水印";
+        WindowDecorations = WindowDecorations.None;
+        CanResize = false; ShowInTaskbar = false; ShowActivated = false;
+        Focusable = false; IsHitTestVisible = false;
+        SizeToContent = SizeToContent.Height;
+        Background = Brushes.Transparent;
+        TransparencyLevelHint = [WindowTransparencyLevel.Transparent];
+        RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark;
+    }
+
+    protected override void OnOpened(EventArgs e)
+    {
+        handle = TryGetPlatformHandle()?.Handle ?? throw new InvalidOperationException("Missing diagnostic watermark HWND.");
+        var style = GetWindowLong(handle, ExtendedStyle);
+        Marshal.SetLastPInvokeError(0);
+        if (SetWindowLong(handle, ExtendedStyle, style | NoActivate) == 0 && Marshal.GetLastWin32Error() != 0)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot disable watermark activation.");
+        if (!SetWindowSubclass(handle, procedure, 1, 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot make diagnostics click-through.");
+        base.OnOpened(e);
+    }
+
+    nint WindowProcedure(nint hwnd, uint message, nuint wParam, nint lParam, nuint id, nuint reference)
+    {
+        // Both windows belong to the UI thread; HTTRANSPARENT continues hit testing beneath this HWND.
+        if (message == 0x0084) return -1;
+        if (message == 0x0021) return 3;
+        if (message == 0x0082 && !RemoveWindowSubclass(hwnd, procedure, id))
+            Console.Error.WriteLine("[watermark] Cannot detach native hit-test handler: " + Marshal.GetLastWin32Error());
+        return DefSubclassProc(hwnd, message, wParam, lParam);
+    }
+
+    public bool VerifyPassThrough(nint preview)
+    {
+        var origin = this.PointToScreen(new Point(8, 8));
+        var position = (nint)((origin.X & 0xffff) | ((origin.Y & 0xffff) << 16));
+        return handle != 0 && preview != 0 && !Focusable && !IsHitTestVisible &&
+            (GetWindowLong(handle, ExtendedStyle) & NoActivate) != 0 &&
+            GetWindowThreadProcessId(handle, out _) == GetWindowThreadProcessId(preview, out _) &&
+            SendMessage(handle, 0x0084, 0, position) == -1 && SendMessage(handle, 0x0021, 0, 0) == 3;
+    }
+
+    delegate nint SubclassProcedure(nint hwnd, uint message, nuint wParam, nint lParam, nuint id, nuint reference);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(nint hwnd, int index);
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)] static extern int SetWindowLong(nint hwnd, int index, int value);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(nint hwnd, out uint process);
+    [DllImport("user32.dll", EntryPoint = "SendMessageW")] static extern nint SendMessage(nint hwnd, uint message, nuint wParam, nint lParam);
+    [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool SetWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id, nuint reference);
+    [DllImport("comctl32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool RemoveWindowSubclass(nint hwnd, SubclassProcedure callback, nuint id);
+    [DllImport("comctl32.dll")] static extern nint DefSubclassProc(nint hwnd, uint message, nuint wParam, nint lParam);
 }

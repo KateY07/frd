@@ -2,9 +2,11 @@
   "schemaVersion": 3,
   "width": 1280,
   "height": 720,
+  "transmissionScale": 1,
   "framesPerSecond": 30,
   "initialPreset": "h264",
   "initialBitrateKbps": 1000,
+  "maximumBitrateMbps": 100,
   "libraryDirectory": "ffmpeg",
   "simulation": {
     "capacityMbps": 0,

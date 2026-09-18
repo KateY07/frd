@@ -73,7 +73,7 @@ static class Program
             using var decoder = new FfmpegDecoder(configuration.Presets["h264"].DecoderArguments);
             long frame = 0;
             List<double> outputRates = new();
-            foreach (var cap in new[] { 1000, 2000, 3000, 4000, 5000, 1000, 500, 5000 })
+            foreach (var cap in new[] { 1000, 2000, 3000, 4000, 5000, 1000, 500, 5000, 10000, 20000, 1000 })
             {
                 if (!encoder.SetBitrate(cap) || encoder.MaxRateBitsPerSecond != cap * 1000L) throw new Exception("Bitrate update failed");
                 long bytes = 0;
