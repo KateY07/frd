@@ -30,6 +30,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -2879,16 +2880,28 @@ public sealed class RemoteInputServer : IDisposable
 
 public sealed class RemoteInputClient : IDisposable
 {
+    const int MaximumInFlight = 64;
+    static readonly TimeSpan AcknowledgementTimeout = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
-    readonly SemaphoreSlim gate = new(1, 1);
+    readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
-    long sequence;
+    readonly object pendingGate = new();
+    readonly Dictionary<long, PendingInput> pending = new();
+    readonly Task reader;
+    Exception? failure;
+    long sequence, repliedSequence;
     long enableRevision;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
 
-    internal RemoteInputClient(TcpClient connection) { this.connection = connection; stream = connection.GetStream(); }
+    internal RemoteInputClient(TcpClient connection)
+    {
+        this.connection = connection;
+        connection.NoDelay = true;
+        stream = connection.GetStream();
+        reader = Task.Run(ReadRepliesAsync);
+    }
 
     public static async Task<RemoteInputClient> ConnectAsync(IPEndPoint endpoint, CancellationToken token = default)
     {
@@ -2903,47 +2916,146 @@ public sealed class RemoteInputClient : IDisposable
 
     public async Task<RemoteInputResult> SetEnabledAsync(bool value, CancellationToken token = default)
     {
-        var revision = Interlocked.Increment(ref enableRevision);
-        if (!value) Volatile.Write(ref enabled, 0);
-        var result = await ExchangeAsync(value, null, token).ConfigureAwait(false);
-        if (revision == Interlocked.Read(ref enableRevision)) Volatile.Write(ref enabled, value && result.Accepted ? 1 : 0);
-        return result;
-    }
-
-    public Task<RemoteInputResult> SendAsync(RemoteInputEvent input, CancellationToken token = default) =>
-        !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) : ExchangeAsync(null, input, token);
-
-    async Task<RemoteInputResult> ExchangeAsync(bool? enable, RemoteInputEvent? input, CancellationToken token)
-    {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, token);
-        await gate.WaitAsync(linked.Token).ConfigureAwait(false);
         try
         {
-            if (input is not null && !Enabled) return new(false, "Input forwarding is disabled.");
-            var current = ++sequence;
-            await InputProtocol.WriteAsync(stream, new InputRequest(current, enable, input), linked.Token).ConfigureAwait(false);
-            var reply = await InputProtocol.ReadAsync<InputReply>(stream, linked.Token).ConfigureAwait(false);
-            if (reply.Sequence != current) throw new InvalidDataException("Input reply sequence mismatch.");
-            return new(reply.Accepted, reply.Message);
+            var revision = Interlocked.Increment(ref enableRevision);
+            if (!value) Volatile.Write(ref enabled, 0);
+            var acknowledgement = await QueueRequestAsync(value, null, token).ConfigureAwait(false);
+            var result = await acknowledgement.ConfigureAwait(false);
+            if (!value && !result.Accepted) Fail(new IOException("Remote input disable was rejected: " + result.Message));
+            lock (pendingGate)
+                if (revision == Interlocked.Read(ref enableRevision) && failure == null && Volatile.Read(ref disposed) == 0)
+                    Volatile.Write(ref enabled, value && result.Accepted ? 1 : 0);
+            return result;
         }
         catch (Exception error)
         {
-            InputProtocol.Log("Input connection failed; closing it to release held input", error);
-            Volatile.Write(ref enabled, 0);
-            connection.Close();
+            // Even cancellation before writing disable must release keys already held at the remote endpoint.
+            if (!value) Fail(error);
             throw;
         }
-        finally { gate.Release(); }
+    }
+
+    public async Task<RemoteInputResult> SendAsync(RemoteInputEvent input, CancellationToken token = default)
+    {
+        var acknowledgement = await QueueAsync(input, token).ConfigureAwait(false);
+        return await acknowledgement.ConfigureAwait(false);
+    }
+
+    // Await the outer task to preserve write order, then observe the returned task for the remote result.
+    public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) :
+            await QueueRequestAsync(null, input, token).ConfigureAwait(false);
+    }
+
+    async Task<Task<RemoteInputResult>> QueueRequestAsync(bool? enable, RemoteInputEvent? input, CancellationToken token)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, token);
+        var ownsSlot = false;
+        var ownsWriter = false;
+        PendingInput? request = null;
+        try
+        {
+            await slots.WaitAsync(linked.Token).ConfigureAwait(false);
+            ownsSlot = true;
+            await writeGate.WaitAsync(linked.Token).ConfigureAwait(false);
+            ownsWriter = true;
+            if (input is not null && !Enabled) return Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled."));
+            lock (pendingGate)
+            {
+                if (failure != null) throw new IOException("Input connection is closed.", failure);
+                linked.Token.ThrowIfCancellationRequested();
+                request = new(++sequence);
+                pending.Add(request.Sequence, request);
+                ownsSlot = false;
+            }
+            ObserveFault(request.Completion.Task);
+            var acknowledgement = AwaitAcknowledgementAsync(request, token);
+            // A write may fail before the caller receives this task. Observing its fault does not change its result.
+            ObserveFault(acknowledgement);
+            await InputProtocol.WriteAsync(stream, new InputRequest(request.Sequence, enable, input), linked.Token).ConfigureAwait(false);
+            return acknowledgement;
+        }
+        catch (Exception error)
+        {
+            if (request != null) Fail(error);
+            throw;
+        }
+        finally
+        {
+            if (ownsWriter) writeGate.Release();
+            if (ownsSlot) slots.Release();
+        }
+    }
+
+    async Task<RemoteInputResult> AwaitAcknowledgementAsync(PendingInput request, CancellationToken token)
+    {
+        try { return await request.Completion.Task.WaitAsync(AcknowledgementTimeout, token).ConfigureAwait(false); }
+        catch (Exception error) { Fail(error); throw; }
+    }
+
+    async Task ReadRepliesAsync()
+    {
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                var reply = await InputProtocol.ReadAsync<InputReply>(stream, stop.Token).ConfigureAwait(false);
+                lock (pendingGate)
+                {
+                    if (failure != null) return;
+                    if (reply.Sequence != repliedSequence + 1 || !pending.Remove(reply.Sequence, out var request))
+                        throw new InvalidDataException("Input reply sequence mismatch.");
+                    repliedSequence = reply.Sequence;
+                    slots.Release();
+                    request.Completion.TrySetResult(new(reply.Accepted, reply.Message));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { InputProtocol.Log("Input reply reader stopped."); }
+        catch (Exception error) { Fail(error); }
+    }
+
+    void Fail(Exception error, bool disposing = false)
+    {
+        PendingInput[] abandoned;
+        lock (pendingGate)
+        {
+            if (failure != null) return;
+            failure = error;
+            Volatile.Write(ref enabled, 0);
+            abandoned = pending.Values.ToArray();
+            pending.Clear();
+        }
+        InputProtocol.Log(disposing ? "Input connection disposed; releasing held input." : "Input connection failed; closing it to release held input", disposing ? null : error);
+        stop.Cancel();
+        connection.Close();
+        foreach (var request in abandoned)
+        {
+            slots.Release();
+            request.Completion.TrySetException(error);
+        }
     }
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        Volatile.Write(ref enabled, 0);
-        stop.Cancel();
-        connection.Dispose();
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
+        Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
+        // The reader handles shutdown itself; disposal never blocks its own continuation.
+        ObserveFault(reader);
+    }
+
+    static void ObserveFault(Task task) => _ = task.ContinueWith(completed => _ = completed.Exception,
+        CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+    sealed class PendingInput(long sequence)
+    {
+        public long Sequence { get; } = sequence;
+        public TaskCompletionSource<RemoteInputResult> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
 
@@ -3410,10 +3522,270 @@ static partial class FfmpegUi
     }
 }
 
+// Source: FfmpegLocalInput.cs
+sealed class LocalDemoInputTarget : IRemoteInputInjector, IDisposable
+{
+    const uint DispatchMessage = 0x8001;
+    readonly ConcurrentQueue<PendingInput> pending = new();
+    readonly TaskCompletionSource ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly Dictionary<int, (uint Key, nint Parameters)> held = new();
+    readonly byte[] keyboard = new byte[256];
+    readonly Thread thread;
+    readonly WindowProcedure procedure;
+    nint window, editor;
+    int disposed, wheelRemainder;
+
+    public nint WindowHandle => Volatile.Read(ref window);
+    internal nint EditorHandle => Volatile.Read(ref editor);
+    public bool IsOpen => Volatile.Read(ref disposed) == 0 && WindowHandle != 0;
+    public string ModeDescription => "本机体验：仅向专用测试窗口转发滚轮和键盘；不移动鼠标、不点击、不抢焦点。";
+
+    public LocalDemoInputTarget()
+    {
+        procedure = WindowProc;
+        thread = new(Run) { IsBackground = true, Name = "FRD local input target" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        try { ready.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult(); }
+        catch { Dispose(); throw; }
+    }
+
+    public RemoteInputResult Inject(RemoteInputEvent input)
+    {
+        if (input.Kind is not (RemoteInputKind.Wheel or RemoteInputKind.KeyDown or RemoteInputKind.KeyUp or RemoteInputKind.ReleaseAll))
+            return new(false, "Local demo refuses mouse movement, clicks and dragging.");
+        if (!IsOpen) return new(false, "Local demo input target is closed.");
+        var request = new PendingInput(input);
+        pending.Enqueue(request);
+        if (!PostMessageW(WindowHandle, DispatchMessage, 0, 0))
+        {
+            Interlocked.Exchange(ref request.Cancelled, 1);
+            var error = new Win32Exception(Marshal.GetLastWin32Error());
+            InputProtocol.Log("Local demo input dispatch failed", error);
+            return new(false, error.Message);
+        }
+        try { return request.Completion.Task.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult(); }
+        catch (TimeoutException error)
+        {
+            Interlocked.Exchange(ref request.Cancelled, 1);
+            InputProtocol.Log("Local demo input target did not respond", error);
+            return new(false, "Local demo input target did not respond within 2 seconds.");
+        }
+    }
+
+    public RemoteInputResult ReleaseAll() => IsOpen ? Inject(new(RemoteInputKind.ReleaseAll)) : new(true, "Local demo has no system input to release.");
+
+    void Run()
+    {
+        var name = "FRD.LocalInput." + Guid.NewGuid().ToString("N");
+        var instance = GetModuleHandleW(null);
+        var registered = false;
+        try
+        {
+            var definition = new WindowClass { Size = (uint)Marshal.SizeOf<WindowClass>(), Instance = instance,
+                Procedure = Marshal.GetFunctionPointerForDelegate(procedure), ClassName = name,
+                Cursor = LoadCursorW(0, 32512), Background = 6 };
+            if (RegisterClassExW(ref definition) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            registered = true;
+            window = CreateWindowExW(0x08000000, name, "FRD 本机输入目标 — 滚轮 / 键盘；在预览中操作", 0x00cf0000,
+                20, 80, 650, 720, 0, 0, instance, 0);
+            if (window == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            editor = CreateWindowExW(0x200, "EDIT", InitialText(), 0x503010c4,
+                8, 8, 620, 660, window, 0, instance, 0);
+            if (editor == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            SendMessageW(editor, 0x30, GetStockObject(17), 1);
+            SendMessageW(editor, 0xb1, 0, 0);
+            if (Volatile.Read(ref disposed) != 0) return;
+            ShowWindow(window, 4);
+            ready.TrySetResult();
+            while (true)
+            {
+                var result = GetMessageW(out var message, 0, 0, 0);
+                if (result == -1) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (result == 0) break;
+                TranslateMessage(ref message);
+                DispatchMessageW(ref message);
+            }
+        }
+        catch (Exception error)
+        {
+            InputProtocol.Log("Local demo input window failed", error);
+            ready.TrySetException(error);
+        }
+        finally
+        {
+            if (window != 0 && !DestroyWindow(window)) InputProtocol.Log("Local demo window cleanup failed", new Win32Exception(Marshal.GetLastWin32Error()));
+            Volatile.Write(ref window, 0);
+            Volatile.Write(ref editor, 0);
+            while (pending.TryDequeue(out var request)) request.Completion.TrySetResult(new(false, "Local demo input target is closed."));
+            if (registered && !UnregisterClassW(name, instance)) InputProtocol.Log("Local demo window class cleanup failed", new Win32Exception(Marshal.GetLastWin32Error()));
+        }
+    }
+
+    nint WindowProc(nint hwnd, uint message, nuint wParam, nint lParam)
+    {
+        try
+        {
+            switch (message)
+            {
+                case DispatchMessage:
+                    while (pending.TryDequeue(out var request))
+                    {
+                        if (Volatile.Read(ref request.Cancelled) != 0) continue;
+                        try { request.Completion.TrySetResult(Apply(request.Input)); }
+                        catch (Exception error)
+                        {
+                            InputProtocol.Log("Local demo input failed", error);
+                            request.Completion.TrySetResult(new(false, error.Message));
+                        }
+                    }
+                    return 0;
+                case 5:
+                    if (editor != 0) MoveWindow(editor, 8, 8, Math.Max(1, (int)((long)lParam & 0xffff) - 16),
+                        Math.Max(1, (int)(((long)lParam >> 16) & 0xffff) - 16), true);
+                    return 0;
+                case 0x10:
+                    if (!DestroyWindow(hwnd)) InputProtocol.Log("Closing local demo window failed", new Win32Exception(Marshal.GetLastWin32Error()));
+                    return 0;
+                case 2:
+                    Volatile.Write(ref window, 0);
+                    Volatile.Write(ref editor, 0);
+                    PostQuitMessage(0);
+                    return 0;
+            }
+        }
+        catch (Exception error) { InputProtocol.Log("Local demo window message failed", error); }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    RemoteInputResult Apply(RemoteInputEvent input)
+    {
+        if (editor == 0) return new(false, "Local demo input target is closed.");
+        if (input.Kind == RemoteInputKind.ReleaseAll)
+        {
+            foreach (var value in held.Values) SendMessageW(editor, 0x101, (nint)value.Key, value.Parameters | unchecked((nint)0xc0000000L));
+            held.Clear();
+            Array.Clear(keyboard);
+            return new(true, "Local demo keys released; system input was not modified.");
+        }
+        if (input.Kind == RemoteInputKind.Wheel)
+        {
+            if (input.WheelDelta is < short.MinValue or > short.MaxValue) return new(false, "Invalid wheel delta.");
+            wheelRemainder += input.WheelDelta;
+            var notches = wheelRemainder / 120;
+            wheelRemainder %= 120;
+            if (notches != 0) SendMessageW(editor, 0xb6, 0, -notches * 3);
+            return new(true, "Wheel delivered to local test editor.");
+        }
+        if (input.ScanCode is <= 0 or > 255) return new(false, "Invalid keyboard scan code.");
+        var layout = GetKeyboardLayout(0);
+        var scan = (uint)input.ScanCode | (input.Extended ? 0xe000u : 0);
+        var key = MapVirtualKeyExW(scan, 3, layout);
+        if (key is 0 or > 255) return new(false, "Keyboard scan code could not be mapped.");
+        var id = input.ScanCode | (input.Extended ? 0x100 : 0);
+        var down = input.Kind == RemoteInputKind.KeyDown;
+        var repeated = held.ContainsKey(id);
+        var parameters = (nint)(1L | ((long)input.ScanCode << 16) | (input.Extended ? 1L << 24 : 0) |
+            (repeated ? 1L << 30 : 0) | (down ? 0 : 1L << 31));
+        if (down && !repeated && key is 0x14 or 0x90 or 0x91) keyboard[key] ^= 1;
+        keyboard[key] = (byte)((keyboard[key] & 1) | (down ? 0x80 : 0));
+        keyboard[0x10] = (byte)(keyboard[0xa0] | keyboard[0xa1]);
+        keyboard[0x11] = (byte)(keyboard[0xa2] | keyboard[0xa3]);
+        keyboard[0x12] = (byte)(keyboard[0xa4] | keyboard[0xa5]);
+        if (down) held[id] = (key, parameters); else held.Remove(id);
+        var messageKey = key is 0xa0 or 0xa1 ? 0x10u : key is 0xa2 or 0xa3 ? 0x11u : key is 0xa4 or 0xa5 ? 0x12u : key;
+        SendMessageW(editor, down ? 0x100u : 0x101u, (nint)messageKey, parameters);
+        if (down)
+        {
+            var characters = new StringBuilder(8);
+            // Flag 4 keeps ToUnicodeEx from changing the thread's keyboard/dead-key state.
+            var length = ToUnicodeEx(key, (uint)input.ScanCode, keyboard, characters, characters.Capacity, 4, layout);
+            for (var index = 0; index < Math.Min(Math.Max(length, 0), characters.Length); index++)
+                SendMessageW(editor, 0x102, characters[index], parameters);
+        }
+        return new(true, "Keyboard delivered to local test editor.");
+    }
+
+    static string InitialText() => "FRD 本机输入体验：在预览画面开启键鼠，再滚动或打字。\r\n" +
+        "此窗口仅接收定向滚轮/键盘消息，不移动系统鼠标，不转发点击。\r\n" +
+        "Ctrl + Alt 退出转发。可把此窗口与 FRD 预览并排，比较画面返回。\r\n\r\n" +
+        string.Join("\r\n", Enumerable.Range(1, 150).Select(index => $"{index:000}  FRD latency test — scroll, type, Backspace, arrows, Page Up / Down."));
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        var hwnd = WindowHandle;
+        if (hwnd != 0 && !PostMessageW(hwnd, 0x10, 0, 0)) InputProtocol.Log("Stopping local demo window failed", new Win32Exception(Marshal.GetLastWin32Error()));
+        if (Thread.CurrentThread != thread && !thread.Join(3000)) InputProtocol.Log("Local demo input window did not stop within 3 seconds.");
+    }
+
+    sealed class PendingInput(RemoteInputEvent input)
+    {
+        public readonly RemoteInputEvent Input = input;
+        public readonly TaskCompletionSource<RemoteInputResult> Completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Cancelled;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)] delegate nint WindowProcedure(nint window, uint message, nuint wParam, nint lParam);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct WindowClass
+    {
+        public uint Size, Style;
+        public nint Procedure;
+        public int ClassExtra, WindowExtra;
+        public nint Instance, Icon, Cursor, Background;
+        public string? MenuName, ClassName;
+        public nint SmallIcon;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct WindowMessage
+    {
+        public nint Window;
+        public uint Message;
+        public nuint WParam;
+        public nint LParam;
+        public uint Time;
+        public int X, Y;
+        public uint Reserved;
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern nint GetModuleHandleW(string? name);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern ushort RegisterClassExW(ref WindowClass definition);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool UnregisterClassW(string name, nint instance);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateWindowExW(uint extended, string className, string title, uint style, int x, int y, int width, int height, nint parent, nint menu, nint instance, nint parameter);
+    [DllImport("user32.dll")] static extern nint DefWindowProcW(nint window, uint message, nuint wParam, nint lParam);
+    [DllImport("user32.dll")] static extern nint LoadCursorW(nint instance, nint cursor);
+    [DllImport("user32.dll")] static extern bool ShowWindow(nint window, int command);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool DestroyWindow(nint window);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessageW(nint window, uint message, nuint wParam, nint lParam);
+    [DllImport("user32.dll")] static extern nint SendMessageW(nint window, uint message, nint wParam, nint lParam);
+    [DllImport("user32.dll", SetLastError = true)] static extern int GetMessageW(out WindowMessage message, nint window, uint minimum, uint maximum);
+    [DllImport("user32.dll")] static extern bool TranslateMessage(ref WindowMessage message);
+    [DllImport("user32.dll")] static extern nint DispatchMessageW(ref WindowMessage message);
+    [DllImport("user32.dll")] static extern void PostQuitMessage(int result);
+    [DllImport("user32.dll")] static extern bool MoveWindow(nint window, int x, int y, int width, int height, bool repaint);
+    [DllImport("user32.dll")] static extern nint GetKeyboardLayout(uint thread);
+    [DllImport("user32.dll")] static extern uint MapVirtualKeyExW(uint code, uint type, nint layout);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int ToUnicodeEx(uint key, uint scan, byte[] state, StringBuilder characters, int capacity, uint flags, nint layout);
+    [DllImport("gdi32.dll")] static extern nint GetStockObject(int index);
+}
+
 // Source: FfmpegNetwork.cs
 static class FrdNetwork
 {
     public static IPAddress Canonical(IPAddress address) => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+    public static bool IsLocalAddress(IPAddress address)
+    {
+        address = Canonical(address);
+        if (IPAddress.IsLoopback(address)) return true;
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces().Any(adapter => adapter.GetIPProperties().UnicastAddresses
+                .Any(local => Canonical(local.Address).Equals(address)));
+        }
+        catch (NetworkInformationException error)
+        {
+            Console.Error.WriteLine($"[input] Cannot determine whether peer shares this desktop; using the local test target: {error}");
+            return true;
+        }
+    }
     public static bool SameEndpoint(EndPoint first, EndPoint second) => first is IPEndPoint a && second is IPEndPoint b &&
         a.Port == b.Port && Canonical(a.Address).Equals(Canonical(b.Address));
     public static int UdpOverhead(IPAddress address) => Canonical(address).AddressFamily == AddressFamily.InterNetworkV6 ? 48 : 28;
@@ -4104,6 +4476,7 @@ public sealed partial class DemoSession
     readonly Queue<long> remotePresentationTicks = new();
     long remoteHistorySweep;
     public bool IsRemote => remoteOptions != null;
+    public bool SharesLocalDesktop { get; internal set; } = true;
     public AppConfiguration Configuration => config;
     internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
@@ -4125,6 +4498,7 @@ public sealed partial class DemoSession
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
         diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
+        SharesLocalDesktop = FrdNetwork.IsLocalAddress(remote.Endpoint.Address);
         var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,
@@ -5297,7 +5671,7 @@ static partial class FfmpegUi
         readonly DateTime startedUtc = DateTime.UtcNow;
         DesktopStreamSource? capture;
         DemoSession? session;
-        Win32InputInjector? inputInjector;
+        LocalDemoInputTarget? localInputTarget;
         RemoteInputServer? inputServer;
         RemoteInputClient? inputClient;
         ClipboardSyncSession? clipboardSync;
@@ -5320,7 +5694,7 @@ static partial class FfmpegUi
         {
             remoteOptions = remote;
             this.config = config; this.autoCloseSeconds = autoCloseSeconds; this.reportPath = reportPath;
-            ToolTip.SetTip(inputEnabled, "本机共用桌面，目标若是预览窗口会被拒绝；预览获得焦点时无法同时作为被控键盘目标。双机控制需独立桌面。");
+            ToolTip.SetTip(inputEnabled, "本机只将滚轮和键盘定向发给专用测试窗口，不移动系统鼠标，不转发点击或拖动。");
             preview.Presented += (frameId, tick) => { Interlocked.Increment(ref shownFrames); session?.ReportPresented(frameId, tick); };
             preview.Failed += ex => { if (Dispatcher.UIThread.CheckAccess()) ReportError(ex); else Dispatcher.UIThread.Post(() => ReportError(ex)); };
             preview.Input += QueueInput;
@@ -5464,17 +5838,15 @@ static partial class FfmpegUi
 
         async Task StartInputAsync()
         {
-            if (session?.IsRemote == true)
+            if (session?.IsRemote == true && !session.SharesLocalDesktop)
             {
                 inputClient = await session.ConnectRemoteInputAsync(inputStop.Token);
                 inputWorker = Task.Run(SendInputLoopAsync); return;
             }
-            inputInjector = new();
-            inputInjector.RegisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
-            inputInjector.RegisterControllerWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0);
-            inputInjector.RegisterControllerWindow(watermark.TryGetPlatformHandle()?.Handle ?? 0);
-            inputInjector.RegisterControllerWindow(preview.SourceWindow);
-            inputServer = new(inputInjector);
+            localInputTarget = new();
+            inputEnabled.Content = "本机滚轮 / 键盘 · Ctrl+Alt 退出";
+            ToolTip.SetTip(inputEnabled, localInputTarget.ModeDescription);
+            inputServer = new(localInputTarget);
             inputServer.Failed += ex => Dispatcher.UIThread.Post(() => ReportError(ex));
             var client = await RemoteInputClient.ConnectAsync(inputServer.Endpoint, inputStop.Token);
             if (stopping || inputStop.IsCancellationRequested) { client.Dispose(); return; }
@@ -5544,7 +5916,10 @@ static partial class FfmpegUi
                 if (enabled && stopping) { await inputClient.SetEnabledAsync(false); enabled = false; }
                 preview.SetInputEnabled(enabled);
                 updatingInput = true; inputEnabled.IsChecked = enabled; updatingInput = false;
-                operation.Text = enabled ? "键鼠转发已启用，按 Ctrl+Alt 退出。本机共用桌面，目标若是预览窗口会被拒绝；预览获得焦点时无法同时作为被控键盘目标。双机控制需独立桌面。" : "键鼠转发已关闭，按键已释放。";
+                operation.Text = enabled ? localInputTarget != null
+                    ? "本机体验：点击预览获得焦点，滚轮和键盘仅发给测试文本窗口；鼠标移动、点击、拖动不转发。Ctrl+Alt 退出。"
+                    : "键鼠转发已启用，按 Ctrl+Alt 退出并释放按键。"
+                    : "键鼠转发已关闭，按键已释放。";
             }
             catch
             {
@@ -5558,6 +5933,7 @@ static partial class FfmpegUi
         void QueueInput(RemoteInputEvent input)
         {
             if (stopping || inputClient?.Enabled != true) return;
+            if (localInputTarget != null && input.Kind is not (RemoteInputKind.Wheel or RemoteInputKind.KeyDown or RemoteInputKind.KeyUp or RemoteInputKind.ReleaseAll)) return;
             var source = capture?.Statistics;
             var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, session.RemoteSourceWidth, session.RemoteSourceHeight) :
                 source == null ? input : InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, source.SourceWidth, source.SourceHeight);
@@ -5580,35 +5956,59 @@ static partial class FfmpegUi
 
         async Task SendInputLoopAsync()
         {
+            using var sending = CancellationTokenSource.CreateLinkedTokenSource(inputStop.Token);
+            List<Task> confirmations = new();
+            Exception? failure = null;
             try
             {
-                while (!inputStop.IsCancellationRequested)
+                while (!sending.IsCancellationRequested)
                 {
-                    await inputReady.WaitAsync(inputStop.Token);
+                    await inputReady.WaitAsync(sending.Token);
                     while (true)
                     {
                         RemoteInputEvent? next;
                         lock (inputGate) { next = inputQueue.First?.Value; if (next != null) inputQueue.RemoveFirst(); }
                         if (next == null) break;
-                        var result = await inputClient!.SendAsync(next, inputStop.Token);
-                        if (result.Accepted) Interlocked.Increment(ref inputSent);
-                        else
-                        {
-                            Interlocked.Increment(ref inputRejected);
-                            if (result.Message != lastInputMessage)
-                            {
-                                lastInputMessage = result.Message; Console.Error.WriteLine("[input rejected] " + result.Message);
-                                Dispatcher.UIThread.Post(() => operation.Text = "输入未注入：" + result.Message);
-                            }
-                        }
+                        // Preserve wire order, but let the next input leave before this event's remote confirmation.
+                        var confirmation = await inputClient!.QueueAsync(next, sending.Token);
+                        confirmations.RemoveAll(task => task.IsCompleted);
+                        confirmations.Add(ObserveAsync(confirmation));
                     }
                 }
             }
-            catch (OperationCanceledException) when (inputStop.IsCancellationRequested) { Console.Error.WriteLine("Input send queue stopped."); }
-            catch (Exception ex)
+            catch (OperationCanceledException) when (sending.IsCancellationRequested) { Console.Error.WriteLine("Input send queue stopped."); }
+            catch (Exception error) { Fail(error); }
+            finally { await Task.WhenAll(confirmations); }
+
+            async Task ObserveAsync(Task<RemoteInputResult> confirmation)
             {
-                Console.Error.WriteLine(ex);
-                Dispatcher.UIThread.Post(() => { preview.SetInputEnabled(false); inputEnabled.IsChecked = false; ReportError(ex); });
+                try
+                {
+                    var result = await confirmation;
+                    if (result.Accepted) Interlocked.Increment(ref inputSent);
+                    else
+                    {
+                        Interlocked.Increment(ref inputRejected);
+                        lock (inputGate)
+                        {
+                            if (result.Message == lastInputMessage) return;
+                            lastInputMessage = result.Message;
+                        }
+                        Console.Error.WriteLine("[input rejected] " + result.Message);
+                        Dispatcher.UIThread.Post(() => operation.Text = "输入未注入：" + result.Message);
+                    }
+                }
+                catch (OperationCanceledException) when (inputStop.IsCancellationRequested) { Console.Error.WriteLine("Input confirmation stopped."); }
+                catch (Exception error) { Fail(error); }
+            }
+
+            void Fail(Exception error)
+            {
+                if (Interlocked.CompareExchange(ref failure, error, null) != null) return;
+                Console.Error.WriteLine(error);
+                inputClient?.Dispose();
+                sending.Cancel();
+                Dispatcher.UIThread.Post(() => { preview.SetInputEnabled(false); inputEnabled.IsChecked = false; ReportError(error); });
             }
         }
 
@@ -5621,10 +6021,7 @@ static partial class FfmpegUi
                 inputStop.Cancel(); inputClient?.Dispose();
                 if (inputWorker != null) await inputWorker;
                 inputServer?.Dispose();
-                inputInjector?.UnregisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
-                inputInjector?.UnregisterControllerWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0);
-                inputInjector?.UnregisterControllerWindow(preview.SourceWindow);
-                inputInjector?.Dispose();
+                localInputTarget?.Dispose();
             }
         }
 
@@ -5744,7 +6141,7 @@ static partial class FfmpegUi
                     Overlay = new { OwnedByPreview = overlay.Owner == this, Visible = overlay.IsVisible, Expanded = details.IsVisible, overlay.Width, Height = overlay.ClientSize.Height, Position = overlay.Position.ToString() },
                     OverlayRegression = overlayCheck, FinalOverlayBounds = finalOverlayBounds,
                     TimingRegression = new { Passed = timingPassed, TransferBreakdownPassed = transportPassed, LatestStageSumMs = stageSum, LatestTotalMs = status?.CaptureToRenderMs, MeanStageSumMs = meanStageSum, MeanTotalMs = status?.MeanCaptureToRenderMs },
-                    Input = new { RequiresManualEnable = true, SentEvents = Interlocked.Read(ref inputSent), RejectedEvents = Interlocked.Read(ref inputRejected), CoalescedMouseMoves = coalescedMoves, PendingEvents = inputQueue.Count },
+                    Input = new { RequiresManualEnable = true, LocalWheelAndKeyboardOnly = localInputTarget != null, SystemInputInjection = localInputTarget == null, SentEvents = Interlocked.Read(ref inputSent), RejectedEvents = Interlocked.Read(ref inputRejected), CoalescedMouseMoves = coalescedMoves, PendingEvents = inputQueue.Count },
                     Status = status, Session = session?.GetReport(), Errors = errors,
                     Capture = captureBackend, CaptureStatistics = captureStatistics,
                     Render = "D3D11 upload → Present(0) → event query GPU completion; physical scan-out is not timed"

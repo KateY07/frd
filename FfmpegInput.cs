@@ -190,16 +190,28 @@ public sealed class RemoteInputServer : IDisposable
 
 public sealed class RemoteInputClient : IDisposable
 {
+    const int MaximumInFlight = 64;
+    static readonly TimeSpan AcknowledgementTimeout = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
-    readonly SemaphoreSlim gate = new(1, 1);
+    readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
-    long sequence;
+    readonly object pendingGate = new();
+    readonly Dictionary<long, PendingInput> pending = new();
+    readonly Task reader;
+    Exception? failure;
+    long sequence, repliedSequence;
     long enableRevision;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
 
-    internal RemoteInputClient(TcpClient connection) { this.connection = connection; stream = connection.GetStream(); }
+    internal RemoteInputClient(TcpClient connection)
+    {
+        this.connection = connection;
+        connection.NoDelay = true;
+        stream = connection.GetStream();
+        reader = Task.Run(ReadRepliesAsync);
+    }
 
     public static async Task<RemoteInputClient> ConnectAsync(IPEndPoint endpoint, CancellationToken token = default)
     {
@@ -214,47 +226,146 @@ public sealed class RemoteInputClient : IDisposable
 
     public async Task<RemoteInputResult> SetEnabledAsync(bool value, CancellationToken token = default)
     {
-        var revision = Interlocked.Increment(ref enableRevision);
-        if (!value) Volatile.Write(ref enabled, 0);
-        var result = await ExchangeAsync(value, null, token).ConfigureAwait(false);
-        if (revision == Interlocked.Read(ref enableRevision)) Volatile.Write(ref enabled, value && result.Accepted ? 1 : 0);
-        return result;
-    }
-
-    public Task<RemoteInputResult> SendAsync(RemoteInputEvent input, CancellationToken token = default) =>
-        !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) : ExchangeAsync(null, input, token);
-
-    async Task<RemoteInputResult> ExchangeAsync(bool? enable, RemoteInputEvent? input, CancellationToken token)
-    {
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, token);
-        await gate.WaitAsync(linked.Token).ConfigureAwait(false);
         try
         {
-            if (input is not null && !Enabled) return new(false, "Input forwarding is disabled.");
-            var current = ++sequence;
-            await InputProtocol.WriteAsync(stream, new InputRequest(current, enable, input), linked.Token).ConfigureAwait(false);
-            var reply = await InputProtocol.ReadAsync<InputReply>(stream, linked.Token).ConfigureAwait(false);
-            if (reply.Sequence != current) throw new InvalidDataException("Input reply sequence mismatch.");
-            return new(reply.Accepted, reply.Message);
+            var revision = Interlocked.Increment(ref enableRevision);
+            if (!value) Volatile.Write(ref enabled, 0);
+            var acknowledgement = await QueueRequestAsync(value, null, token).ConfigureAwait(false);
+            var result = await acknowledgement.ConfigureAwait(false);
+            if (!value && !result.Accepted) Fail(new IOException("Remote input disable was rejected: " + result.Message));
+            lock (pendingGate)
+                if (revision == Interlocked.Read(ref enableRevision) && failure == null && Volatile.Read(ref disposed) == 0)
+                    Volatile.Write(ref enabled, value && result.Accepted ? 1 : 0);
+            return result;
         }
         catch (Exception error)
         {
-            InputProtocol.Log("Input connection failed; closing it to release held input", error);
-            Volatile.Write(ref enabled, 0);
-            connection.Close();
+            // Even cancellation before writing disable must release keys already held at the remote endpoint.
+            if (!value) Fail(error);
             throw;
         }
-        finally { gate.Release(); }
+    }
+
+    public async Task<RemoteInputResult> SendAsync(RemoteInputEvent input, CancellationToken token = default)
+    {
+        var acknowledgement = await QueueAsync(input, token).ConfigureAwait(false);
+        return await acknowledgement.ConfigureAwait(false);
+    }
+
+    // Await the outer task to preserve write order, then observe the returned task for the remote result.
+    public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) :
+            await QueueRequestAsync(null, input, token).ConfigureAwait(false);
+    }
+
+    async Task<Task<RemoteInputResult>> QueueRequestAsync(bool? enable, RemoteInputEvent? input, CancellationToken token)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(stop.Token, token);
+        var ownsSlot = false;
+        var ownsWriter = false;
+        PendingInput? request = null;
+        try
+        {
+            await slots.WaitAsync(linked.Token).ConfigureAwait(false);
+            ownsSlot = true;
+            await writeGate.WaitAsync(linked.Token).ConfigureAwait(false);
+            ownsWriter = true;
+            if (input is not null && !Enabled) return Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled."));
+            lock (pendingGate)
+            {
+                if (failure != null) throw new IOException("Input connection is closed.", failure);
+                linked.Token.ThrowIfCancellationRequested();
+                request = new(++sequence);
+                pending.Add(request.Sequence, request);
+                ownsSlot = false;
+            }
+            ObserveFault(request.Completion.Task);
+            var acknowledgement = AwaitAcknowledgementAsync(request, token);
+            // A write may fail before the caller receives this task. Observing its fault does not change its result.
+            ObserveFault(acknowledgement);
+            await InputProtocol.WriteAsync(stream, new InputRequest(request.Sequence, enable, input), linked.Token).ConfigureAwait(false);
+            return acknowledgement;
+        }
+        catch (Exception error)
+        {
+            if (request != null) Fail(error);
+            throw;
+        }
+        finally
+        {
+            if (ownsWriter) writeGate.Release();
+            if (ownsSlot) slots.Release();
+        }
+    }
+
+    async Task<RemoteInputResult> AwaitAcknowledgementAsync(PendingInput request, CancellationToken token)
+    {
+        try { return await request.Completion.Task.WaitAsync(AcknowledgementTimeout, token).ConfigureAwait(false); }
+        catch (Exception error) { Fail(error); throw; }
+    }
+
+    async Task ReadRepliesAsync()
+    {
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                var reply = await InputProtocol.ReadAsync<InputReply>(stream, stop.Token).ConfigureAwait(false);
+                lock (pendingGate)
+                {
+                    if (failure != null) return;
+                    if (reply.Sequence != repliedSequence + 1 || !pending.Remove(reply.Sequence, out var request))
+                        throw new InvalidDataException("Input reply sequence mismatch.");
+                    repliedSequence = reply.Sequence;
+                    slots.Release();
+                    request.Completion.TrySetResult(new(reply.Accepted, reply.Message));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { InputProtocol.Log("Input reply reader stopped."); }
+        catch (Exception error) { Fail(error); }
+    }
+
+    void Fail(Exception error, bool disposing = false)
+    {
+        PendingInput[] abandoned;
+        lock (pendingGate)
+        {
+            if (failure != null) return;
+            failure = error;
+            Volatile.Write(ref enabled, 0);
+            abandoned = pending.Values.ToArray();
+            pending.Clear();
+        }
+        InputProtocol.Log(disposing ? "Input connection disposed; releasing held input." : "Input connection failed; closing it to release held input", disposing ? null : error);
+        stop.Cancel();
+        connection.Close();
+        foreach (var request in abandoned)
+        {
+            slots.Release();
+            request.Completion.TrySetException(error);
+        }
     }
 
     public void Dispose()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
-        Volatile.Write(ref enabled, 0);
-        stop.Cancel();
-        connection.Dispose();
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
+        Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
+        // The reader handles shutdown itself; disposal never blocks its own continuation.
+        ObserveFault(reader);
+    }
+
+    static void ObserveFault(Task task) => _ = task.ContinueWith(completed => _ = completed.Exception,
+        CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+    sealed class PendingInput(long sequence)
+    {
+        public long Sequence { get; } = sequence;
+        public TaskCompletionSource<RemoteInputResult> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
 

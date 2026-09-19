@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 
 namespace Frd;
@@ -6,6 +7,21 @@ namespace Frd;
 static class FrdNetwork
 {
     public static IPAddress Canonical(IPAddress address) => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+    public static bool IsLocalAddress(IPAddress address)
+    {
+        address = Canonical(address);
+        if (IPAddress.IsLoopback(address)) return true;
+        try
+        {
+            return NetworkInterface.GetAllNetworkInterfaces().Any(adapter => adapter.GetIPProperties().UnicastAddresses
+                .Any(local => Canonical(local.Address).Equals(address)));
+        }
+        catch (NetworkInformationException error)
+        {
+            Console.Error.WriteLine($"[input] Cannot determine whether peer shares this desktop; using the local test target: {error}");
+            return true;
+        }
+    }
     public static bool SameEndpoint(EndPoint first, EndPoint second) => first is IPEndPoint a && second is IPEndPoint b &&
         a.Port == b.Port && Canonical(a.Address).Equals(Canonical(b.Address));
     public static int UdpOverhead(IPAddress address) => Canonical(address).AddressFamily == AddressFamily.InterNetworkV6 ? 48 : 28;

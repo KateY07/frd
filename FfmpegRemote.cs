@@ -118,6 +118,7 @@ public sealed partial class DemoSession
     readonly Queue<long> remotePresentationTicks = new();
     long remoteHistorySweep;
     public bool IsRemote => remoteOptions != null;
+    public bool SharesLocalDesktop { get; internal set; } = true;
     public AppConfiguration Configuration => config;
     internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
@@ -139,6 +140,7 @@ public sealed partial class DemoSession
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
         diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
+        SharesLocalDesktop = FrdNetwork.IsLocalAddress(remote.Endpoint.Address);
         var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,

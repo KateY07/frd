@@ -10,7 +10,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'third_party/ffmpeg/ru
 }
 & dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $staging
 if ($LASTEXITCODE -ne 0) { throw "Publish failed; staging retained at $staging" }
-foreach ($document in @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md', "docs/$version-发布说明.md", "docs/$version-静态检查.md")) {
+foreach ($document in @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
+    'docs/本机输入延迟验证.md', 'docs/公网拥塞控制调查.md', 'docs/受限公网回归设计.md',
+    "docs/$version-发布说明.md", "docs/$version-静态检查.md")) {
     $destination = Join-Path $staging $document
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination

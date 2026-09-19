@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup><Compile Include="../../FfmpegInput.cs" Link="FfmpegInput.cs" /><Compile Include="../../FfmpegCursor.cs" Link="FfmpegCursor.cs" /><Compile Include="../../FfmpegNetwork.cs" Link="FfmpegNetwork.cs" /><Compile Include="../../FfmpegTransport.cs" Link="FfmpegTransport.cs" /></ItemGroup>
+</Project>
