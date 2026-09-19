@@ -3,7 +3,6 @@
   <ItemGroup>
     <Compile Include="../../FfmpegInput.cs" Link="FfmpegInput.cs" />
     <Compile Include="../../FfmpegCursor.cs" Link="FfmpegCursor.cs" />
-    <Compile Include="../../FfmpegLocalInput.cs" Link="FfmpegLocalInput.cs" />
     <Compile Include="../../FfmpegNetwork.cs" Link="FfmpegNetwork.cs" />
   </ItemGroup>
 </Project>

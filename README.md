@@ -1,4 +1,4 @@
-# FRD v1.pre7 · 远程桌面 CLI
+# FRD v1.pre8 · 远程桌面 CLI
 
 FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
@@ -34,7 +34,7 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 | `FRD.exe --help-window` | 打开可视帮助窗口 |
 | `FRD.exe` | 本机 localhost 真实桌面演示 |
 
-- 本机 Demo（包括 `--connect` 连接自身回环/网卡地址）只将滚轮和键盘通过输入协议定向发送给专用测试文本窗口，禁止转发鼠标移动、点击、拖动；不调用系统 `SendInput`，避免与人的鼠标争抢及键盘回注循环。手动开启“本机滚轮 / 键盘”后点击预览获得焦点，即可滚动、打字，观察真实捕获 → 编码 → UDP → 解码 → 呈现的反馈。Ctrl+Alt 退出；测试文本窗口随 Demo 关闭。双机连接保持完整键鼠转发。本机模式用于体验画面反馈，不代表真实远端系统注入或 RDP 对比结果。
+- v1.pre8 已移除发布版的 Demo 输入限制。开启转发后，鼠标移动、点击、拖动、滚轮与键盘均使用正式输入通道；`--connect` 不再因地址是 localhost、回环或本机网卡而改接测试窗口。无参数演示恢复真实系统输入，并保留 FRD 窗口防回注；本机共用鼠标与焦点，双机体验需独立桌面。Ctrl+Alt 退出并释放按键。
 
 - `--port` 为必填 TCP 监听端口，范围 1–65535；视频、诊断和反馈使用协商的 UDP 端口。两端须允许相应网络通信。
 - 被控端 `--listen` 必填，没有默认地址。本机测试使用 `localhost`（同时监听 `127.0.0.1` 和 `::1`，仅限本机）；指定 `::` 使用单个 IPv6 双栈 Socket，接受所有网卡的 IPv4/IPv6 连接。`0.0.0.0` 仅监听所有 IPv4 接口；具体 IP 仅绑定该地址，`::1` 仅限 IPv6 回环。IPv6 地址与 `--port` 分开传入，无需方括号；链路本地地址可带 `%接口索引`。
@@ -51,7 +51,7 @@ using System.Diagnostics;
 
 var executable = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-    "Programs", "FRD", "v1.pre7", "FRD.exe");
+    "Programs", "FRD", "v1.pre8", "FRD.exe");
 var info = new ProcessStartInfo(executable)
 {
     WorkingDirectory = Path.GetDirectoryName(executable),
@@ -80,8 +80,9 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - 修改 EXE 同目录的 `codec-config.json`。`presets` 的 `encoderArguments` / `decoderArguments` 是单行 FFmpeg 参数字符串；支持现有构建和设备提供的 H.264、VP9、AV1、NVENC、QSV 等预设。不支持的预设明确失败。
 - `initialBitrateKbps` 设置初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示；此值限制编码码率，不进行额外链路节流，允许编码缓冲和帧发送突发。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre7\`，不同版本分目录保留。
-- 发布脚本的输出目录为 `artifacts/v1.pre7/`，包含便携 ZIP、README 和 SHA-256。Git 只推送版本标签及其引用的源码提交，不更新远端默认分支；安装包保留本机，不上传 GitHub Releases。
+- 本版依赖 **.NET 10 x64 Runtime**，不再自包含运行时，也不启用 Native AOT；仍直接运行 `FRD.exe`。需在主控与被控机器预先安装相应运行时，SDK 非必需；[微软下载页](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)。Avalonia 与 FFmpeg 原生依赖仍随包提供。原生调试符号另存于本机构建产物，不进入便携包。
+- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre8\`，不同版本分目录保留。
+- 发布脚本的输出目录为 `artifacts/v1.pre8/`，包含便携 ZIP、README 和 SHA-256。Git 只推送版本标签及其引用的源码提交，不更新远端默认分支；安装包保留本机，不上传 GitHub Releases。
 
 ## 开发与边界
 
@@ -93,13 +94,13 @@ v1.pre7 的输入发送改为有界流水：保持事件顺序，后台确认，
 
 后续拥塞控制目标保留，但按用户要求暂缓实现：**滑块固定为用户码率上限，内部在上限内自动调节实际编码码率，拥塞时优先延迟、允许降低清晰度，恢复后逐步升码率。** 不自动改变预设或传输比例。诊断区分链路低负载基线、估计的新增网络排队和本地处理/排队；高 RTT 本身不等于带宽不足。此项不属于本版已实现功能，详见 [目标与验收](docs/目标与验收.md)。
 
-## v1.pre7 界面
+## v1.pre8 界面
 
 - 主控和本机演示使用紧凑控制栏；主控、被控和帮助窗口统一采用 Avalonia Simple 主题。
 - 点击全屏按钮或按 Ctrl+Alt+F11 切换全屏；Ctrl+Alt 退出键鼠转发。启用转发时，单独按 Esc 或 F11 保留远端输入含义。
 - 展开时可拖动控制栏的空白区域，按钮、下拉框和滑条保持正常交互。收起后显示为 50 像素半透明悬浮球，同样可拖动；单击恢复控制栏。两种状态均限制在视口内，窗口缩放或切换全屏时保留当前位置，必要时调整至可见范围。
 - 诊断水印可独立隐藏，保持鼠标穿透且不获取键盘焦点。水印显隐与诊断包开关独立，隐藏水印不会关闭诊断采集或网络诊断包。
 
-以上控制栏界面继承自已获人工确认的 v1.pre4；本版主要修复输入确认等待和失败清理，并提供受限的本机滚轮/键盘测试目标。未重新执行真实双机或 RDP 对照，不能沿用 pre6 的历史双机结果宣称本版已完成同等回归。自动全局键鼠注入回归继续保持暂停。
+以上控制栏界面继承自已获人工确认的 v1.pre4；本版移除 pre7 的本机专用测试目标和鼠标事件过滤，保留输入流水发送及失败清理。测试目标仅保存在独立测试工程，不进入正式程序或生成的单文件 Demo。未重新执行真实双机或 RDP 对照，自动全局键鼠注入回归继续保持暂停。
 
-进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre7-发布说明.md)、[静态检查](docs/v1.pre7-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre8-发布说明.md)、[静态检查](docs/v1.pre8-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。

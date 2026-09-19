@@ -8,7 +8,7 @@ $staging = Join-Path $releaseRoot ('staging-' + [Guid]::NewGuid().ToString('N'))
 if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'third_party/ffmpeg/runtime/avcodec-62.dll'))) {
     throw 'Run Get-FFmpeg.ps1 first.'
 }
-& dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $staging
+& dotnet publish $project -c Release -r win-x64 --self-contained false -p:PublishAot=false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $staging
 if ($LASTEXITCODE -ne 0) { throw "Publish failed; staging retained at $staging" }
 $documents = @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
     'docs/本机输入延迟验证.md', 'docs/公网拥塞控制调查.md', 'docs/受限公网回归设计.md',
@@ -28,6 +28,13 @@ if (Get-ChildItem -LiteralPath $staging -Filter '*Tests*' -Recurse) { throw 'Tes
 $workspace = [IO.Path]::GetFullPath($PSScriptRoot) + [IO.Path]::DirectorySeparatorChar
 foreach ($path in @($staging, $output)) {
     if (-not $path.StartsWith($workspace, [StringComparison]::OrdinalIgnoreCase)) { throw 'Publish path escapes workspace.' }
+}
+$symbols = [IO.Path]::GetFullPath((Join-Path $releaseRoot ('symbols-' + [Guid]::NewGuid().ToString('N'))))
+if (-not $symbols.StartsWith($workspace, [StringComparison]::OrdinalIgnoreCase)) { throw 'Symbols path escapes workspace.' }
+foreach ($symbol in Get-ChildItem -LiteralPath $staging -Filter '*.pdb' -File -Recurse) {
+    $symbolDestination = Join-Path $symbols ([IO.Path]::GetRelativePath($staging, $symbol.FullName))
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $symbolDestination) | Out-Null
+    Move-Item -LiteralPath $symbol.FullName -Destination $symbolDestination
 }
 if (Test-Path -LiteralPath $output) {
     $archive = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ('archive/replaced-builds/' + $version + '-' + [Guid]::NewGuid().ToString('N'))))

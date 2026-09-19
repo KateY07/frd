@@ -1,3 +1,4 @@
+// Test-only directed input fixture; excluded from the released application and generated demo.
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Runtime.InteropServices;

@@ -21,6 +21,7 @@ static class Program
         {
             await PipelineOrdering();
             await ProductionReleaseAndReconnect();
+            await MixedInputDelivery();
             foreach (var mode in new[] { "disconnect", "wrong-sequence", "dispose" }) await PendingFailure(mode);
             await CancelAfterWrite();
             await CancelDisableBeforeWrite();
@@ -96,6 +97,51 @@ static class Program
         var before = mock.Count;
         var rejected = await next.SendAsync(Key).WaitAsync(Deadline);
         Check(!next.Enabled && !rejected.Accepted && mock.Count == before, "Reconnect remains disabled and cannot inject without explicit enable");
+    }
+
+    static async Task MixedInputDelivery()
+    {
+        var mock = new MockInjector();
+        using var server = new RemoteInputServer(mock);
+        using var client = await RemoteInputClient.ConnectAsync(server.Endpoint).WaitAsync(Deadline);
+        Check((await client.SetEnabledAsync(true).WaitAsync(Deadline)).Accepted && client.Enabled,
+            "Mixed-input fixture explicitly enables the production loopback TCP connection");
+        RemoteInputEvent[] sequence =
+        [
+            new(RemoteInputKind.MouseMove, .1, .2),
+            new(RemoteInputKind.MouseDown, .1, .2, RemoteMouseButton.Left),
+            new(RemoteInputKind.MouseMove, .3, .4),
+            new(RemoteInputKind.MouseMove, .6, .7),
+            new(RemoteInputKind.MouseUp, .6, .7, RemoteMouseButton.Left),
+            new(RemoteInputKind.MouseDown, .6, .7, RemoteMouseButton.Right),
+            new(RemoteInputKind.MouseUp, .6, .7, RemoteMouseButton.Right),
+            new(RemoteInputKind.MouseDown, .6, .7, RemoteMouseButton.Middle),
+            new(RemoteInputKind.MouseUp, .6, .7, RemoteMouseButton.Middle),
+            new(RemoteInputKind.Wheel, .6, .7, WheelDelta: -240),
+            new(RemoteInputKind.KeyDown, ScanCode: 0x1d, Extended: true),
+            new(RemoteInputKind.KeyDown, ScanCode: 0x1e),
+            new(RemoteInputKind.KeyUp, ScanCode: 0x1e),
+            new(RemoteInputKind.KeyUp, ScanCode: 0x1d, Extended: true),
+            new(RemoteInputKind.KeyDown, ScanCode: 0x2a),
+            new(RemoteInputKind.MouseDown, .8, .9, RemoteMouseButton.Left),
+            new(RemoteInputKind.ReleaseAll),
+            new(RemoteInputKind.MouseMove, .9, .1)
+        ];
+        List<Task<RemoteInputResult>> pending = new();
+        foreach (var input in sequence) pending.Add(await client.QueueAsync(input).WaitAsync(Deadline));
+        var results = await Task.WhenAll(pending).WaitAsync(Deadline);
+        Check(results.All(x => x.Accepted) && mock.Snapshot().SequenceEqual(sequence) &&
+            Enum.GetValues<RemoteInputKind>().All(kind => sequence.Any(input => input.Kind == kind)),
+            "Production receiver preserves every mixed event and parameter, including movement during a held drag",
+            new { Expected = sequence, Received = mock.Snapshot(), Acknowledgements = results.Length });
+        Check(mock.Held == 0 && mock.Releases == 1,
+            "Explicit ReleaseAll in the mixed stream clears the remaining held modifier and button", new { mock.Held, mock.Releases });
+        var disabled = await client.SetEnabledAsync(false).WaitAsync(Deadline);
+        var before = mock.Count;
+        var denied = await Task.WhenAll(sequence.Select(input => client.SendAsync(input))).WaitAsync(Deadline);
+        Check(disabled.Accepted && !client.Enabled && denied.All(result => !result.Accepted) && mock.Count == before && mock.Held == 0,
+            "After disable, all mixed event kinds are rejected without additional mock injection",
+            new { Attempted = sequence.Length, ReceivedBefore = before, ReceivedAfter = mock.Count, client.Enabled, mock.Held });
     }
 
     static async Task PendingFailure(string mode)
@@ -306,6 +352,7 @@ static class Program
         public int Held => Volatile.Read(ref held);
         public int Releases => Volatile.Read(ref releases);
         public int Count => events.Count;
+        public RemoteInputEvent[] Snapshot() => events.ToArray();
         public RemoteInputResult Inject(RemoteInputEvent input)
         {
             events.Enqueue(input);

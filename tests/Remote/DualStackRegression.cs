@@ -55,7 +55,7 @@ static class DualStackRegression
                     session.FrameReceived += _ => Interlocked.Increment(ref frames);
                     session.Failed += error => failure = error;
                     await session.StartAsync().WaitAsync(TimeSpan.FromSeconds(15));
-                    Check(session.SharesLocalDesktop, listen + " → " + address + ": same-machine UI uses the restricted local input target");
+                    Check(session.IsRemote, listen + " → " + address + ": loopback remains a remote session");
                     using (var input = await session.ConnectRemoteInputAsync(CancellationToken.None))
                     {
                         await using var cursor = await session.ConnectRemoteCursorAsync(_ => Interlocked.Increment(ref cursors), error => failure = error, CancellationToken.None);

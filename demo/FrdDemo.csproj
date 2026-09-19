@@ -9,8 +9,10 @@
     <ApplicationManifest>../app.manifest</ApplicationManifest>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>1.0.0-pre7</Version>
-    <InformationalVersion>v1.pre7</InformationalVersion>
+    <Version>1.0.0-pre8</Version>
+    <InformationalVersion>v1.pre8</InformationalVersion>
+    <SelfContained>false</SelfContained>
+    <PublishAot>false</PublishAot>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />

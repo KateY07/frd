@@ -1,6 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Net;
-using System.Net.NetworkInformation;
 using System.Text;
 using System.Text.Json;
 using Frd;
@@ -16,11 +14,6 @@ static class Program
         GetCursorPos(out var originalCursor);
         try
         {
-            foreach (var address in new[] { "127.0.0.1", "::1", "::ffff:127.0.0.1" })
-                Check(FrdNetwork.IsLocalAddress(IPAddress.Parse(address)), $"Local endpoint recognized: {address}.");
-            foreach (var address in NetworkInterface.GetAllNetworkInterfaces().SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses).Select(item => item.Address).Distinct())
-                Check(FrdNetwork.IsLocalAddress(address), $"Assigned interface address recognized: {address}.");
-            Check(!FrdNetwork.IsLocalAddress(IPAddress.Parse("203.0.113.1")), "Documentation-only remote address is not local.");
             using var target = new LocalDemoInputTarget();
             Check(target.IsOpen && target.WindowHandle != 0, "Independent target window opened without activation.");
             Check(GetForegroundWindow() == foreground, "Creating the target preserved the foreground window.");

@@ -90,7 +90,7 @@ static partial class FfmpegUi
         readonly DateTime startedUtc = DateTime.UtcNow;
         DesktopStreamSource? capture;
         DemoSession? session;
-        LocalDemoInputTarget? localInputTarget;
+        Win32InputInjector? inputInjector;
         RemoteInputServer? inputServer;
         RemoteInputClient? inputClient;
         ClipboardSyncSession? clipboardSync;
@@ -113,7 +113,7 @@ static partial class FfmpegUi
         {
             remoteOptions = remote;
             this.config = config; this.autoCloseSeconds = autoCloseSeconds; this.reportPath = reportPath;
-            ToolTip.SetTip(inputEnabled, "本机只将滚轮和键盘定向发给专用测试窗口，不移动系统鼠标，不转发点击或拖动。");
+            ToolTip.SetTip(inputEnabled, "转发鼠标移动、点击、拖动、滚轮和键盘；Ctrl+Alt 退出并释放按键。");
             preview.Presented += (frameId, tick) => { Interlocked.Increment(ref shownFrames); session?.ReportPresented(frameId, tick); };
             preview.Failed += ex => { if (Dispatcher.UIThread.CheckAccess()) ReportError(ex); else Dispatcher.UIThread.Post(() => ReportError(ex)); };
             preview.Input += QueueInput;
@@ -257,15 +257,17 @@ static partial class FfmpegUi
 
         async Task StartInputAsync()
         {
-            if (session?.IsRemote == true && !session.SharesLocalDesktop)
+            if (session?.IsRemote == true)
             {
                 inputClient = await session.ConnectRemoteInputAsync(inputStop.Token);
                 inputWorker = Task.Run(SendInputLoopAsync); return;
             }
-            localInputTarget = new();
-            inputEnabled.Content = "本机滚轮 / 键盘 · Ctrl+Alt 退出";
-            ToolTip.SetTip(inputEnabled, localInputTarget.ModeDescription);
-            inputServer = new(localInputTarget);
+            inputInjector = new();
+            inputInjector.RegisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
+            inputInjector.RegisterControllerWindow(overlay.TryGetPlatformHandle()?.Handle ?? 0);
+            inputInjector.RegisterControllerWindow(watermark.TryGetPlatformHandle()?.Handle ?? 0);
+            inputInjector.RegisterControllerWindow(preview.SourceWindow);
+            inputServer = new(inputInjector);
             inputServer.Failed += ex => Dispatcher.UIThread.Post(() => ReportError(ex));
             var client = await RemoteInputClient.ConnectAsync(inputServer.Endpoint, inputStop.Token);
             if (stopping || inputStop.IsCancellationRequested) { client.Dispose(); return; }
@@ -335,9 +337,7 @@ static partial class FfmpegUi
                 if (enabled && stopping) { await inputClient.SetEnabledAsync(false); enabled = false; }
                 preview.SetInputEnabled(enabled);
                 updatingInput = true; inputEnabled.IsChecked = enabled; updatingInput = false;
-                operation.Text = enabled ? localInputTarget != null
-                    ? "本机体验：点击预览获得焦点，滚轮和键盘仅发给测试文本窗口；鼠标移动、点击、拖动不转发。Ctrl+Alt 退出。"
-                    : "键鼠转发已启用，按 Ctrl+Alt 退出并释放按键。"
+                operation.Text = enabled ? "键鼠转发已启用，按 Ctrl+Alt 退出并释放按键。"
                     : "键鼠转发已关闭，按键已释放。";
             }
             catch
@@ -352,7 +352,6 @@ static partial class FfmpegUi
         void QueueInput(RemoteInputEvent input)
         {
             if (stopping || inputClient?.Enabled != true) return;
-            if (localInputTarget != null && input.Kind is not (RemoteInputKind.Wheel or RemoteInputKind.KeyDown or RemoteInputKind.KeyUp or RemoteInputKind.ReleaseAll)) return;
             var source = capture?.Statistics;
             var mapped = session?.IsRemote == true ? InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, session.RemoteSourceWidth, session.RemoteSourceHeight) :
                 source == null ? input : InputCoordinates.MapFromVideo(input, preview.VideoWidth, preview.VideoHeight, source.SourceWidth, source.SourceHeight);
@@ -440,7 +439,7 @@ static partial class FfmpegUi
                 inputStop.Cancel(); inputClient?.Dispose();
                 if (inputWorker != null) await inputWorker;
                 inputServer?.Dispose();
-                localInputTarget?.Dispose();
+                inputInjector?.Dispose();
             }
         }
 
@@ -560,7 +559,7 @@ static partial class FfmpegUi
                     Overlay = new { OwnedByPreview = overlay.Owner == this, Visible = overlay.IsVisible, Expanded = details.IsVisible, overlay.Width, Height = overlay.ClientSize.Height, Position = overlay.Position.ToString() },
                     OverlayRegression = overlayCheck, FinalOverlayBounds = finalOverlayBounds,
                     TimingRegression = new { Passed = timingPassed, TransferBreakdownPassed = transportPassed, LatestStageSumMs = stageSum, LatestTotalMs = status?.CaptureToRenderMs, MeanStageSumMs = meanStageSum, MeanTotalMs = status?.MeanCaptureToRenderMs },
-                    Input = new { RequiresManualEnable = true, LocalWheelAndKeyboardOnly = localInputTarget != null, SystemInputInjection = localInputTarget == null, SentEvents = Interlocked.Read(ref inputSent), RejectedEvents = Interlocked.Read(ref inputRejected), CoalescedMouseMoves = coalescedMoves, PendingEvents = inputQueue.Count },
+                    Input = new { RequiresManualEnable = true, LocalWheelAndKeyboardOnly = false, SystemInputInjection = true, SentEvents = Interlocked.Read(ref inputSent), RejectedEvents = Interlocked.Read(ref inputRejected), CoalescedMouseMoves = coalescedMoves, PendingEvents = inputQueue.Count },
                     Status = status, Session = session?.GetReport(), Errors = errors,
                     Capture = captureBackend, CaptureStatistics = captureStatistics,
                     Render = "D3D11 upload → Present(0) → event query GPU completion; physical scan-out is not timed"
