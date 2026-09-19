@@ -10,9 +10,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'third_party/ffmpeg/ru
 }
 & dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=None -o $staging
 if ($LASTEXITCODE -ne 0) { throw "Publish failed; staging retained at $staging" }
-foreach ($document in @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
+$documents = @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
     'docs/本机输入延迟验证.md', 'docs/公网拥塞控制调查.md', 'docs/受限公网回归设计.md',
-    "docs/$version-发布说明.md", "docs/$version-静态检查.md")) {
+    "docs/$version-发布说明.md", "docs/$version-静态检查.md")
+foreach ($document in $documents) {
     $destination = Join-Path $staging $document
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination
@@ -41,8 +42,15 @@ if (-not $zipTool -and (Test-Path -LiteralPath 'C:/Program Files/7-Zip/7z.exe'))
 if (-not $zipTool) { throw '7-Zip is required to package the release.' }
 # A fresh archive cannot inherit stale members from any previous package.
 $freshZip = Join-Path $releaseRoot ('package-' + [Guid]::NewGuid().ToString('N') + '.zip')
-& $zipTool a -tzip -mx=1 $freshZip (Join-Path $output '*')
+& $zipTool a -tzip -mx=1 -mcu=on $freshZip (Join-Path $output '*')
 if ($LASTEXITCODE -ne 0) { throw 'Release archive creation failed.' }
+$verification = [IO.Compression.ZipFile]::OpenRead($freshZip)
+try {
+    foreach ($document in $documents) {
+        if ($null -eq $verification.GetEntry($document)) { throw "Archive document filename mismatch: $document" }
+    }
+}
+finally { $verification.Dispose() }
 Move-Item -LiteralPath $freshZip -Destination $archivePath -Force
 $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $releaseRoot 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archivePath))`n")
