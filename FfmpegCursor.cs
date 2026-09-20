@@ -38,30 +38,41 @@ public static class CursorWire
         nint previousHandle = 0;
         var bounds = Win32InputInjector.ReadPrimaryMonitor();
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(16));
+        bool cursorUnavailable = false;
         do
         {
-            var state = NativeCursor.ReadState();
-            CursorShape? shape = null;
-            var reset = false;
-            var id = previous?.Id ?? 0;
-            if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
+            try
             {
-                shape = NativeCursor.ReadShape(state.Handle);
-                var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
-                if (known.TryGetValue(fingerprint, out id)) shape = null;
-                else
+                var state = NativeCursor.ReadState();
+                CursorShape? shape = null;
+                var reset = false;
+                var id = previous?.Id ?? 0;
+                if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
                 {
-                    if (known.Count >= 64) { known.Clear(); reset = true; }
-                    id = ++nextId; known[fingerprint] = id;
+                    shape = NativeCursor.ReadShape(state.Handle);
+                    var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
+                    if (known.TryGetValue(fingerprint, out id)) shape = null;
+                    else
+                    {
+                        if (known.Count >= 64) { known.Clear(); reset = true; }
+                        id = ++nextId; known[fingerprint] = id;
+                    }
                 }
+                if (state.Handle == 0) id = 0;
+                var update = new CursorUpdate(id, state.Visible, (state.X - bounds.Left) / (double)Math.Max(1, bounds.Width - 1),
+                    (state.Y - bounds.Top) / (double)Math.Max(1, bounds.Height - 1), shape, reset);
+                if (previous == null || update.Id != previous.Id || update.Visible != previous.Visible || update.X != previous.X || update.Y != previous.Y || shape != null)
+                    await WriteAsync(client.GetStream(), update, token);
+                previous = update;
+                previousHandle = state.Handle;
+                if (cursorUnavailable) Console.Error.WriteLine("[cursor] Desktop cursor access restored.");
+                cursorUnavailable = false;
             }
-            if (state.Handle == 0) id = 0;
-            var update = new CursorUpdate(id, state.Visible, (state.X - bounds.Left) / (double)Math.Max(1, bounds.Width - 1),
-                (state.Y - bounds.Top) / (double)Math.Max(1, bounds.Height - 1), shape, reset);
-            if (previous == null || update.Id != previous.Id || update.Visible != previous.Visible || update.X != previous.X || update.Y != previous.Y || shape != null)
-                await WriteAsync(client.GetStream(), update, token);
-            previous = update;
-            previousHandle = state.Handle;
+            catch (Win32Exception error)
+            {
+                if (!cursorUnavailable) Console.Error.WriteLine("[cursor] Desktop cursor temporarily unavailable: " + error);
+                cursorUnavailable = true;
+            }
         } while (await timer.WaitForNextTickAsync(token));
     }
 }

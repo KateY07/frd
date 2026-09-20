@@ -30,6 +30,8 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Compression;
+using System.IO.MemoryMappedFiles;
 using System.Net.Sockets;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -51,6 +53,10 @@ public sealed record CodecPreset
     public string Label { get; init; } = "";
     public string EncoderArguments { get; init; } = "";
     public string DecoderArguments { get; init; } = "";
+    public string InputPixelMode { get; init; } = "bgra";
+    public bool BitrateControlled { get; init; } = true;
+    public bool AutoProbe { get; init; }
+    public int MinimumAutoBitrateKbps { get; init; } = 100;
     public bool Enabled { get; init; } = true;
     public string? UnavailableReason { get; init; }
 }
@@ -63,6 +69,7 @@ public sealed record AppConfiguration
     public double TransmissionScale { get; init; } = 1;
     public int FramesPerSecond { get; init; } = 30;
     public string InitialPreset { get; init; } = "h264";
+    public bool AutoSelectCodec { get; init; } = true;
     public int InitialBitrateKbps { get; init; } = 1000;
     public double MaximumBitrateMbps { get; init; } = 100;
     [System.Text.Json.Serialization.JsonIgnore]
@@ -78,9 +85,17 @@ public sealed record AppConfiguration
             throw new InvalidDataException("Expected schemaVersion=3 and even video dimensions between 64 and 7680×4320.");
         if (!double.IsFinite(config.MaximumBitrateMbps) || config.MaximumBitrateMbps is < .1 or > 1000)
             throw new InvalidDataException("maximumBitrateMbps must be between 0.1 and 1000.");
-        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
+        if (config.FramesPerSecond is not (10 or 20 or 30 or 60) || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
             throw new InvalidDataException("Invalid FPS, initial bitrate, or initial preset.");
         TransmissionGeometry.ValidateScale(config.TransmissionScale);
+        foreach (var (id, preset) in config.Presets.Where(entry => entry.Value.Enabled))
+        {
+            var pixelMode = CapturePixelModes.Parse(preset.InputPixelMode);
+            if (!preset.BitrateControlled || preset.MinimumAutoBitrateKbps < 100 ||
+                preset.EncoderArguments.Contains("frd_lz4", StringComparison.OrdinalIgnoreCase) ||
+                preset.DecoderArguments.Contains("frd_lz4", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Preset {id}: only bitrate-controlled FFmpeg codecs are supported.");
+        }
         var directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, config.LibraryDirectory));
         FfmpegRuntime.Initialize(directory);
         return config;
@@ -125,14 +140,18 @@ public sealed record ControlResult(bool Success, string Message, int Generation)
     public int Width { get; init; }
     public int Height { get; init; }
     public double TransmissionScale { get; init; } = 1;
+    public int FramesPerSecond { get; init; }
 }
-sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null);
+sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null, int? FramesPerSecond = null);
 sealed record PendingControl(ControlCommand Command, TaskCompletionSource<ControlResult> Completion);
 
 public sealed partial class DemoSession : IDisposable
 {
     AppConfiguration config;
     readonly Func<byte[]> capture;
+    readonly Func<bool, MappedBgraFrame?>? captureMapped;
+    readonly Func<(int Width, int Height)>? captureDimensions;
+    readonly Action<CapturePixelMode>? setCapturePixelMode;
     readonly Action<int, int>? resizeCapture;
     readonly int sourceWidth, sourceHeight;
     readonly CancellationTokenSource stop = new();
@@ -149,7 +168,7 @@ public sealed partial class DemoSession : IDisposable
     long presentationCount;
     TransferTimings? lastTransfer;
     readonly Queue<TransferTimings> transferSamples = new();
-    readonly Dictionary<int, FfmpegDecoder> decoders = new();
+    readonly Dictionary<int, VideoDecoder> decoders = new();
     readonly Dictionary<int, string> presetNames = new();
     readonly ConcurrentQueue<object> changes = new();
     readonly TcpListener controlServer = new(IPAddress.Loopback, 0);
@@ -193,9 +212,18 @@ public sealed partial class DemoSession : IDisposable
             Transfer / Math.Max(1, count), Decode / Math.Max(1, count), Render / Math.Max(1, count));
     }
 
-    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null, int sourceWidth = 0, int sourceHeight = 0)
+    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null,
+        int sourceWidth = 0, int sourceHeight = 0)
+        : this(config, capture, resizeCapture, sourceWidth, sourceHeight, null) { }
+
+    internal DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture,
+        int sourceWidth, int sourceHeight, Func<bool, MappedBgraFrame?>? captureMapped,
+        Action<CapturePixelMode>? setCapturePixelMode = null, Func<(int Width, int Height)>? captureDimensions = null)
     {
         this.config = config; this.capture = capture; this.resizeCapture = resizeCapture;
+        this.captureMapped = captureMapped;
+        this.captureDimensions = captureDimensions;
+        this.setCapturePixelMode = setCapturePixelMode;
         this.sourceWidth = sourceWidth; this.sourceHeight = sourceHeight;
     }
 
@@ -228,9 +256,10 @@ public sealed partial class DemoSession : IDisposable
         if (!result.Success) throw new InvalidOperationException(result.Message);
     }
 
-    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null)
+    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null, int? framesPerSecond = null)
     {
-        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "传输比例仅支持 1×、0.75×、0.5×。", AppliedGeneration);
+        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "仅支持原始分辨率 1×。", AppliedGeneration);
+        if (framesPerSecond is { } fps && fps is not (10 or 20 or 30 or 60)) return new(false, "仅支持 10/20/30/60 FPS。", AppliedGeneration);
         if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
         if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
         if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
@@ -238,18 +267,19 @@ public sealed partial class DemoSession : IDisposable
         var generation = Interlocked.Increment(ref requestedGeneration);
         try
         {
-            FfmpegDecoder decoder;
+            VideoDecoder decoder;
             try { decoder = new(preset.DecoderArguments); }
             catch (Exception ex) { Console.Error.WriteLine(ex); return new(false, ex.Message, AppliedGeneration); }
             lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = presetId; }
-            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale));
+            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale, FramesPerSecond: framesPerSecond));
             if (!result.Success || result.Generation != generation)
             {
                 lock (decoderGate) { decoders.Remove(generation); presetNames.Remove(generation); decoder.Dispose(); }
             }
             changes.Enqueue(new { Preset = presetId, LimitKbps = limitKbps, Result = result });
             if (result.Success && result.Width > 0 && result.Height > 0)
-                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale };
+                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale,
+                    FramesPerSecond = result.FramesPerSecond > 0 ? result.FramesPerSecond : config.FramesPerSecond };
             return result;
         }
         finally { controlGate.Release(); }
@@ -308,7 +338,7 @@ public sealed partial class DemoSession : IDisposable
 
     void EncodeLoop()
     {
-        FfmpegEncoder? encoder = null;
+        VideoEncoder? encoder = null;
         var force = true;
         try
         {
@@ -331,27 +361,39 @@ public sealed partial class DemoSession : IDisposable
                         if (!config.Presets.TryGetValue(cmd.PresetId, out var preset) || !preset.Enabled) throw new InvalidDataException("Preset unavailable on sender.");
                         if (cmd.LimitKbps < 100 || cmd.LimitKbps > config.MaximumBitrateKbps || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
                         var scale = cmd.Scale ?? config.TransmissionScale;
+                        var fps = cmd.FramesPerSecond ?? config.FramesPerSecond;
+                        if (fps is not (10 or 20 or 30 or 60)) throw new InvalidDataException("Unsupported FPS.");
                         TransmissionGeometry.ValidateScale(scale);
-                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) : TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
+                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) :
+                            captureDimensions?.Invoke() ?? TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
                         if (resizeCapture == null && cmd.Scale is { } requestedScale && requestedScale != config.TransmissionScale)
                             throw new InvalidOperationException("This capture source cannot change transmission scale.");
                         var resize = dimensions.Width != config.Width || dimensions.Height != config.Height;
                         ControlResult Applied(string text, int revision) => new(true, text, revision)
-                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
-                        if (!resize && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
+                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale, FramesPerSecond = fps };
+                        if (!resize && fps == config.FramesPerSecond && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
                         {
-                            sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, cmd.LimitKbps);
+                            sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, encoder.HasBitrateCap ? cmd.LimitKbps : 0);
                             pending.Completion.TrySetResult(Applied("发送端已在原会话更新码率上限", AppliedGeneration));
                             continue;
                         }
-                        var replacement = new FfmpegEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height, config.FramesPerSecond, cmd.LimitKbps);
-                        try { if (resize) resizeCapture!(dimensions.Width, dimensions.Height); }
+                        var pixelMode = CapturePixelModes.Parse(preset.InputPixelMode);
+                        if (pixelMode != CapturePixelMode.Bgra && setCapturePixelMode == null)
+                            throw new NotSupportedException("This capture source cannot provide packed color pixels.");
+                        var replacement = new VideoEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height,
+                            fps, cmd.LimitKbps, pixelMode);
+                        try
+                        {
+                            if (resize) resizeCapture!(dimensions.Width, dimensions.Height);
+                            setCapturePixelMode?.Invoke(pixelMode);
+                        }
                         catch { replacement.Dispose(); throw; }
                         encoder?.Dispose(); encoder = replacement;
-                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
+                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale,
+                            FramesPerSecond = fps };
                         sender!.SetEncoderBitrateKbps(cmd.LimitKbps);
-                        activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, cmd.LimitKbps); Volatile.Write(ref appliedGeneration, cmd.Generation);
-                        force = true; message = "手动控制；带宽估计仅参考";
+                        activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, replacement.HasBitrateCap ? cmd.LimitKbps : 0); Volatile.Write(ref appliedGeneration, cmd.Generation);
+                        force = true; next = Stopwatch.GetTimestamp(); message = "手动控制；带宽估计仅参考";
                         pending.Completion.TrySetResult(Applied("发送端已应用；等待新预设首帧", cmd.Generation));
                     }
                     catch (Exception ex) { Console.Error.WriteLine(ex); pending.Completion.TrySetResult(new(false, ex.Message, AppliedGeneration)); }
@@ -360,13 +402,45 @@ public sealed partial class DemoSession : IDisposable
                 var waitMs = (next - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency;
                 if (waitMs > 0 && stop.Token.WaitHandle.WaitOne((int)Math.Ceiling(waitMs))) break;
                 var captureStart = Stopwatch.GetTimestamp();
-                var pixels = capture();
+                MappedBgraFrame? mapped = null;
+                byte[]? pixels = null;
+                if (encoder.SupportsMappedBgra && captureMapped != null) mapped = captureMapped(force);
+                else pixels = capture();
+                if (mapped == null && pixels == null)
+                {
+                    next = Math.Max(next + Stopwatch.Frequency / config.FramesPerSecond, Stopwatch.GetTimestamp());
+                    continue;
+                }
+                var frameSize = mapped != null ? (mapped.Width, mapped.Height) : captureDimensions?.Invoke() ?? (config.Width, config.Height);
+                if (frameSize.Width != config.Width || frameSize.Height != config.Height)
+                {
+                    if (frameSize.Width is < 64 or > 8192 || frameSize.Height is < 64 or > 8192 ||
+                        (frameSize.Width & 1) != 0 || (frameSize.Height & 1) != 0)
+                        throw new InvalidDataException($"Invalid source resolution {frameSize.Width}x{frameSize.Height}.");
+                    var preset = config.Presets[activePreset];
+                    var replacement = new VideoEncoder(preset.EncoderArguments, frameSize.Width, frameSize.Height,
+                        config.FramesPerSecond, appliedLimit, CapturePixelModes.Parse(preset.InputPixelMode));
+                    encoder.Dispose(); encoder = replacement;
+                    config = config with { Width = frameSize.Width, Height = frameSize.Height };
+                    var generation = Interlocked.Increment(ref appliedGeneration);
+                    Interlocked.Exchange(ref requestedGeneration, generation);
+                    if (diagnosticDestination == null)
+                    {
+                        var decoder = new VideoDecoder(preset.DecoderArguments);
+                        lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = activePreset; }
+                    }
+                    force = true;
+                    Console.Error.WriteLine($"[video] Source resolution changed to {frameSize.Width}x{frameSize.Height}; encoder generation {generation}, keyframe required.");
+                }
                 var capturedTick = Stopwatch.GetTimestamp();
                 Interlocked.Add(ref captureTicks, capturedTick - captureStart);
                 var encodeStart = Stopwatch.GetTimestamp();
                 var inputId = nextFrameId++; inputClocks[inputId] = (captureStart, capturedTick);
                 inputClocks.Remove(inputId - 4096);
-                var packets = encoder.Encode(pixels, inputId, force); force = false;
+                IReadOnlyList<CodecPacket> packets;
+                try { packets = mapped != null ? encoder.EncodeMapped(mapped, inputId, force) : encoder.Encode(pixels!, inputId, force); }
+                finally { mapped?.Dispose(); }
+                force = false;
                 var encodedTick = Stopwatch.GetTimestamp();
                 Interlocked.Add(ref encodeTicks, encodedTick - encodeStart);
                 Interlocked.Increment(ref encodedFrames);
@@ -506,6 +580,7 @@ public sealed partial class DemoSession : IDisposable
 
     void ReportError(string stage, Exception ex)
     {
+        SessionTrace.Error(stage, ex);
         message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
         stop.Cancel();
         if (Interlocked.Exchange(ref failureReported, 1) == 0) Failed?.Invoke(ex);
@@ -580,7 +655,7 @@ public sealed partial class DemoSession : IDisposable
         Network = sender?.Snapshot ?? remoteNetwork, Changes = changes.ToArray(), Message = message,
         Mode = IsRemote ? "remote-controller" : diagnosticDestination != null ? "remote-host" : "localhost-demo",
         ClockTiming = IsRemote ? RemoteTimingDescription : "One local monotonic clock",
-        Scope = "Capture start -> FFmpeg encode -> immediate UDP (unless explicit simulation is enabled) -> FFmpeg decode -> BGRA -> DXGI Present -> D3D11 GPU completion. Only confirmed presentations contribute to timing; physical scanout is not measured. Separate optional diagnostic UDP packets do not change video packets or gate rendering. Local mode uses one monotonic clock; remote mode estimates clock offset with the uncertainty shown in ClockTiming. The slider controls encoder bitrate only."
+        Scope = "Capture start -> selected encoder -> immediate UDP (unless explicit simulation is enabled) -> selected decoder -> BGRA -> DXGI Present -> D3D11 GPU completion. Only confirmed presentations contribute to timing; physical scanout is not measured. Separate optional diagnostic UDP packets do not change video packets or gate rendering. Local mode uses one monotonic clock; remote mode estimates clock offset with the uncertainty shown in ClockTiming. The slider caps encoder bitrate; it does not pace UDP sends."
     };
 
     TransferTimings[] GetTransferSamples()
@@ -624,26 +699,65 @@ static class Program
                     .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
                 return 0;
             }
+            if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
+                return AutoCodecProbe.RunWorker(args);
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
-                "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
+                "--presentation-regression" or "--static-regression" or "--demo-regression" or "--cpu-presets-regression" or
+                "--auto-probe-regression" or "--gpu-prereadback-regression" or "--gpu-quantized-encode-regression" or "--packed-presets-regression")) throw new ArgumentException(RemoteLaunch.Usage);
             var remoteOptions = args.Length > 0 && args[0] is "--host" or "--connect" ? RemoteLaunch.Parse(args) : null;
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (remoteOptions != null) return RemoteLaunch.Run(config, remoteOptions);
+            if (args.Length > 0 && args[0] == "--gpu-prereadback-regression")
+                return GpuPreReadbackRegression.Run(args.Length > 1 ? args[1] : "results/gpu-prereadback.json");
+            if (args.Length > 0 && args[0] == "--gpu-quantized-encode-regression")
+                return GpuQuantizedEncodeRegression.Run(args.Length > 1 ? args[1] : "results/gpu-quantized-encode.json", args.Length > 2 ? args[2] : null);
+            if (args.Length > 0 && args[0] == "--packed-presets-regression")
+            {
+                GpuQuantizedEncodeRegression.RunSessionAsync(config, args.Length > 1 ? args[1] : "results/packed-presets.json")
+                    .GetAwaiter().GetResult();
+                return 0;
+            }
+            if (args.Length > 0 && args[0] == "--auto-probe-regression")
+            {
+                var selected = AutoCodecProbe.SelectSender(config);
+                var receiver = AutoCodecProbe.SelectReceiver(config, selected.Samples);
+                var output = args.Length > 1 ? args[1] : "results/auto-codec-probe.json";
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+                File.WriteAllText(output, JsonSerializer.Serialize(new
+                {
+                    SelectedPreset = selected.Configuration.InitialPreset,
+                    ReceiverSelectedPreset = receiver.InitialPreset,
+                    Candidates = selected.Samples.Select(sample => new
+                    { sample.PresetId, sample.CaptureMs, sample.EncodeMs, sample.LocalDecodeMs, Bytes = sample.Packet.Length })
+                }, AppConfiguration.JsonOptions));
+                return selected.Samples.Length > 0 ? 0 : 1;
+            }
+            if (remoteOptions != null)
+            {
+                var selected = remoteOptions.Host ? AutoCodecProbe.SelectSender(config) : (config, Array.Empty<CodecProbeSample>());
+                return RemoteLaunch.Run(selected.Item1, remoteOptions, selected.Item2);
+            }
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--presentation-regression") { FfmpegUi.RunPresentationRegression(config, args.Length > 1 ? args[1] : "results/ffmpeg-presentation.json"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--static-regression") { FfmpegRegression.RunStaticLowBandwidth(config, args.Length > 1 ? args[1] : "results/ffmpeg-static"); return Environment.ExitCode; }
+            if (args.Length > 0 && args[0] == "--cpu-presets-regression")
+            {
+                CpuPresetRegression.Run(config, args.Length > 1 ? args[1] : "results/cpu-presets.json").GetAwaiter().GetResult();
+                return 0;
+            }
             if (args.Length > 0 && args[0] == "--demo-regression")
             {
                 var seconds = args.Length > 1 ? int.Parse(args[1]) : 10;
                 var output = args.Length > 2 ? args[2] : "results/ffmpeg-demo.json";
                 FfmpegUi.Run(config, seconds, output); return Environment.ExitCode;
             }
+            config = AutoCodecProbe.SelectSender(config).Configuration;
             FfmpegUi.Run(config); return Environment.ExitCode;
         }
         catch (Exception ex)
         {
+            SessionTrace.Error("process-startup", ex);
             Console.Error.WriteLine(ex);
             try { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString()); }
             catch (Exception logError) { Console.Error.WriteLine("Cannot write startup-error.txt: " + logError); }
@@ -652,9 +766,206 @@ static class Program
     }
 }
 
+// Source: FfmpegAutoProbe.cs
+sealed record CodecProbeSample(string PresetId, string DecoderArguments, int Width, int Height,
+    double CaptureMs, double EncodeMs, double LocalDecodeMs, byte[] Packet)
+{
+    public double SenderMs => CaptureMs + EncodeMs;
+}
+
+sealed record CodecProbeReport(List<CodecProbeSample> Samples);
+sealed record CodecDecodeRequest(CodecProbeSample[] Samples);
+sealed record CodecDecodeReport(Dictionary<string, double> DecoderMs);
+
+static class AutoCodecProbe
+{
+    const int DeadlineMs = 5000, MaxPacketBytes = 128 * 1024, MaxSamples = 8;
+
+    public static (AppConfiguration Configuration, CodecProbeSample[] Samples) SelectSender(AppConfiguration config)
+    {
+        if (!config.AutoSelectCodec) return (config, []);
+        var path = Path.Combine(Path.GetTempPath(), "frd-probe-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            RunProcess("--auto-codec-probe", Path.Combine(AppContext.BaseDirectory, "codec-config.json"), path);
+            var samples = Read<CodecProbeReport>(path)?.Samples.Where(sample =>
+                config.Presets.TryGetValue(sample.PresetId, out var preset) && preset.Enabled &&
+                preset.BitrateControlled && sample.Packet.Length > 0 && sample.Packet.Length <= MaxPacketBytes)
+                .ToArray() ?? [];
+            var fastest = samples.MinBy(sample => sample.SenderMs + sample.LocalDecodeMs);
+            if (fastest == null)
+            {
+                Console.Error.WriteLine("[auto-codec] No valid result in 5 seconds; retaining configured preset " + config.InitialPreset);
+                return (config, samples);
+            }
+            Console.Error.WriteLine($"[auto-codec] {fastest.PresetId}: capture {fastest.CaptureMs:F2} + encode {fastest.EncodeMs:F2} + decode {fastest.LocalDecodeMs:F2} ms; {samples.Length} valid candidates.");
+            return (config with { InitialPreset = fastest.PresetId }, samples);
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("[auto-codec] Probe failed; retaining configured preset: " + error);
+            return (config, []);
+        }
+        finally { Delete(path); }
+    }
+
+    public static AppConfiguration SelectReceiver(AppConfiguration config, CodecProbeSample[]? samples)
+    {
+        if (!config.AutoSelectCodec || samples is not { Length: > 0 }) return config;
+        var request = Path.Combine(Path.GetTempPath(), "frd-decoder-" + Guid.NewGuid().ToString("N") + ".json");
+        var output = request + ".result";
+        try
+        {
+            File.WriteAllText(request, JsonSerializer.Serialize(new CodecDecodeRequest(samples), AppConfiguration.JsonOptions));
+            RunProcess("--auto-decode-probe", Path.Combine(AppContext.BaseDirectory, "codec-config.json"), output, request);
+            var results = Read<CodecDecodeReport>(output)?.DecoderMs;
+            if (results == null || results.Count == 0) return config;
+            var fastest = samples.Where(sample => results.ContainsKey(sample.PresetId) && config.Presets.ContainsKey(sample.PresetId))
+                .MinBy(sample => sample.SenderMs + results[sample.PresetId]);
+            if (fastest == null) return config;
+            Console.Error.WriteLine($"[auto-codec] Remote pair {fastest.PresetId}: sender {fastest.SenderMs:F2} + receiver decode {results[fastest.PresetId]:F2} ms.");
+            return config with { InitialPreset = fastest.PresetId };
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("[auto-codec] Decoder probe failed; retaining host preset: " + error);
+            return config;
+        }
+        finally { Delete(request); Delete(output); }
+    }
+
+    public static int RunWorker(string[] args)
+    {
+        var config = AppConfiguration.Load(args[1]);
+        if (args[0] == "--auto-codec-probe") RunSenderWorker(config, args[2]);
+        else RunDecoderWorker(args[3], args[2]);
+        return 0;
+    }
+
+    static void RunSenderWorker(AppConfiguration config, string output)
+    {
+        CodecProbeReport report = new([]);
+        using var capture = new DesktopStreamSource(config.TransmissionScale);
+        capture.Capture();
+        var candidates = config.Presets.Where(entry => entry.Value.Enabled && entry.Value.BitrateControlled &&
+            (entry.Value.AutoProbe || entry.Key == config.InitialPreset) &&
+            entry.Value.MinimumAutoBitrateKbps <= config.InitialBitrateKbps)
+            .OrderBy(entry => entry.Key == config.InitialPreset ? 0 : 1).Take(MaxSamples);
+        foreach (var (id, preset) in candidates)
+        {
+            try
+            {
+                using var encoder = new VideoEncoder(preset.EncoderArguments, capture.Width, capture.Height,
+                    config.FramesPerSecond, config.InitialBitrateKbps);
+                using var decoder = new VideoDecoder(preset.DecoderArguments);
+                CodecProbeSample? sample = null;
+                for (var frame = 0; frame < 3; frame++)
+                {
+                    var started = Stopwatch.GetTimestamp();
+                    MappedBgraFrame? mapped = null;
+                    byte[]? pixels = null;
+                    if (encoder.SupportsMappedBgra) mapped = capture.CaptureMapped(true);
+                    else pixels = capture.Capture();
+                    var captured = Stopwatch.GetTimestamp();
+                    IReadOnlyList<CodecPacket> packets;
+                    try { packets = mapped != null ? encoder.EncodeMapped(mapped, frame, true) : encoder.Encode(pixels!, frame, true); }
+                    finally { mapped?.Dispose(); }
+                    var encoded = Stopwatch.GetTimestamp();
+                    foreach (var packet in packets)
+                    {
+                        if (packet.Data.Length is < 1 or > MaxPacketBytes) continue;
+                        var decoded = decoder.Decode(packet.Data, packet.Pts);
+                        var finished = Stopwatch.GetTimestamp();
+                        if (decoded.Count == 0 || decoded[^1].Width != capture.Width || decoded[^1].Height != capture.Height) continue;
+                        sample = new(id, preset.DecoderArguments, capture.Width, capture.Height,
+                            Ms(started, captured), Ms(captured, encoded), Ms(encoded, finished), packet.Data);
+                    }
+                }
+                if (sample == null) throw new InvalidDataException("No complete decoded frame from a bounded packet.");
+                report.Samples.Add(sample);
+                Write(output, report);
+                Console.Error.WriteLine($"[auto-codec] {id}: {sample.CaptureMs:F2} + {sample.EncodeMs:F2} + {sample.LocalDecodeMs:F2} ms, {sample.Packet.Length} bytes");
+            }
+            catch (Exception error) { Console.Error.WriteLine($"[auto-codec] {id} skipped: {error}"); }
+        }
+    }
+
+    static void RunDecoderWorker(string requestPath, string output)
+    {
+        var request = Read<CodecDecodeRequest>(requestPath) ?? throw new InvalidDataException("Missing decoder request.");
+        CodecDecodeReport report = new(new());
+        foreach (var sample in request.Samples.Take(MaxSamples))
+        {
+            try
+            {
+                if (sample.Packet.Length is < 1 or > MaxPacketBytes) continue;
+                using var decoder = new VideoDecoder(sample.DecoderArguments);
+                var started = Stopwatch.GetTimestamp();
+                var frames = decoder.Decode(sample.Packet, 0);
+                var elapsed = Ms(started, Stopwatch.GetTimestamp());
+                if (frames.Any(frame => frame.Width == sample.Width && frame.Height == sample.Height))
+                {
+                    report.DecoderMs[sample.PresetId] = elapsed;
+                    Write(output, report);
+                }
+            }
+            catch (Exception error) { Console.Error.WriteLine($"[auto-codec] Receiver rejected {sample.PresetId}: {error}"); }
+        }
+    }
+
+    static void RunProcess(string mode, string configPath, string outputPath, string? requestPath = null)
+    {
+        var executable = Environment.ProcessPath ?? throw new InvalidOperationException("Cannot locate FRD executable.");
+        ProcessStartInfo start = new(executable)
+        {
+            UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = AppContext.BaseDirectory
+        };
+        if (Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(Environment.GetCommandLineArgs()[0]);
+        start.ArgumentList.Add(mode);
+        start.ArgumentList.Add(configPath);
+        start.ArgumentList.Add(outputPath);
+        if (requestPath != null) start.ArgumentList.Add(requestPath);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not launch bounded codec probe.");
+        if (process.WaitForExit(DeadlineMs)) return;
+        Console.Error.WriteLine("[auto-codec] 5-second probe limit reached; using completed candidates.");
+        process.Kill(entireProcessTree: true);
+        process.WaitForExit(1000);
+    }
+
+    static T? Read<T>(string path) => File.Exists(path)
+        ? JsonSerializer.Deserialize<T>(File.ReadAllText(path), AppConfiguration.JsonOptions) : default;
+
+    static void Write<T>(string path, T value)
+    {
+        var temporary = path + ".writing";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(value, AppConfiguration.JsonOptions));
+        File.Move(temporary, path, true);
+    }
+
+    static void Delete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); }
+        catch (Exception error) { Console.Error.WriteLine("[auto-codec] Cannot remove temporary probe file: " + error); }
+    }
+
+    static double Ms(long start, long end) => (end - start) * 1000d / Stopwatch.Frequency;
+}
+
 // Source: FfmpegBackend.cs
 public sealed record CodecPacket(byte[] Data, bool KeyFrame, long Pts);
 public sealed record DecodedPixels(byte[] Bgra, int Width, int Height, long Pts);
+
+internal sealed class MappedBgraFrame(nint pixels, int stride, int width, int height, Action release) : IDisposable
+{
+    Action? releaseFrame = release;
+    public nint Pixels { get; } = pixels;
+    public int Stride { get; } = stride;
+    public int Width { get; } = width;
+    public int Height { get; } = height;
+    public void Dispose() => Interlocked.Exchange(ref releaseFrame, null)?.Invoke();
+}
 
 public static unsafe class FfmpegRuntime
 {
@@ -785,10 +1096,15 @@ internal sealed class FfmpegArguments
 
 public sealed unsafe class FfmpegEncoder : IDisposable
 {
+    static readonly av_buffer_create_free ReleaseBorrowedInput = (_, _) => { };
     AVCodecContext* context;
     AVFrame* frame;
+    AVFrame* mappedFrame;
     AVPacket* packet;
     SwsContext* converter;
+    SwsContext* grayConverter;
+    SwsContext* rgb332Converter;
+    SwsContext* rgb565Converter;
     readonly byte*[] inputPlanes = new byte*[4];
     readonly int[] inputStrides = new int[4];
     readonly byte*[] outputPlanes = new byte*[4];
@@ -833,8 +1149,8 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             context->gop_size = fps * 2;
             context->max_b_frames = 0;
             context->thread_count = 1;
-            context->color_range = AVColorRange.AVCOL_RANGE_MPEG;
-            context->colorspace = AVColorSpace.AVCOL_SPC_BT709;
+            context->color_range = Name == "libx264rgb" ? AVColorRange.AVCOL_RANGE_JPEG : AVColorRange.AVCOL_RANGE_MPEG;
+            context->colorspace = Name == "libx264rgb" ? AVColorSpace.AVCOL_SPC_RGB : AVColorSpace.AVCOL_SPC_BT709;
             context->color_primaries = AVColorPrimaries.AVCOL_PRI_BT709;
             context->color_trc = AVColorTransferCharacteristic.AVCOL_TRC_BT709;
             var desiredFormat = options.Last("pix_fmt");
@@ -858,8 +1174,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             FfmpegRuntime.OpenCodec(context, codec, $"Open encoder {Name}");
             PixelFormat = ffmpeg.av_get_pix_fmt_name(context->pix_fmt);
             frame = ffmpeg.av_frame_alloc();
+            if (Name == "libx264rgb" && context->pix_fmt == AVPixelFormat.AV_PIX_FMT_BGR0)
+                mappedFrame = ffmpeg.av_frame_alloc();
             packet = ffmpeg.av_packet_alloc();
-            if (frame == null || packet == null) throw new OutOfMemoryException("FFmpeg frame or packet allocation failed.");
+            if (frame == null || packet == null || (Name == "libx264rgb" && context->pix_fmt == AVPixelFormat.AV_PIX_FMT_BGR0 && mappedFrame == null))
+                throw new OutOfMemoryException("FFmpeg frame or packet allocation failed.");
             frame->format = (int)context->pix_fmt;
             frame->width = width;
             frame->height = height;
@@ -931,6 +1250,70 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             var rows = ffmpeg.sws_scale(converter, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
             if (rows != height) throw new InvalidOperationException($"BGRA conversion returned {rows} rows, expected {height}.");
         }
+        return SubmitFrame(pts, forceKeyframe);
+    }
+
+    internal IReadOnlyList<CodecPacket> EncodeQuantized(byte[] pixels, bool grayscale, long pts, bool forceKeyframe = false)
+        => EncodePacked(pixels, grayscale ? AVPixelFormat.AV_PIX_FMT_GRAY8 : AVPixelFormat.AV_PIX_FMT_RGB8, 1, pts, forceKeyframe);
+
+    internal IReadOnlyList<CodecPacket> EncodeRgb565(byte[] pixels, long pts, bool forceKeyframe = false)
+        => EncodePacked(pixels, AVPixelFormat.AV_PIX_FMT_RGB565LE, 2, pts, forceKeyframe);
+
+    byte[]? gray4Expanded;
+
+    internal IReadOnlyList<CodecPacket> EncodeGray4(byte[] pixels, long pts, bool forceKeyframe = false)
+    {
+        if ((width & 1) != 0 || pixels.Length != checked(width * height / 2))
+            throw new ArgumentException("Packed Gray4 input dimensions do not match the encoder.", nameof(pixels));
+        var expanded = gray4Expanded ??= new byte[checked(width * height)];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var pair = pixels[i];
+            expanded[i * 2] = (byte)((pair >> 4) * 17);
+            expanded[i * 2 + 1] = (byte)((pair & 15) * 17);
+        }
+        return EncodeQuantized(expanded, true, pts, forceKeyframe);
+    }
+
+    IReadOnlyList<CodecPacket> EncodePacked(byte[] pixels, AVPixelFormat sourceFormat, int bytesPerPixel, long pts, bool forceKeyframe)
+    {
+        ObjectDisposedException.ThrowIf(context == null, this);
+        if (flushed) throw new InvalidOperationException("Cannot encode after flushing the session.");
+        if (pixels.Length != checked(width * height * bytesPerPixel)) throw new ArgumentException("Packed input size does not match encoder dimensions.", nameof(pixels));
+        FfmpegRuntime.Check(ffmpeg.av_frame_make_writable(frame), "Make quantized encoder input writable");
+        var chosen = sourceFormat switch
+        {
+            AVPixelFormat.AV_PIX_FMT_GRAY8 => grayConverter,
+            AVPixelFormat.AV_PIX_FMT_RGB8 => rgb332Converter,
+            AVPixelFormat.AV_PIX_FMT_RGB565LE => rgb565Converter,
+            _ => throw new ArgumentOutOfRangeException(nameof(sourceFormat))
+        };
+        var firstUse = chosen == null;
+        chosen = ffmpeg.sws_getCachedContext(chosen, width, height, sourceFormat, width, height, context->pix_fmt,
+            (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
+        if (chosen == null) throw new NotSupportedException($"{sourceFormat} to {PixelFormat} conversion is unavailable.");
+        if (firstUse)
+        {
+            var coefficients = *(int_array4*)ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU709);
+            FfmpegRuntime.Check(ffmpeg.sws_setColorspaceDetails(chosen, coefficients, 1, coefficients, 0, 0, 1 << 16, 1 << 16),
+                "Configure packed BT.709 conversion");
+        }
+        if (sourceFormat == AVPixelFormat.AV_PIX_FMT_GRAY8) grayConverter = chosen;
+        else if (sourceFormat == AVPixelFormat.AV_PIX_FMT_RGB8) rgb332Converter = chosen;
+        else rgb565Converter = chosen;
+        fixed (byte* input = pixels)
+        {
+            inputPlanes[0] = input;
+            inputStrides[0] = width * bytesPerPixel;
+            for (var i = 0; i < 4; i++) { outputPlanes[i] = frame->data[(uint)i]; outputStrides[i] = frame->linesize[(uint)i]; }
+            var rows = ffmpeg.sws_scale(chosen, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
+            if (rows != height) throw new InvalidOperationException($"Quantized conversion returned {rows} rows, expected {height}.");
+        }
+        return SubmitFrame(pts, forceKeyframe);
+    }
+
+    IReadOnlyList<CodecPacket> SubmitFrame(long pts, bool forceKeyframe)
+    {
         frame->pts = pts;
         frame->pict_type = forceKeyframe ? AVPictureType.AV_PICTURE_TYPE_I : AVPictureType.AV_PICTURE_TYPE_NONE;
         List<CodecPacket> result = new();
@@ -939,6 +1322,62 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         FfmpegRuntime.Check(status, $"Encode using {Name}");
         Receive(result);
         return result;
+    }
+
+    internal bool SupportsMappedBgra => true;
+
+    internal IReadOnlyList<CodecPacket> EncodeMapped(MappedBgraFrame bgra, long pts, bool forceKeyframe = false)
+    {
+        ObjectDisposedException.ThrowIf(context == null, this);
+        if (flushed) throw new InvalidOperationException("Cannot encode after flushing the session.");
+        if (bgra.Width != width || bgra.Height != height || bgra.Pixels == 0 || bgra.Stride < checked(width * 4))
+            throw new ArgumentException("Mapped BGRA input dimensions or stride do not match the encoder.", nameof(bgra));
+        if (mappedFrame == null)
+        {
+            FfmpegRuntime.Check(ffmpeg.av_frame_make_writable(frame), "Make encoder input writable");
+            inputPlanes[0] = (byte*)bgra.Pixels;
+            inputStrides[0] = bgra.Stride;
+            for (var i = 0; i < 4; i++) { outputPlanes[i] = frame->data[(uint)i]; outputStrides[i] = frame->linesize[(uint)i]; }
+            var rows = ffmpeg.sws_scale(converter, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
+            if (rows != height) throw new InvalidOperationException($"BGRA conversion returned {rows} rows, expected {height}.");
+            return SubmitFrame(pts, forceKeyframe);
+        }
+        ffmpeg.av_frame_unref(mappedFrame);
+        var buffer = ffmpeg.av_buffer_create((byte*)bgra.Pixels, checked((ulong)bgra.Stride * (ulong)height),
+            ReleaseBorrowedInput, null, ffmpeg.AV_BUFFER_FLAG_READONLY);
+        if (buffer == null) throw new OutOfMemoryException("Reference mapped desktop pixels.");
+        mappedFrame->buf[0] = buffer;
+        mappedFrame->data[0] = (byte*)bgra.Pixels;
+        mappedFrame->linesize[0] = bgra.Stride;
+        mappedFrame->format = (int)AVPixelFormat.AV_PIX_FMT_BGR0;
+        mappedFrame->width = width;
+        mappedFrame->height = height;
+        mappedFrame->color_range = context->color_range;
+        mappedFrame->colorspace = context->colorspace;
+        mappedFrame->color_primaries = context->color_primaries;
+        mappedFrame->color_trc = context->color_trc;
+        mappedFrame->pts = pts;
+        mappedFrame->pict_type = forceKeyframe ? AVPictureType.AV_PICTURE_TYPE_I : AVPictureType.AV_PICTURE_TYPE_NONE;
+        try
+        {
+            List<CodecPacket> result = new();
+            var status = ffmpeg.avcodec_send_frame(context, mappedFrame);
+            if (status == ffmpeg.AVERROR(ffmpeg.EAGAIN)) { Receive(result); status = ffmpeg.avcodec_send_frame(context, mappedFrame); }
+            FfmpegRuntime.Check(status, $"Encode mapped desktop using {Name}");
+            Receive(result);
+            if (ffmpeg.av_buffer_get_ref_count(mappedFrame->buf[0]) != 1)
+            {
+                Dispose();
+                throw new InvalidOperationException("libx264rgb retained the mapped desktop input; encoder stopped before unmapping it.");
+            }
+            return result;
+        }
+        catch
+        {
+            if (mappedFrame != null && mappedFrame->buf[0] != null && ffmpeg.av_buffer_get_ref_count(mappedFrame->buf[0]) != 1) Dispose();
+            throw;
+        }
+        finally { if (mappedFrame != null) ffmpeg.av_frame_unref(mappedFrame); }
     }
 
     public IReadOnlyList<CodecPacket> Flush()
@@ -1001,7 +1440,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     public void Dispose()
     {
         if (converter != null) { ffmpeg.sws_freeContext(converter); converter = null; }
+        if (grayConverter != null) { ffmpeg.sws_freeContext(grayConverter); grayConverter = null; }
+        if (rgb332Converter != null) { ffmpeg.sws_freeContext(rgb332Converter); rgb332Converter = null; }
+        if (rgb565Converter != null) { ffmpeg.sws_freeContext(rgb565Converter); rgb565Converter = null; }
         var savedFrame = frame; frame = null; if (savedFrame != null) ffmpeg.av_frame_free(&savedFrame);
+        var savedMapped = mappedFrame; mappedFrame = null; if (savedMapped != null) ffmpeg.av_frame_free(&savedMapped);
         var savedPacket = packet; packet = null; if (savedPacket != null) ffmpeg.av_packet_free(&savedPacket);
         var savedContext = context; context = null; if (savedContext != null) ffmpeg.avcodec_free_context(&savedContext);
     }
@@ -1183,11 +1626,11 @@ sealed record DesktopCaptureStatistics(string Backend, int SourceWidth, int Sour
     int OutputWidth = 1280, int OutputHeight = 720, bool DesktopImageInSystemMemory = false,
     string SourceBindFlags = "", bool? DirectShaderResourceSupported = null);
 
-enum DesktopCapturePath { VideoProcessor, CpuSwscale, PixelShader, VideoProcessorLateRelease, NativeNoScale, DirectPixelShader }
+enum DesktopCapturePath { VideoProcessor, CpuSwscale, PixelShader, VideoProcessorLateRelease, NativeNoScale, DirectPixelShader, PixelShaderGray8, PixelShaderRgb332, PixelShaderRgb565, PixelShaderGray4 }
 
 sealed class DesktopCapture : IDisposable
 {
-    static readonly DesktopCapturePath[] DxgiPaths = [DesktopCapturePath.PixelShader, DesktopCapturePath.VideoProcessor];
+    static readonly DesktopCapturePath[] DxgiPaths = [DesktopCapturePath.NativeNoScale, DesktopCapturePath.PixelShader, DesktopCapturePath.VideoProcessor];
     readonly object gate = new();
     readonly int width, height, stretchMode;
     DxgiDesktopCapture? dxgi;
@@ -1229,6 +1672,34 @@ sealed class DesktopCapture : IDisposable
         }
     }
 
+    public MappedBgraFrame? CaptureMapped(bool allowUnchanged)
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (dxgi?.Path == DesktopCapturePath.NativeNoScale)
+            {
+                try { return dxgi.CaptureMapped(allowUnchanged); }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine($"[capture] Direct mapped capture failed; rebuilding desktop duplication: {error}");
+                    dxgi.Dispose(); dxgi = null;
+                    try { dxgi = new(width, height, DesktopCapturePath.NativeNoScale); return dxgi.CaptureMapped(allowUnchanged); }
+                    catch (Exception retryError)
+                    {
+                        Console.Error.WriteLine($"[capture] Direct mapped retry failed; using the next capture path: {retryError}");
+                        dxgi?.Dispose(); dxgi = null; pathIndex++;
+                        InitializeDxgi(retryError);
+                    }
+                }
+            }
+            var pixels = Capture();
+            if (!allowUnchanged && dxgi?.Statistics?.NewDesktopImage == false) return null;
+            var pin = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+            return new(pin.AddrOfPinnedObject(), width * 4, width, height, pin.Free);
+        }
+    }
+
     void InitializeDxgi(Exception? lastError = null)
     {
         while (pathIndex < DxgiPaths.Length)
@@ -1266,6 +1737,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     readonly int width, height;
     readonly DesktopCapturePath path;
     readonly bool probeDirectShaderResource;
+    readonly bool forceProcessUnchanged;
+    readonly int bytesPerPixel, rowBytes, renderWidth;
     int sourceWidth, sourceHeight;
     int contentWidth, contentHeight, contentLeft, contentTop;
     IDXGIAdapter1? adapter;
@@ -1292,15 +1765,28 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     readonly byte*[] cpuInputPlanes = new byte*[4], cpuOutputPlanes = new byte*[4];
     readonly int[] cpuInputStrides = new int[4], cpuOutputStrides = new int[4];
     byte[]? lastPixels;
+    bool stagingReady, borrowedMapped;
+    readonly bool reusePixelBuffer;
     bool? separateCursorVisible;
     bool desktopImageInSystemMemory;
     string sourceBindFlags = "";
     bool? directShaderResourceSupported;
     public DesktopCapturePath Path => path;
+    public int BytesPerPixel => bytesPerPixel;
+    public int BytesPerFrame => checked(rowBytes * height);
     public DesktopCaptureStatistics? Statistics { get; set; }
 
-    public DxgiDesktopCapture(int width, int height, DesktopCapturePath path = DesktopCapturePath.PixelShader, bool probeDirectShaderResource = false)
+    public DxgiDesktopCapture(int width, int height, DesktopCapturePath path = DesktopCapturePath.PixelShader, bool probeDirectShaderResource = false,
+        bool reusePixelBuffer = false, bool forceProcessUnchanged = false)
     {
+        this.reusePixelBuffer = reusePixelBuffer;
+        this.forceProcessUnchanged = forceProcessUnchanged;
+        bytesPerPixel = path is DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderGray4 ? 1
+            : path == DesktopCapturePath.PixelShaderRgb565 ? 2 : 4;
+        if (path == DesktopCapturePath.PixelShaderGray4 && (width & 1) != 0)
+            throw new ArgumentException("Packed Gray4 capture requires an even output width.", nameof(width));
+        rowBytes = path == DesktopCapturePath.PixelShaderGray4 ? width / 2 : checked(width * bytesPerPixel);
+        renderWidth = path == DesktopCapturePath.PixelShaderGray4 ? width / 2 : width;
         this.width = width; this.height = height; this.path = path; this.probeDirectShaderResource = probeDirectShaderResource;
         try
         {
@@ -1331,8 +1817,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             sourceWidth = checked((int)duplication.Description.ModeDescription.Width);
             sourceHeight = checked((int)duplication.Description.ModeDescription.Height);
             desktopImageInSystemMemory = duplication.Description.DesktopImageInSystemMemory;
-            if (path == DesktopCapturePath.NativeNoScale)
-            { width = sourceWidth; height = sourceHeight; this.width = width; this.height = height; }
+            if (path == DesktopCapturePath.NativeNoScale && (width != sourceWidth || height != sourceHeight))
+                throw new NotSupportedException($"Direct mapped capture needs native dimensions {sourceWidth}×{sourceHeight}, got {width}×{height}.");
             var scale = Math.Min(width / (double)sourceWidth, height / (double)sourceHeight);
             contentWidth = (int)Math.Round(sourceWidth * scale); contentHeight = (int)Math.Round(sourceHeight * scale);
             contentLeft = (width - contentWidth) / 2; contentTop = (height - contentHeight) / 2;
@@ -1350,12 +1836,14 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             {
                 if (path != DesktopCapturePath.DirectPixelShader)
                     desktop = device.CreateTexture2D(Texture(sourceWidth, sourceHeight, ResourceUsage.Default,
-                        path == DesktopCapturePath.PixelShader ? BindFlags.ShaderResource : BindFlags.None, CpuAccessFlags.None));
-                scaled = device.CreateTexture2D(Texture(width, height, ResourceUsage.Default, BindFlags.RenderTarget | BindFlags.ShaderResource, CpuAccessFlags.None));
-                staging = device.CreateTexture2D(Texture(width, height, ResourceUsage.Staging, BindFlags.None, CpuAccessFlags.Read));
+                        path is DesktopCapturePath.PixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4 ? BindFlags.ShaderResource : BindFlags.None, CpuAccessFlags.None));
+                var outputFormat = path is DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderGray4 ? Format.R8_UNorm
+                    : path == DesktopCapturePath.PixelShaderRgb565 ? Format.R16_UNorm : Format.B8G8R8A8_UNorm;
+                scaled = device.CreateTexture2D(Texture(renderWidth, height, ResourceUsage.Default, BindFlags.RenderTarget | BindFlags.ShaderResource, CpuAccessFlags.None, outputFormat));
+                staging = device.CreateTexture2D(Texture(renderWidth, height, ResourceUsage.Staging, BindFlags.None, CpuAccessFlags.Read, outputFormat));
                 clearView = device.CreateRenderTargetView(scaled);
             }
-            if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader) InitializePixelShader();
+            if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4) InitializePixelShader();
             if (path is DesktopCapturePath.VideoProcessor or DesktopCapturePath.VideoProcessorLateRelease)
             {
                 videoDevice = device.QueryInterface<ID3D11VideoDevice>(); videoContext = context.QueryInterface<ID3D11VideoContext>();
@@ -1390,12 +1878,13 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
         catch { Dispose(); throw; }
     }
 
-    static Texture2DDescription Texture(int width, int height, ResourceUsage usage, BindFlags bind, CpuAccessFlags cpu) => new()
-    { Width = (uint)width, Height = (uint)height, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm, SampleDescription = new(1, 0), Usage = usage, BindFlags = bind, CPUAccessFlags = cpu };
+    static Texture2DDescription Texture(int width, int height, ResourceUsage usage, BindFlags bind, CpuAccessFlags cpu,
+        Format format = Format.B8G8R8A8_UNorm) => new()
+    { Width = (uint)width, Height = (uint)height, MipLevels = 1, ArraySize = 1, Format = format, SampleDescription = new(1, 0), Usage = usage, BindFlags = bind, CPUAccessFlags = cpu };
 
     void InitializePixelShader()
     {
-        const string source = """
+        const string common = """
             Texture2D<float4> Desktop : register(t0);
             SamplerState LinearClamp : register(s0);
             struct Vertex { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -1405,8 +1894,15 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 output.Position = float4(output.Uv.x * 2 - 1, 1 - output.Uv.y * 2, 0, 1);
                 return output;
             }
-            float4 PS(Vertex input) : SV_Target { return float4(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, 1); }
             """;
+        var source = common + (path switch
+        {
+            DesktopCapturePath.PixelShaderGray8 => "float PS(Vertex input) : SV_Target { return dot(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, float3(0.2126, 0.7152, 0.0722)); }",
+            DesktopCapturePath.PixelShaderGray4 => "static const float Bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}; float PS(Vertex input) : SV_Target { uint sourceWidth, sourceHeight; Desktop.GetDimensions(sourceWidth, sourceHeight); float2 step = float2(0.5 / sourceWidth, 0); float left = dot(Desktop.SampleLevel(LinearClamp, input.Uv - step, 0).rgb, float3(0.2126, 0.7152, 0.0722)); float right = dot(Desktop.SampleLevel(LinearClamp, input.Uv + step, 0).rgb, float3(0.2126, 0.7152, 0.0722)); uint2 position = uint2(input.Position.xy); float biasLeft = (Bayer[(position.y & 3) * 4 + ((position.x * 2) & 3)] - 7.5) / 16.0; float biasRight = (Bayer[(position.y & 3) * 4 + ((position.x * 2 + 1) & 3)] - 7.5) / 16.0; uint first = (uint)clamp(floor(left * 15 + biasLeft + 0.5), 0, 15); uint second = (uint)clamp(floor(right * 15 + biasRight + 0.5), 0, 15); return (first * 16 + second) / 255.0; }",
+            DesktopCapturePath.PixelShaderRgb332 => "static const float Bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}; float PS(Vertex input) : SV_Target { float3 color = Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb; uint2 position = uint2(input.Position.xy); float bias = (Bayer[(position.y & 3) * 4 + (position.x & 3)] - 7.5) / 16.0; uint3 quantized = (uint3)clamp(floor(color * float3(7, 7, 3) + bias + 0.5), 0, float3(7, 7, 3)); uint packed = quantized.r * 32 + quantized.g * 4 + quantized.b; return packed / 255.0; }",
+            DesktopCapturePath.PixelShaderRgb565 => "float PS(Vertex input) : SV_Target { float3 color = Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb; uint3 quantized = (uint3)round(color * float3(31, 63, 31)); uint packed = quantized.r * 2048 + quantized.g * 32 + quantized.b; return packed / 65535.0; }",
+            _ => "float4 PS(Vertex input) : SV_Target { return float4(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, 1); }"
+        });
         vertexShader = device!.CreateVertexShader(CompileShader(source, "VS", "vs_5_0"));
         pixelShader = device.CreatePixelShader(CompileShader(source, "PS", "ps_5_0"));
         if (desktop != null) shaderInput = device.CreateShaderResourceView(desktop);
@@ -1451,7 +1947,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     {
         ObjectDisposedException.ThrowIf(duplication == null, this);
         var started = Stopwatch.GetTimestamp();
-        var result = duplication.AcquireNextFrame(lastPixels == null ? 1000u : 0u, out var info, out var resource);
+        if (borrowedMapped) throw new InvalidOperationException("Release the borrowed desktop frame before another capture.");
+        var result = duplication.AcquireNextFrame(stagingReady ? 0u : 1000u, out var info, out var resource);
         var acquired = Stopwatch.GetTimestamp();
         double desktopCopyMs = 0, releaseMs = 0, scaleMs = 0, readbackCopyMs = 0, mapMs = 0, allocationMs = 0, rowCopyMs = 0, unmapMs = 0, cpuScaleMs = 0;
         var changed = result.Success && (lastPixels == null || info.LastPresentTime != 0);
@@ -1489,12 +1986,14 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                             else if (path is DesktopCapturePath.CpuSwscale or DesktopCapturePath.NativeNoScale)
                             {
                                 context!.CopyResource(staging!, texture);
+                                stagingReady = true;
                                 readbackCopyMs = Stopwatch.GetElapsedTime(copyStarted).TotalMilliseconds;
                             }
                             else
                             {
                                 context!.CopyResource(desktop!, texture);
                                 desktopCopyMs = Stopwatch.GetElapsedTime(copyStarted).TotalMilliseconds;
+                                stagingReady = true;
                             }
                         }
                     }
@@ -1505,20 +2004,21 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 }
             }
             else if (result.Code != WaitTimeout) result.CheckError();
-            if (!changed)
+            if (!changed && lastPixels != null && !forceProcessUnchanged)
             {
-                if (lastPixels == null) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
                 ReleaseAcquiredFrame(); RecordStatistics(false);
                 return lastPixels;
             }
+            if (!changed && !stagingReady) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
             if (path is not (DesktopCapturePath.CpuSwscale or DesktopCapturePath.NativeNoScale))
             {
                 var scaleStarted = Stopwatch.GetTimestamp();
                 context!.ClearRenderTargetView(clearView!, new Color4(0, 0, 0, 1));
-                if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader)
+                if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4)
                 {
                     context.OMSetRenderTargets(clearView!);
-                    context.RSSetViewport(contentLeft, contentTop, contentWidth, contentHeight);
+                    context.RSSetViewport(path == DesktopCapturePath.PixelShaderGray4 ? contentLeft / 2 : contentLeft,
+                        contentTop, path == DesktopCapturePath.PixelShaderGray4 ? contentWidth / 2 : contentWidth, contentHeight);
                     context.RSSetState(rasterizer!);
                     context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                     context.VSSetShader(vertexShader!);
@@ -1540,7 +2040,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             try
             {
                 var allocationStarted = Stopwatch.GetTimestamp();
-                pixels = new byte[checked(width * height * 4)];
+                // Opt-in only for synchronous consumers that finish reading before the next capture.
+                pixels = reusePixelBuffer && lastPixels != null ? lastPixels : new byte[BytesPerFrame];
                 if (path == DesktopCapturePath.CpuSwscale) MemoryMarshal.Cast<byte, uint>(pixels.AsSpan()).Fill(0xff000000);
                 allocationMs = Stopwatch.GetElapsedTime(allocationStarted).TotalMilliseconds;
                 var rowCopyStarted = Stopwatch.GetTimestamp();
@@ -1558,7 +2059,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 else
                 {
                     for (var y = 0; y < height; y++)
-                        new ReadOnlySpan<byte>((void*)(map.DataPointer + (nint)(y * (long)map.RowPitch)), width * 4).CopyTo(pixels.AsSpan(y * width * 4, width * 4));
+                        new ReadOnlySpan<byte>((void*)(map.DataPointer + (nint)(y * (long)map.RowPitch)), rowBytes)
+                            .CopyTo(pixels.AsSpan(y * rowBytes, rowBytes));
                     rowCopyMs = Stopwatch.GetElapsedTime(rowCopyStarted).TotalMilliseconds;
                 }
             }
@@ -1570,7 +2072,7 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             }
             lastPixels = pixels;
             ReleaseAcquiredFrame();
-            RecordStatistics(true);
+            RecordStatistics(changed);
             return pixels;
         }
         finally { ReleaseAcquiredFrame(); }
@@ -1602,8 +2104,66 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
         }
     }
 
+    public MappedBgraFrame? CaptureMapped(bool allowUnchanged)
+    {
+        ObjectDisposedException.ThrowIf(duplication == null, this);
+        if (path != DesktopCapturePath.NativeNoScale) throw new NotSupportedException("Mapped input requires native-size DDA capture.");
+        if (borrowedMapped) throw new InvalidOperationException("Release the borrowed desktop frame before another capture.");
+        var started = Stopwatch.GetTimestamp();
+        var result = duplication.AcquireNextFrame(stagingReady ? 0u : 1000u, out var info, out var resource);
+        var acquired = Stopwatch.GetTimestamp();
+        var changed = result.Success && (!stagingReady || info.LastPresentTime != 0);
+        var copyMs = 0d;
+        try
+        {
+            if (result.Success)
+            {
+                using (resource)
+                {
+                    if (info.LastMouseUpdateTime != 0) separateCursorVisible = info.PointerPosition.Visible;
+                    if (changed)
+                    {
+                        using var texture = resource.QueryInterface<ID3D11Texture2D>();
+                        if (texture.Description.Width != sourceWidth || texture.Description.Height != sourceHeight)
+                            throw new InvalidOperationException("Desktop dimensions changed; recreate duplication.");
+                        var copyStart = Stopwatch.GetTimestamp();
+                        context!.CopyResource(staging!, texture);
+                        copyMs = Stopwatch.GetElapsedTime(copyStart).TotalMilliseconds;
+                        stagingReady = true;
+                        lastPixels = null;
+                    }
+                }
+            }
+            else if (result.Code != WaitTimeout) result.CheckError();
+        }
+        finally { if (result.Success) duplication.ReleaseFrame().CheckError(); }
+        if (!changed && !allowUnchanged) return null;
+        if (!stagingReady) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
+        var mapStart = Stopwatch.GetTimestamp();
+        var mapped = context!.Map(staging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        borrowedMapped = true;
+        var mapMs = Stopwatch.GetElapsedTime(mapStart).TotalMilliseconds;
+        Statistics = new("DXGI", sourceWidth, sourceHeight, changed,
+            Stopwatch.GetElapsedTime(started, acquired).TotalMilliseconds, copyMs + mapMs,
+            separateCursorVisible, "Separate hardware cursor excluded; an OS-composited cursor may already be part of the desktop texture.",
+            ReadbackCopySubmitMs: copyMs, MapWaitAndReadbackMs: mapMs,
+            TotalCaptureMs: Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            CapturePath: path.ToString(), SourcePresentAgeMs: info.LastPresentTime == 0 ? 0 : Stopwatch.GetElapsedTime(info.LastPresentTime).TotalMilliseconds,
+            AccumulatedFrames: info.AccumulatedFrames, OutputWidth: width, OutputHeight: height,
+            DesktopImageInSystemMemory: desktopImageInSystemMemory);
+        return new(mapped.DataPointer, checked((int)mapped.RowPitch), width, height, ReleaseMapped);
+    }
+
+    void ReleaseMapped()
+    {
+        if (!borrowedMapped) return;
+        context!.Unmap(staging!, 0);
+        borrowedMapped = false;
+    }
+
     public void Dispose()
     {
+        ReleaseMapped();
         outputView?.Dispose(); inputView?.Dispose(); clearView?.Dispose(); staging?.Dispose(); scaled?.Dispose(); desktop?.Dispose();
         vertexShader?.Dispose(); pixelShader?.Dispose(); shaderInput?.Dispose(); sampler?.Dispose(); rasterizer?.Dispose();
         if (cpuScaler != null) Ffmpeg.sws_freeContext(cpuScaler);
@@ -2107,6 +2667,8 @@ static partial class FfmpegUi
     {
         const double OrbSize = 50, ChromeMargin = 12;
         readonly Button fullScreen = new() { Name = "FullScreen", Content = "全屏", Padding = new Thickness(10, 4) };
+        readonly Button reconnect = new() { Name = "Reconnect", Content = "重新建立会话", IsVisible = false,
+            Padding = new Thickness(8, 2), Margin = new Thickness(8, 0, 0, 0) };
         readonly CheckBox showWatermark = new() { Name = "ShowWatermark", Content = "诊断水印", IsChecked = true };
         readonly Button floatingOrb = new()
         {
@@ -2128,10 +2690,9 @@ static partial class FfmpegUi
         void BuildControls()
         {
             overlay.FontSize = 12;
-            presets.MinHeight = transmissionScale.MinHeight = 28;
-            presets.Height = transmissionScale.Height = double.NaN;
+            presets.MinHeight = 28;
+            presets.Height = double.NaN;
             presets.MinWidth = 130;
-            transmissionScale.Width = 110;
             bitrate.VerticalAlignment = VerticalAlignment.Center;
             controlTitle.Text = "编码预设"; controlTitle.FontSize = 11; controlTitle.Opacity = .75;
             inputEnabled.Content = "键鼠"; inputEnabled.Margin = new Thickness(0);
@@ -2145,32 +2706,38 @@ static partial class FfmpegUi
             ToolTip.SetTip(packetDiagnostics, "主控切换独立诊断包；关闭后跨机延迟不可测");
             ToolTip.SetTip(clipboardEnabled, clipboardMessage);
 
-            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,110,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
+            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
             controls.Children.Add(controlTitle);
-            var scaleTitle = new TextBlock { Text = "传输比例", FontSize = 11, Opacity = .75 };
             Grid.SetColumn(bitrateLabel, 2); controls.Children.Add(bitrateLabel);
-            Grid.SetColumn(scaleTitle, 4); controls.Children.Add(scaleTitle);
             Grid.SetRow(presets, 2); controls.Children.Add(presets);
             Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 2); controls.Children.Add(bitrate);
-            Grid.SetColumn(transmissionScale, 4); Grid.SetRow(transmissionScale, 2); controls.Children.Add(transmissionScale);
-            Grid.SetColumn(fullScreen, 6); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
-            Grid.SetColumn(collapse, 8); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
+            Grid.SetColumn(fullScreen, 4); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
+            Grid.SetColumn(collapse, 6); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
             Add(details, controls, 0);
-            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale =>
-                new ComboBoxItem { Content = scale == 1 ? "1× 原始" : $"{scale}×", Tag = scale }).ToArray();
-            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
-            ToolTip.SetTip(transmissionScale, "传输分辨率比例，与窗口缩放无关");
+            presetMenu.CornerRadius = new CornerRadius(4);
+            presetMenu.Margin = new Thickness(0, 5, 0, 0);
+            Add(details, presetMenu, 1);
             var options = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 4) };
             foreach (var check in new[] { inputEnabled, clipboardEnabled, showWatermark, packetDiagnostics })
             {
                 check.FontSize = 12; check.MinHeight = 24; check.Margin = new Thickness(0, 0, 16, 0);
                 options.Children.Add(check);
             }
-            Add(details, options, 1);
+            options.Children.Add(new TextBlock { Text = "FPS", VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 5, 0), Opacity = .75 });
+            foreach (var button in fpsButtons)
+            {
+                button.Margin = new Thickness(0, 0, 3, 0);
+                options.Children.Add(button);
+            }
+            Add(details, options, 2);
             operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
             operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
             operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
-            Add(details, operation, 2);
+            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto") };
+            connectionRow.Children.Add(operation);
+            Grid.SetColumn(reconnect, 1); connectionRow.Children.Add(reconnect);
+            Add(details, connectionRow, 3);
             controlPanel.Child = details;
             chromeRoot.Children.Add(controlPanel); chromeRoot.Children.Add(floatingOrb);
             overlay.Content = chromeRoot;
@@ -2186,7 +2753,7 @@ static partial class FfmpegUi
             };
             summary.FontSize = 12; diagnosticBody.Children.Add(summary);
             metrics.FontSize = 11; metrics.Margin = new Thickness(0, 3, 0, 4);
-            metrics.Text = "正在启动真实捕获与 FFmpeg…"; diagnosticBody.Children.Add(metrics);
+            metrics.Text = "正在启动真实捕获与编解码…"; diagnosticBody.Children.Add(metrics);
             diagnosticBody.Children.Add(new TextBlock { Text = "分层耗时：最近 / 近 1 秒平均（ms）", Opacity = .8 });
             var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
             for (var i = 0; i < timings.Length; i++)
@@ -2206,6 +2773,15 @@ static partial class FfmpegUi
             overlay.Deactivated += (_, _) => fullScreenKeyHeld = false;
             showWatermark.IsCheckedChanged += (_, _) => SyncChromeVisibility();
             floatingOrb.Click += (_, _) => ToggleDetails();
+            ToolTip.SetTip(presets, "单击展开控制栏内的预设列表；也可用键盘选择");
+            presets.AddHandler(PointerReleasedEvent, (_, args) =>
+            {
+                if (args.GetCurrentPoint(presets).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonReleased) return;
+                presets.IsDropDownOpen = false;
+                presetMenu.IsVisible = !presetMenu.IsVisible;
+                PositionOverlay();
+                args.Handled = true;
+            }, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerPressedEvent, BeginOrbDrag, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerMovedEvent, ContinueOrbDrag, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerReleasedEvent, EndOrbDrag, RoutingStrategies.Tunnel);
@@ -2218,6 +2794,33 @@ static partial class FfmpegUi
             };
         }
 
+        void RebuildPresetMenu()
+        {
+            var choices = new StackPanel { Spacing = 2, Margin = new Thickness(4) };
+            foreach (var item in presets.Items.OfType<ComboBoxItem>())
+            {
+                var choice = new Button
+                {
+                    Content = item.Content, Tag = item.Tag, IsEnabled = item.IsEnabled,
+                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    MinHeight = 27, Padding = new Thickness(8, 3),
+                    Background = Brushes.Transparent, BorderBrush = Brushes.Transparent, BorderThickness = new Thickness(0)
+                };
+                choice.PointerEntered += (_, _) => choice.Background = new SolidColorBrush(Color.Parse(
+                    ActualThemeVariant == ThemeVariant.Dark ? "#334D5A69" : "#E8EDF3"));
+                choice.PointerExited += (_, _) => choice.Background = Brushes.Transparent;
+                choice.Click += (_, _) =>
+                {
+                    presets.SelectedItem = item;
+                    presetMenu.IsVisible = false;
+                    PositionOverlay();
+                };
+                choices.Children.Add(choice);
+            }
+            presetMenu.Child = new ScrollViewer { Content = choices, MaxHeight = 220, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        }
+
         void ApplyChromeColors()
         {
             var dark = ActualThemeVariant == ThemeVariant.Dark;
@@ -2225,6 +2828,9 @@ static partial class FfmpegUi
             overlay.Foreground = new SolidColorBrush(Color.Parse(dark ? "#EDF0F3" : "#20252B"));
             controlPanel.Background = new SolidColorBrush(Color.Parse(dark ? "#222529" : "#FAFAFA"));
             controlPanel.BorderBrush = new SolidColorBrush(Color.Parse(dark ? "#484E56" : "#D7DCE1"));
+            presetMenu.Background = controlPanel.Background;
+            presetMenu.BorderBrush = controlPanel.BorderBrush;
+            presetMenu.BorderThickness = new Thickness(1);
         }
 
         void HandleLocalKeyDown(object? sender, KeyEventArgs args)
@@ -2354,6 +2960,114 @@ static partial class FfmpegUi
     }
 }
 
+// Source: FfmpegCpuCodecs.cs
+sealed class VideoEncoder : IDisposable
+{
+    readonly FfmpegEncoder ffmpeg;
+    readonly CapturePixelMode pixelMode;
+    public string Name => ffmpeg.Name;
+    public bool SupportsMappedBgra => pixelMode == CapturePixelMode.Bgra && ffmpeg.SupportsMappedBgra;
+    public bool HasBitrateCap => true;
+
+    public VideoEncoder(string arguments, int width, int height, int fps, int bitrateKbps,
+        CapturePixelMode pixelMode = CapturePixelMode.Bgra)
+    {
+        this.pixelMode = pixelMode;
+        ffmpeg = new(arguments, width, height, fps, bitrateKbps);
+    }
+
+    public bool SetBitrate(int bitrateKbps) => ffmpeg.SetBitrate(bitrateKbps);
+    public IReadOnlyList<CodecPacket> Encode(byte[] bgra, long pts, bool keyframe) => pixelMode switch
+    {
+        CapturePixelMode.Rgb332 => ffmpeg.EncodeQuantized(bgra, false, pts, keyframe),
+        CapturePixelMode.Rgb565 => ffmpeg.EncodeRgb565(bgra, pts, keyframe),
+        CapturePixelMode.Gray8 => ffmpeg.EncodeQuantized(bgra, true, pts, keyframe),
+        CapturePixelMode.Gray4 => ffmpeg.EncodeGray4(bgra, pts, keyframe),
+        _ => ffmpeg.Encode(bgra, pts, keyframe)
+    };
+    public IReadOnlyList<CodecPacket> EncodeMapped(MappedBgraFrame bgra, long pts, bool keyframe) =>
+        ffmpeg.EncodeMapped(bgra, pts, keyframe);
+    public void Dispose() => ffmpeg.Dispose();
+}
+
+sealed class VideoDecoder : IDisposable
+{
+    readonly FfmpegDecoder ffmpeg;
+    public VideoDecoder(string arguments) => ffmpeg = new(arguments);
+    public IReadOnlyList<DecodedPixels> Decode(byte[] compressed, long pts) => ffmpeg.Decode(compressed, pts);
+    public void Dispose() => ffmpeg.Dispose();
+}
+
+// Source: FfmpegCpuRegression.cs
+static class CpuPresetRegression
+{
+    public static async Task Run(AppConfiguration config, string reportPath)
+    {
+        if (!config.Presets.TryGetValue("h264_rgb_fast", out var preset))
+            throw new InvalidDataException("CPU regression needs h264_rgb_fast preset.");
+        var synthetic = new byte[640 * 360 * 4];
+        Random.Shared.NextBytes(synthetic);
+        const int paddedStride = 640 * 4 + 64;
+        var padded = new byte[paddedStride * 360];
+        for (var row = 0; row < 360; row++)
+            synthetic.AsSpan(row * 640 * 4, 640 * 4).CopyTo(padded.AsSpan(row * paddedStride));
+        using (var encoder = new VideoEncoder(preset.EncoderArguments, 640, 360, 30, 2000))
+        using (var decoder = new VideoDecoder(preset.DecoderArguments))
+        {
+            var pin = System.Runtime.InteropServices.GCHandle.Alloc(padded, System.Runtime.InteropServices.GCHandleType.Pinned);
+            using var mapped = new MappedBgraFrame(pin.AddrOfPinnedObject(), paddedStride, 640, 360, pin.Free);
+            var packet = encoder.EncodeMapped(mapped, 0, true).Single();
+            var decoded = decoder.Decode(packet.Data, packet.Pts).Single();
+            if (decoded.Width != 640 || decoded.Height != 360 || decoded.Bgra.Length != synthetic.Length)
+                throw new InvalidDataException("Borrowed x264rgb frame did not decode at the source dimensions.");
+        }
+        using var capture = new DesktopStreamSource(1);
+        var active = config with { InitialPreset = "h264_rgb_fast", InitialBitrateKbps = 2000,
+            Width = capture.Width, Height = capture.Height };
+        using var session = new DemoSession(active, capture.Capture, capture.Resize, capture.SourceWidth,
+            capture.SourceHeight, capture.CaptureMapped);
+        var received = new List<(int Width, int Height, long Pts)>();
+        var gate = new object();
+        session.FrameReceived += frame => { lock (gate) received.Add((frame.Width, frame.Height, frame.Pts)); };
+        await session.StartAsync();
+        var timeout = Stopwatch.StartNew();
+        while (true)
+        {
+            lock (gate) if (received.Count > 0) break;
+            if (timeout.Elapsed > TimeSpan.FromSeconds(8)) throw new TimeoutException("CPU preset delivered no frames.");
+            await Task.Delay(25);
+        }
+        var stats = capture.Statistics;
+        if (stats?.CapturePath != "NativeNoScale" || stats.CpuRowCopyMs != 0)
+            throw new InvalidDataException("x264rgb did not use a native-size mapped DDA frame without an application row copy.");
+        foreach (var fps in new[] { 10, 20, 30, 60 })
+        {
+            var result = await session.ApplyAsync("h264_rgb_fast", 2000, framesPerSecond: fps);
+            if (!result.Success || result.FramesPerSecond != fps || session.Configuration.FramesPerSecond != fps)
+                throw new InvalidDataException($"Runtime FPS change to {fps} did not apply: {result.Message}");
+            timeout.Restart();
+            while (session.DecodedGeneration < result.Generation)
+            {
+                if (timeout.Elapsed > TimeSpan.FromSeconds(8))
+                    throw new TimeoutException($"No decoded frame after switching to {fps} FPS.");
+                await Task.Delay(25);
+            }
+        }
+        await session.StopAsync();
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(reportPath))!);
+        File.WriteAllText(reportPath, JsonSerializer.Serialize(new
+        {
+            Passed = true, Capture = "DDA native-size staging Map; no application pixel row copy",
+            CaptureSize = new { capture.SourceWidth, capture.SourceHeight },
+            X264Rgb = new { stats.CapturePath, stats.CpuRowCopyMs },
+            RuntimeFpsSwitches = new[] { 10, 20, 30, 60 },
+            UdpFrames = received.Count,
+            Scope = "Synthetic x264rgb codec roundtrip plus real desktop frame through localhost UDP, decoder and session callback; display scan-out is not tested."
+        }, AppConfiguration.JsonOptions));
+        Console.WriteLine("CPU preset regression PASS: " + Path.GetFullPath(reportPath));
+    }
+}
+
 // Source: FfmpegCursor.cs
 public sealed record CursorShape(int Width, int Height, int HotX, int HotY, byte[] Color, byte[] Mask);
 public sealed record CursorUpdate(long Id, bool Visible, double X, double Y, CursorShape? Shape = null, bool Reset = false);
@@ -2386,30 +3100,41 @@ public static class CursorWire
         nint previousHandle = 0;
         var bounds = Win32InputInjector.ReadPrimaryMonitor();
         using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(16));
+        bool cursorUnavailable = false;
         do
         {
-            var state = NativeCursor.ReadState();
-            CursorShape? shape = null;
-            var reset = false;
-            var id = previous?.Id ?? 0;
-            if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
+            try
             {
-                shape = NativeCursor.ReadShape(state.Handle);
-                var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
-                if (known.TryGetValue(fingerprint, out id)) shape = null;
-                else
+                var state = NativeCursor.ReadState();
+                CursorShape? shape = null;
+                var reset = false;
+                var id = previous?.Id ?? 0;
+                if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
                 {
-                    if (known.Count >= 64) { known.Clear(); reset = true; }
-                    id = ++nextId; known[fingerprint] = id;
+                    shape = NativeCursor.ReadShape(state.Handle);
+                    var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
+                    if (known.TryGetValue(fingerprint, out id)) shape = null;
+                    else
+                    {
+                        if (known.Count >= 64) { known.Clear(); reset = true; }
+                        id = ++nextId; known[fingerprint] = id;
+                    }
                 }
+                if (state.Handle == 0) id = 0;
+                var update = new CursorUpdate(id, state.Visible, (state.X - bounds.Left) / (double)Math.Max(1, bounds.Width - 1),
+                    (state.Y - bounds.Top) / (double)Math.Max(1, bounds.Height - 1), shape, reset);
+                if (previous == null || update.Id != previous.Id || update.Visible != previous.Visible || update.X != previous.X || update.Y != previous.Y || shape != null)
+                    await WriteAsync(client.GetStream(), update, token);
+                previous = update;
+                previousHandle = state.Handle;
+                if (cursorUnavailable) Console.Error.WriteLine("[cursor] Desktop cursor access restored.");
+                cursorUnavailable = false;
             }
-            if (state.Handle == 0) id = 0;
-            var update = new CursorUpdate(id, state.Visible, (state.X - bounds.Left) / (double)Math.Max(1, bounds.Width - 1),
-                (state.Y - bounds.Top) / (double)Math.Max(1, bounds.Height - 1), shape, reset);
-            if (previous == null || update.Id != previous.Id || update.Visible != previous.Visible || update.X != previous.X || update.Y != previous.Y || shape != null)
-                await WriteAsync(client.GetStream(), update, token);
-            previous = update;
-            previousHandle = state.Handle;
+            catch (Win32Exception error)
+            {
+                if (!cursorUnavailable) Console.Error.WriteLine("[cursor] Desktop cursor temporarily unavailable: " + error);
+                cursorUnavailable = true;
+            }
         } while (await timer.WaitForNextTickAsync(token));
     }
 }
@@ -2528,48 +3253,314 @@ public static class NativeCursor
 }
 
 // Source: FfmpegDesktopSource.cs
+enum CapturePixelMode { Bgra, Rgb332, Rgb565, Gray8, Gray4 }
+
+static class CapturePixelModes
+{
+    public static CapturePixelMode Parse(string mode) => mode switch
+    {
+        "bgra" => CapturePixelMode.Bgra,
+        "rgb332" => CapturePixelMode.Rgb332,
+        "rgb565" => CapturePixelMode.Rgb565,
+        "gray8" => CapturePixelMode.Gray8,
+        "gray4" => CapturePixelMode.Gray4,
+        _ => throw new ArgumentException($"Unsupported inputPixelMode '{mode}'. Expected bgra, rgb332, rgb565, gray8 or gray4.")
+    };
+
+    public static DesktopCapturePath CapturePath(CapturePixelMode mode) => mode switch
+    {
+        CapturePixelMode.Rgb332 => DesktopCapturePath.PixelShaderRgb332,
+        CapturePixelMode.Rgb565 => DesktopCapturePath.PixelShaderRgb565,
+        CapturePixelMode.Gray8 => DesktopCapturePath.PixelShaderGray8,
+        CapturePixelMode.Gray4 => DesktopCapturePath.PixelShaderGray4,
+        _ => throw new ArgumentException("BGRA uses the standard desktop capture path.", nameof(mode))
+    };
+}
+
 public static class TransmissionGeometry
 {
-    public static bool IsValidScale(double scale) => scale is 1 or .75 or .5;
+    public static bool IsValidScale(double scale) => scale == 1;
     public static void ValidateScale(double scale)
     {
-        if (!IsValidScale(scale)) throw new ArgumentOutOfRangeException(nameof(scale), "Transmission scale must be 1, 0.75 or 0.5.");
+        if (!IsValidScale(scale)) throw new ArgumentOutOfRangeException(nameof(scale), "Transmission scale must be 1.");
     }
     public static (int Width, int Height) Dimensions(int width, int height, double scale)
     {
         ValidateScale(scale);
         if (width < 64 || height < 64 || width > 8192 || height > 8192) throw new ArgumentOutOfRangeException(nameof(width));
-        return (Math.Max(2, (int)(width * scale) & ~1), Math.Max(2, (int)(height * scale) & ~1));
+        return (width & ~1, height & ~1);
     }
 }
 
 sealed class DesktopStreamSource : IDisposable
 {
     readonly object gate = new();
-    DesktopCapture capture;
-    int width, height;
-    public int SourceWidth { get; }
-    public int SourceHeight { get; }
+    readonly SecureDesktopFrames? secure;
+    DesktopCapture? capture;
+    DxgiDesktopCapture? packedCapture;
+    CapturePixelMode pixelMode;
+    bool disposed;
+    bool secureWasActive;
+    long secureFailureStarted;
+    int width, height, sourceWidth, sourceHeight;
+    public int SourceWidth { get { lock (gate) return sourceWidth; } }
+    public int SourceHeight { get { lock (gate) return sourceHeight; } }
     public int Width { get { lock (gate) return width; } }
     public int Height { get { lock (gate) return height; } }
-    public DesktopCaptureStatistics? Statistics { get { lock (gate) return capture.Statistics; } }
-    public string Backend { get { lock (gate) return capture.Backend; } }
-    public DesktopStreamSource(double scale)
+    public DesktopCaptureStatistics? Statistics { get { lock (gate) return packedCapture?.Statistics ?? capture?.Statistics; } }
+    public bool WaitingForSecureTransition { get { lock (gate) return secureFailureStarted != 0; } }
+    public bool SecureActive { get { lock (gate) return secure?.Active == true; } }
+    public string Backend { get { lock (gate) return secure?.Active == true ? "SYSTEM Winlogon capture → loopback UDP" :
+        packedCapture == null ? capture?.Backend ?? "未初始化" : $"DXGI Desktop Duplication + {packedCapture.Path}"; } }
+    public DesktopStreamSource(double scale, bool secureDesktop = false)
     {
         var bounds = Win32InputInjector.ReadPrimaryMonitor();
-        SourceWidth = bounds.Width; SourceHeight = bounds.Height;
-        (width, height) = TransmissionGeometry.Dimensions(SourceWidth, SourceHeight, scale);
+        sourceWidth = bounds.Width; sourceHeight = bounds.Height;
+        (width, height) = TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
         capture = new(Width, Height);
+        if (secureDesktop) secure = SecureDesktopFrames.TryStart();
     }
-    public byte[] Capture() { lock (gate) return capture.Capture(); }
+    public byte[] Capture()
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (secure is { } source)
+            {
+                var frame = source.Take();
+                if (frame.Active)
+                {
+                    secureWasActive = true; secureFailureStarted = 0;
+                    if (frame.Pixels == null) return null!;
+                    var pixels = NativeSecure(frame.Pixels, frame.Width, frame.Height);
+                    return ConvertSecure(pixels, pixelMode, width, height);
+                }
+            }
+            try
+            {
+                RestoreOrdinaryDesktop();
+                var pixels = packedCapture?.Capture() ?? capture?.Capture() ?? throw new InvalidOperationException("Desktop capture is unavailable.");
+                secureFailureStarted = 0;
+                return pixels;
+            }
+            catch (Exception error) when (WaitForSecureTransition(error)) { return null!; }
+        }
+    }
+    public MappedBgraFrame? CaptureMapped(bool allowUnchanged)
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (secure is { } source)
+            {
+                var shared = source.TakeSharedMapped(allowUnchanged);
+                if (shared.Active)
+                {
+                    secureWasActive = true; secureFailureStarted = 0;
+                    if (shared.Frame == null) return null;
+                    SetSecureSize(shared.Width, shared.Height);
+                    return new(shared.Frame.Pixels, shared.Width * 4, shared.Width, shared.Height, shared.Frame.Dispose);
+                }
+                var frame = source.Take(allowUnchanged);
+                if (frame.Active)
+                {
+                    secureWasActive = true; secureFailureStarted = 0;
+                    if (frame.Pixels == null) return null;
+                    var pixels = NativeSecure(frame.Pixels, frame.Width, frame.Height);
+                    var pin = System.Runtime.InteropServices.GCHandle.Alloc(pixels,
+                        System.Runtime.InteropServices.GCHandleType.Pinned);
+                    return new(pin.AddrOfPinnedObject(), width * 4, width, height, pin.Free);
+                }
+            }
+            try
+            {
+                RestoreOrdinaryDesktop();
+                if (packedCapture != null) throw new InvalidOperationException("Packed capture cannot be passed as BGRA mapped pixels.");
+                if (capture == null) throw new InvalidOperationException("Mapped desktop capture is unavailable.");
+                var mapped = capture.CaptureMapped(allowUnchanged);
+                secureFailureStarted = 0;
+                return mapped;
+            }
+            catch (Exception error) when (WaitForSecureTransition(error)) { return null; }
+        }
+    }
+
+    byte[] NativeSecure(byte[] pixels, int frameWidth, int frameHeight)
+    {
+        SetSecureSize(frameWidth, frameHeight);
+        return pixels;
+    }
+
+    void SetSecureSize(int frameWidth, int frameHeight)
+    {
+        if (frameWidth != width || frameHeight != height)
+        {
+            width = frameWidth; height = frameHeight;
+            Console.Error.WriteLine($"[secure capture] Native frame size changed to {width}x{height}; no scaling.");
+        }
+        sourceWidth = frameWidth; sourceHeight = frameHeight;
+    }
+
+    void RestoreOrdinaryDesktop()
+    {
+        if (!secureWasActive) return;
+        var bounds = Win32InputInjector.ReadPrimaryMonitor();
+        sourceWidth = bounds.Width; sourceHeight = bounds.Height;
+        var dimensions = TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, 1);
+        Reconfigure(pixelMode, dimensions.Width, dimensions.Height);
+        secureWasActive = false;
+        Console.Error.WriteLine("[capture] Ordinary desktop restored after secure desktop.");
+    }
+
+    bool WaitForSecureTransition(Exception error)
+    {
+        if (secure == null) return false;
+        if (!secureWasActive)
+        {
+            try
+            {
+                var bounds = Win32InputInjector.ReadPrimaryMonitor();
+                if (bounds.Width != sourceWidth || bounds.Height != sourceHeight)
+                {
+                    sourceWidth = bounds.Width; sourceHeight = bounds.Height;
+                    var dimensions = TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, 1);
+                    Reconfigure(pixelMode, dimensions.Width, dimensions.Height);
+                    Console.Error.WriteLine($"[capture] Display resolution changed to {width}x{height}.");
+                }
+            }
+            catch (Exception refreshError) { Console.Error.WriteLine("[capture] Resolution refresh failed: " + refreshError); }
+        }
+        var now = Stopwatch.GetTimestamp();
+        if (secureFailureStarted == 0)
+        {
+            secureFailureStarted = now;
+            Console.Error.WriteLine("[capture] Waiting for secure desktop transition: " + error);
+        }
+        return true;
+    }
+
+    static byte[] ConvertSecure(byte[] bgra, CapturePixelMode mode, int width, int height)
+    {
+        if (mode == CapturePixelMode.Bgra) return bgra;
+        var pixels = checked(width * height);
+        var packed = new byte[mode == CapturePixelMode.Rgb565 ? pixels * 2 :
+            mode == CapturePixelMode.Gray4 ? pixels / 2 : pixels];
+        for (var index = 0; index < pixels; index++)
+        {
+            var source = index * 4;
+            var blue = bgra[source]; var green = bgra[source + 1]; var red = bgra[source + 2];
+            switch (mode)
+            {
+                case CapturePixelMode.Rgb332:
+                    packed[index] = (byte)((red * 7 / 255 << 5) | (green * 7 / 255 << 2) | blue * 3 / 255);
+                    break;
+                case CapturePixelMode.Rgb565:
+                    var rgb = (red * 31 / 255 << 11) | (green * 63 / 255 << 5) | blue * 31 / 255;
+                    packed[index * 2] = (byte)rgb; packed[index * 2 + 1] = (byte)(rgb >> 8);
+                    break;
+                case CapturePixelMode.Gray8:
+                    packed[index] = (byte)((red * 77 + green * 150 + blue * 29) >> 8);
+                    break;
+                case CapturePixelMode.Gray4:
+                    var gray = (red * 77 + green * 150 + blue * 29) >> 8;
+                    if ((index & 1) == 0) packed[index / 2] = (byte)((gray >> 4) << 4);
+                    else packed[index / 2] |= (byte)(gray >> 4);
+                    break;
+            }
+        }
+        return packed;
+    }
+
+    public void SetPixelMode(CapturePixelMode mode)
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (pixelMode == mode) return;
+            if (secureWasActive)
+            {
+                pixelMode = mode;
+                Console.Error.WriteLine($"[capture] Secure desktop pixel mode changed to {mode}.");
+                return;
+            }
+            Reconfigure(mode, width, height);
+            Console.Error.WriteLine($"[capture] Pixel mode changed to {mode}; {width}x{height}.");
+        }
+    }
     public void Resize(int width, int height)
     {
-        var replacement = new DesktopCapture(width, height);
-        try { replacement.Capture(); }
-        catch { replacement.Dispose(); throw; }
-        lock (gate) { var previous = capture; capture = replacement; this.width = width; this.height = height; previous.Dispose(); }
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (this.width == width && this.height == height) return;
+            Reconfigure(pixelMode, width, height);
+            Console.Error.WriteLine($"[capture] Output resized to {width}x{height}; {pixelMode}.");
+        }
     }
-    public void Dispose() { lock (gate) capture.Dispose(); }
+
+    void Reconfigure(CapturePixelMode mode, int targetWidth, int targetHeight)
+    {
+        var originalMode = pixelMode;
+        var originalWidth = width;
+        var originalHeight = height;
+        ReleaseActive();
+        try
+        {
+            Initialize(mode, targetWidth, targetHeight);
+            pixelMode = mode;
+            width = targetWidth;
+            height = targetHeight;
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine($"[capture] Reconfigure {mode} {targetWidth}x{targetHeight} failed: {error}");
+            ReleaseActive();
+            try { Initialize(originalMode, originalWidth, originalHeight); }
+            catch (Exception restoreError)
+            {
+                Console.Error.WriteLine($"[capture] Restore {originalMode} {originalWidth}x{originalHeight} failed: {restoreError}");
+                throw new AggregateException("Capture reconfiguration and restoration both failed.", error, restoreError);
+            }
+            throw;
+        }
+    }
+
+    void Initialize(CapturePixelMode mode, int targetWidth, int targetHeight)
+    {
+        if (mode == CapturePixelMode.Bgra)
+        {
+            var replacement = new DesktopCapture(targetWidth, targetHeight);
+            try { replacement.Capture(); capture = replacement; }
+            catch { replacement.Dispose(); throw; }
+        }
+        else
+        {
+            var replacement = new DxgiDesktopCapture(targetWidth, targetHeight, CapturePixelModes.CapturePath(mode), reusePixelBuffer: true);
+            try { replacement.Capture(); packedCapture = replacement; }
+            catch { replacement.Dispose(); throw; }
+        }
+    }
+
+    void ReleaseActive()
+    {
+        var standard = capture;
+        var packed = packedCapture;
+        capture = null;
+        packedCapture = null;
+        packed?.Dispose();
+        standard?.Dispose();
+    }
+
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            disposed = true;
+            secure?.Dispose();
+            ReleaseActive();
+        }
+    }
 }
 
 // Source: FfmpegDiagnostics.cs
@@ -2693,6 +3684,283 @@ public sealed class UdpFrameDiagnosticsReceiver : IDisposable
         socket.Dispose();
         if (worker != Thread.CurrentThread && !worker.Join(1500)) VideoDatagram.Log("Diagnostic callback is still finishing after shutdown.");
         else stop.Dispose();
+    }
+}
+
+// Source: FfmpegGpuPreReadbackRegression.cs
+static class GpuPreReadbackRegression
+{
+    sealed record Timing(double MeanMs, double P95Ms, double MaxMs);
+    sealed record RouteResult(string Name, int Width, int Height, int BytesPerPixel, int RawBytes,
+        bool Complete, bool Under10Ms, Timing? CaptureToCpu, Timing? Acquire, Timing? DesktopCopySubmit,
+        Timing? GpuTransformSubmit, Timing? ReadbackCopySubmit, Timing? MapWait, Timing? CpuRowCopy,
+        string? FrameHash, int DistinctByteValues, string? Error);
+
+    public static int Run(string output)
+    {
+        var bounds = Win32InputInjector.ReadPrimaryMonitor();
+        var width = bounds.Width & ~1;
+        var height = bounds.Height & ~1;
+        var routes = new (string Name, DesktopCapturePath Path, int Width, int Height)[]
+        {
+            ("BGRA8 native", DesktopCapturePath.PixelShader, width, height),
+            ("BGRA8 half width and height", DesktopCapturePath.PixelShader, width / 2 & ~1, height / 2 & ~1),
+            ("Gray8 native", DesktopCapturePath.PixelShaderGray8, width, height),
+            ("Gray8 half width and height", DesktopCapturePath.PixelShaderGray8, width / 2 & ~1, height / 2 & ~1)
+        };
+        List<RouteResult> results = new();
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+        foreach (var route in routes)
+        {
+            try
+            {
+                using var source = new DxgiDesktopCapture(route.Width, route.Height, route.Path,
+                    reusePixelBuffer: true, forceProcessUnchanged: true);
+                source.Capture();
+                List<DesktopCaptureStatistics> samples = new();
+                byte[] pixels = [];
+                for (var i = 0; i < 35; i++)
+                {
+                    pixels = source.Capture();
+                    if (i >= 5) samples.Add(source.Statistics ?? throw new InvalidDataException("Missing capture timing."));
+                }
+                var expected = checked(route.Width * route.Height * source.BytesPerPixel);
+                if (pixels.Length != expected || samples.Count != 30) throw new InvalidDataException("Unexpected capture output size or sample count.");
+                var distinct = pixels.Distinct().Count();
+                if (distinct < 8) throw new InvalidDataException($"GPU output has only {distinct} byte values; cannot validate image conversion.");
+                var total = Measure(samples.Select(sample => sample.TotalCaptureMs));
+                results.Add(new(route.Name, route.Width, route.Height, source.BytesPerPixel, expected,
+                    true, total.MeanMs < 10 && total.P95Ms < 10, total,
+                    Measure(samples.Select(sample => sample.AcquireMs)),
+                    Measure(samples.Select(sample => sample.DesktopCopySubmitMs)),
+                    Measure(samples.Select(sample => sample.GpuScaleSubmitMs)),
+                    Measure(samples.Select(sample => sample.ReadbackCopySubmitMs)),
+                    Measure(samples.Select(sample => sample.MapWaitAndReadbackMs)),
+                    Measure(samples.Select(sample => sample.CpuRowCopyMs)),
+                    Convert.ToHexString(SHA256.HashData(pixels)), distinct, null));
+                Console.WriteLine($"{route.Name}: {route.Width}x{route.Height}, {expected / 1_000_000d:F2} MB, capture+GPU+CPU readback {total.MeanMs:F2} ms average / {total.P95Ms:F2} ms P95");
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine($"[GPU pre-readback] {route.Name}: {error}");
+                results.Add(new(route.Name, route.Width, route.Height,
+                    route.Path == DesktopCapturePath.PixelShaderGray8 ? 1 : 4, 0,
+                    false, false, null, null, null, null, null, null, null, null, 0, error.ToString()));
+            }
+            File.WriteAllText(output, JsonSerializer.Serialize(new
+            {
+                Source = "Real primary desktop DDA BGRA8 texture; transformation runs on the same D3D11 GPU before staging readback.",
+                Boundary = "AcquireNextFrame(0) call start through GPU transform, staging Map, and complete CPU output buffer; excludes encode, UDP, decode and rendering.",
+                Stimulus = "One real desktop frame per route; 5 warmup + 30 forced GPU transformations of the retained texture. Does not measure display-frame waiting or dynamic content quality.",
+                Decision = "A route requires both mean and P95 under 10 ms for this feasibility screen; this is not an end-to-end latency claim.",
+                NativeWidth = width, NativeHeight = height, Routes = results
+            }, AppConfiguration.JsonOptions));
+        }
+        return results.All(result => result.Complete) ? 0 : 1;
+    }
+
+    static Timing Measure(IEnumerable<double> values)
+    {
+        var ordered = values.Order().ToArray();
+        return new(ordered.Average(), ordered[(int)Math.Ceiling(ordered.Length * .95) - 1], ordered[^1]);
+    }
+}
+
+// Source: FfmpegGpuQuantizedEncodeRegression.cs
+static class GpuQuantizedEncodeRegression
+{
+    sealed record Timing(double MeanMs, double P95Ms, double MaxMs);
+    sealed record Sample(double CaptureMs, double EncodeMs, double TotalMs, int PacketBytes);
+    sealed record RouteResult(string Name, int Width, int Height, double CapturedBytesPerPixel, string Encoder,
+        int ValidFrames, int DecodedFrames, Timing? Capture, Timing? Encode, Timing? CaptureToPacket,
+        double PacketMbpsAt30Fps, int LargestPacketBytes, int SourcePatterns, int DecodedPatterns,
+        int LastSourceDistinctByteValues, string? Error);
+
+    public static int Run(string output, string? only = null)
+    {
+        var bounds = Win32InputInjector.ReadPrimaryMonitor();
+        var width = bounds.Width & ~1;
+        var height = bounds.Height & ~1;
+        var halfWidth = width / 2 & ~1;
+        var halfHeight = height / 2 & ~1;
+        var routes = new (string Name, DesktopCapturePath Path, int Width, int Height, string Encoder, bool Mapped, bool? Gray)[]
+        {
+            ("native-mapped-x264rgb", DesktopCapturePath.NativeNoScale, width, height, "libx264rgb", true, null),
+            ("half-bgra-x264", DesktopCapturePath.PixelShader, halfWidth, halfHeight, "libx264", false, null),
+            ("half-rgb332-x264", DesktopCapturePath.PixelShaderRgb332, halfWidth, halfHeight, "libx264", false, false),
+            ("half-gray8-x264", DesktopCapturePath.PixelShaderGray8, halfWidth, halfHeight, "libx264", false, true),
+            ("native-rgb332-x264", DesktopCapturePath.PixelShaderRgb332, width, height, "libx264", false, false),
+            ("native-rgb565-x264", DesktopCapturePath.PixelShaderRgb565, width, height, "libx264", false, null),
+            ("native-gray8-x264", DesktopCapturePath.PixelShaderGray8, width, height, "libx264", false, true),
+            ("native-gray4-x264", DesktopCapturePath.PixelShaderGray4, width, height, "libx264", false, true)
+        };
+        List<RouteResult> results = new();
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+        var selected = only?.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (selected != null && selected.Any(name => !routes.Any(route => route.Name == name)))
+            throw new ArgumentException($"Unknown route in '{only}'.", nameof(only));
+        foreach (var route in routes.Where(route => selected == null ? route.Name is not ("half-rgb332-x264" or "native-rgb332-x264" or "native-rgb565-x264") : selected.Contains(route.Name)))
+        {
+            try
+            {
+                var arguments = route.Mapped
+                    ? "-c:v libx264rgb -pix_fmt bgr0 -preset ultrafast -tune zerolatency -bf 0 -g 300 -threads 16 -bufsize 100k"
+                    : "-c:v libx264 -pix_fmt yuv420p -preset ultrafast -tune zerolatency -bf 0 -g 300 -threads 4 -bufsize 100k";
+                using var source = new DxgiDesktopCapture(route.Width, route.Height, route.Path, reusePixelBuffer: !route.Mapped);
+                using var encoder = new FfmpegEncoder(arguments, route.Width, route.Height, 30, 2000);
+                List<Sample> samples = new();
+                List<CodecPacket> packets = new();
+                HashSet<ulong> sourcePatterns = new();
+                HashSet<ulong> decodedPatterns = new();
+                byte[]? lastSource = null;
+                var valid = 0;
+                var deadline = Stopwatch.StartNew();
+                while (valid < 35 && deadline.Elapsed < TimeSpan.FromSeconds(8))
+                {
+                    Thread.Sleep(31);
+                    var start = Stopwatch.GetTimestamp();
+                    IReadOnlyList<CodecPacket> encoded;
+                    double captureMs;
+                    if (route.Mapped)
+                    {
+                        using var pixels = source.CaptureMapped(false);
+                        if (pixels == null) continue;
+                        captureMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                        encoded = encoder.EncodeMapped(pixels, valid);
+                    }
+                    else
+                    {
+                        var pixels = source.Capture();
+                        if (source.Statistics?.NewDesktopImage != true) continue;
+                        captureMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                        encoded = route.Path == DesktopCapturePath.PixelShaderRgb565 ? encoder.EncodeRgb565(pixels, valid)
+                            : route.Path == DesktopCapturePath.PixelShaderGray4 ? encoder.EncodeGray4(pixels, valid)
+                            : route.Gray is bool gray ? encoder.EncodeQuantized(pixels, gray, valid) : encoder.Encode(pixels, valid);
+                        lastSource = pixels;
+                    }
+                    var totalMs = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
+                    if (encoded.Count != 1 || encoded[0].Pts != valid)
+                        throw new InvalidDataException($"Encoder returned {encoded.Count} packets for frame {valid}; immediate one-in/one-out encoding is required.");
+                    if (lastSource != null) sourcePatterns.Add(Fingerprint(lastSource));
+                    packets.Add(encoded[0]);
+                    if (valid >= 5) samples.Add(new(captureMs, totalMs - captureMs, totalMs, encoded[0].Data.Length));
+                    valid++;
+                }
+                if (samples.Count != 30) throw new TimeoutException($"Only {valid}/35 changing desktop frames in eight seconds.");
+                using var decoder = new FfmpegDecoder("-c:v h264 -threads 1");
+                var decoded = 0;
+                foreach (var packet in packets)
+                    foreach (var frame in decoder.Decode(packet.Data, packet.Pts))
+                    {
+                        if (frame.Width != route.Width || frame.Height != route.Height || frame.Bgra.Length != checked(route.Width * route.Height * 4))
+                            throw new InvalidDataException("Decoded frame dimensions or pixel size are incorrect.");
+                        decodedPatterns.Add(Fingerprint(frame.Bgra));
+                        decoded++;
+                    }
+                decoded += decoder.Flush().Count;
+                if (decoded != valid) throw new InvalidDataException($"Decoded {decoded}/{valid} frames.");
+                if (decodedPatterns.Count < 2 || (lastSource != null && sourcePatterns.Count < 2))
+                    throw new InvalidDataException($"Captured patterns={sourcePatterns.Count}, decoded patterns={decodedPatterns.Count}; full-motion source did not survive encoding.");
+                var total = Measure(samples.Select(sample => sample.TotalMs));
+                results.Add(new(route.Name, route.Width, route.Height, source.BytesPerFrame / (double)(route.Width * route.Height), route.Encoder,
+                    valid, decoded, Measure(samples.Select(sample => sample.CaptureMs)),
+                    Measure(samples.Select(sample => sample.EncodeMs)), total,
+                    samples.Sum(sample => sample.PacketBytes) * 8d * 30 / samples.Count / 1_000_000,
+                    samples.Max(sample => sample.PacketBytes), sourcePatterns.Count, decodedPatterns.Count,
+                    lastSource?.Distinct().Count() ?? 0, null));
+                Console.WriteLine($"{route.Name}: capture to packet {total.MeanMs:F2} ms mean / {total.P95Ms:F2} P95; {decoded} decoded; {results[^1].PacketMbpsAt30Fps:F2} Mbps");
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine($"[GPU quantized encode] {route.Name}: {error}");
+                results.Add(new(route.Name, route.Width, route.Height,
+                    route.Path == DesktopCapturePath.PixelShaderGray4 ? 0.5
+                        : route.Path is DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 ? 1
+                        : route.Path == DesktopCapturePath.PixelShaderRgb565 ? 2 : 4,
+                    route.Encoder, 0, 0, null, null, null, 0, 0, 0, 0, 0, error.ToString()));
+            }
+            File.WriteAllText(output, JsonSerializer.Serialize(new
+            {
+                Source = $"Live {width}x{height} primary desktop captured with DDA; intended controlled full-motion stimulus at 30 FPS.",
+                Boundary = "Capture API call start through complete H.264 packet; excludes source-frame waiting, UDP, decode timing and rendering.",
+                BitrateLimitKbps = 2000, WarmupValidFrames = 5, TimedValidFrames = 30,
+                Rgb332 = "One byte total: 3 red, 3 green, 2 blue bits. This route is diagnostic-only because the controlled muted-color stimulus collapsed to one source pattern and one decoded pattern.",
+                Gray8 = "One byte luma. GPU output is downloaded, converted to YUV420 and encoded by CPU x264.",
+                Gray4 = "Two four-bit grayscale pixels per byte. GPU packs; CPU unpacks to gray8 before YUV420 conversion and x264.",
+                ComparisonLimit = "Routes observe successive live desktop frames, not byte-identical source frames. Output resolutions/color precision differ; packet rate is observed, not a quality-equivalence claim.",
+                Routes = results
+            }, AppConfiguration.JsonOptions));
+        }
+        return results.All(result => result.Error == null) ? 0 : 1;
+    }
+
+    public static async Task RunSessionAsync(AppConfiguration config, string output)
+    {
+        using var capture = new DesktopStreamSource(1);
+        var active = config with { AutoSelectCodec = false, InitialPreset = "h264_fast", InitialBitrateKbps = 2000,
+            Width = capture.Width, Height = capture.Height };
+        using var session = new DemoSession(active, capture.Capture, capture.Resize, capture.SourceWidth,
+            capture.SourceHeight, capture.CaptureMapped, capture.SetPixelMode);
+        Exception? failure = null;
+        session.Failed += error => failure ??= error;
+        List<object> observations = new();
+        try
+        {
+            await session.StartAsync();
+            foreach (var (preset, expectedPath) in new[]
+            {
+                ("h264_rgb332", "PixelShaderRgb332"),
+                ("h264_rgb565", "PixelShaderRgb565"),
+                ("h264_gray8", "PixelShaderGray8"),
+                ("h264_gray4", "PixelShaderGray4"),
+                ("h264_fast", "NativeNoScale"),
+                ("h264_rgb_fast", "NativeNoScale")
+            })
+            {
+                var applied = await session.ApplyAsync(preset, 2000);
+                if (!applied.Success) throw new InvalidOperationException($"{preset}: {applied.Message}");
+                var timeout = Stopwatch.StartNew();
+                while (session.DecodedGeneration < applied.Generation)
+                {
+                    if (failure != null) throw new InvalidOperationException("Session failed during packed preset switch.", failure);
+                    if (timeout.Elapsed > TimeSpan.FromSeconds(8)) throw new TimeoutException($"{preset} did not decode a fresh UDP frame.");
+                    await Task.Delay(25);
+                }
+                var stats = capture.Statistics ?? throw new InvalidDataException("Missing real desktop capture statistics.");
+                if (stats.CapturePath != expectedPath || stats.OutputWidth != capture.SourceWidth || stats.OutputHeight != capture.SourceHeight)
+                    throw new InvalidDataException($"{preset}: expected {expectedPath} at native size, got {stats.CapturePath} {stats.OutputWidth}x{stats.OutputHeight}.");
+                observations.Add(new { Preset = preset, applied.Generation, CapturePath = stats.CapturePath,
+                    stats.OutputWidth, stats.OutputHeight, session.DecodedGeneration, CaptureMs = stats.TotalCaptureMs });
+                Console.WriteLine($"{preset}: UDP roundtrip decoded generation {session.DecodedGeneration}; {stats.CapturePath} {stats.OutputWidth}x{stats.OutputHeight}");
+                if (preset == "h264_rgb_fast")
+                {
+                    await Task.Delay(500);
+                    if (failure != null) throw new InvalidOperationException("Mapped capture failed after returning to the desktop RGB preset.", failure);
+                }
+            }
+        }
+        finally { await session.StopAsync(); }
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+        File.WriteAllText(output, JsonSerializer.Serialize(new
+        {
+            Passed = true,
+            Scope = "Real DDA capture, live preset switch, x264 H.264, localhost UDP, decoder callback; excludes UI rendering and subjective color review.",
+            Observations = observations
+        }, AppConfiguration.JsonOptions));
+    }
+
+    static Timing Measure(IEnumerable<double> values)
+    {
+        var ordered = values.Order().ToArray();
+        return new(ordered.Average(), ordered[(int)Math.Ceiling(ordered.Length * .95) - 1], ordered[^1]);
+    }
+
+    static ulong Fingerprint(byte[] bytes)
+    {
+        var hash = 14695981039346656037ul;
+        var step = Math.Max(1, bytes.Length / 4096);
+        for (var i = 0; i < bytes.Length; i += step) hash = (hash ^ bytes[i]) * 1099511628211ul;
+        return hash;
     }
 }
 
@@ -2824,7 +4092,8 @@ public sealed class RemoteInputServer : IDisposable
         catch (Exception error) { Report(error); }
     }
 
-    internal static async Task ServePeerAsync(IRemoteInputInjector injector, TcpClient peer, CancellationToken token, Action<Exception>? failure = null)
+    internal static async Task ServePeerAsync(IRemoteInputInjector injector, TcpClient peer, CancellationToken token, Action<Exception>? failure = null,
+        Action<bool>? enabledChanged = null)
     {
         peer.NoDelay = true;
         var stream = peer.GetStream();
@@ -2843,6 +4112,7 @@ public sealed class RemoteInputServer : IDisposable
                     if (request.Input is not null) throw new InvalidDataException("Input enable and event are mutually exclusive.");
                     result = enable ? new(true, "Input forwarding enabled.") : injector.ReleaseAll();
                     enabled = enable;
+                    enabledChanged?.Invoke(enabled);
                 }
                 else if (request.Input is null) result = new(false, "No input event supplied.");
                 else if (!enabled) result = new(false, "Input forwarding is disabled.");
@@ -2855,6 +4125,7 @@ public sealed class RemoteInputServer : IDisposable
         catch (Exception error) { if (failure != null) failure(error); else InputProtocol.Log("Input peer failed", error); }
         finally
         {
+            enabledChanged?.Invoke(false);
             var released = injector.ReleaseAll();
             if (!released.Accepted) InputProtocol.Log(released.Message);
         }
@@ -2880,9 +4151,12 @@ public sealed class RemoteInputServer : IDisposable
 public sealed class RemoteInputClient : IDisposable
 {
     const int MaximumInFlight = 64;
-    static readonly TimeSpan AcknowledgementTimeout = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan AcknowledgementWarning = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
+    readonly Socket? mouseSocket;
+    readonly IPEndPoint? mouseEndpoint;
+    readonly byte[]? mouseSession;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
     readonly object pendingGate = new();
@@ -2890,13 +4164,23 @@ public sealed class RemoteInputClient : IDisposable
     readonly Task reader;
     Exception? failure;
     long sequence, repliedSequence;
+    long mouseSequence;
     long enableRevision;
+    int warnedAboutDelay;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
+    public Exception? Failure => Volatile.Read(ref failure);
 
-    internal RemoteInputClient(TcpClient connection)
+    internal RemoteInputClient(TcpClient connection, IPEndPoint? mouseEndpoint = null, byte[]? mouseSession = null)
     {
         this.connection = connection;
+        this.mouseEndpoint = mouseEndpoint;
+        this.mouseSession = mouseSession;
+        if (mouseEndpoint != null)
+        {
+            if (mouseSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(mouseSession));
+            mouseSocket = new Socket(mouseEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        }
         connection.NoDelay = true;
         stream = connection.GetStream();
         reader = Task.Run(ReadRepliesAsync);
@@ -2945,6 +4229,26 @@ public sealed class RemoteInputClient : IDisposable
     public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(input);
+        if (input.Kind == RemoteInputKind.MouseMove && mouseSocket != null && Enabled)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                Span<byte> packet = stackalloc byte[40];
+                mouseSession!.CopyTo(packet);
+                BinaryPrimitives.WriteInt64LittleEndian(packet[16..], Interlocked.Increment(ref mouseSequence));
+                BinaryPrimitives.WriteDoubleLittleEndian(packet[24..], input.X);
+                BinaryPrimitives.WriteDoubleLittleEndian(packet[32..], input.Y);
+                mouseSocket.SendTo(packet, SocketFlags.None, mouseEndpoint!);
+                return Task.FromResult(new RemoteInputResult(true, "Mouse position sent over UDP."));
+            }
+            catch (Exception error) when (error is SocketException or ObjectDisposedException)
+            {
+                InputProtocol.Log("UDP mouse position failed", error);
+                throw;
+            }
+        }
         return !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) :
             await QueueRequestAsync(null, input, token).ConfigureAwait(false);
     }
@@ -2992,7 +4296,13 @@ public sealed class RemoteInputClient : IDisposable
 
     async Task<RemoteInputResult> AwaitAcknowledgementAsync(PendingInput request, CancellationToken token)
     {
-        try { return await request.Completion.Task.WaitAsync(AcknowledgementTimeout, token).ConfigureAwait(false); }
+        try
+        {
+            if (await Task.WhenAny(request.Completion.Task, Task.Delay(AcknowledgementWarning, token)).ConfigureAwait(false) != request.Completion.Task &&
+                Interlocked.Exchange(ref warnedAboutDelay, 1) == 0)
+                InputProtocol.Log("Input acknowledgement delayed; preserving the open TCP channel while the path recovers.");
+            return await request.Completion.Task.WaitAsync(token).ConfigureAwait(false);
+        }
         catch (Exception error) { Fail(error); throw; }
     }
 
@@ -3009,6 +4319,7 @@ public sealed class RemoteInputClient : IDisposable
                     if (reply.Sequence != repliedSequence + 1 || !pending.Remove(reply.Sequence, out var request))
                         throw new InvalidDataException("Input reply sequence mismatch.");
                     repliedSequence = reply.Sequence;
+                    Volatile.Write(ref warnedAboutDelay, 0);
                     slots.Release();
                     request.Completion.TrySetResult(new(reply.Accepted, reply.Message));
                 }
@@ -3044,6 +4355,7 @@ public sealed class RemoteInputClient : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
         Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
+        mouseSocket?.Dispose();
         // The reader handles shutdown itself; disposal never blocks its own continuation.
         ObserveFault(reader);
     }
@@ -3422,15 +4734,14 @@ static partial class FfmpegUi
                 }
                 if (details.IsVisible) ToggleDetails();
                 var bounds = Win32InputInjector.ReadPrimaryMonitor();
-                foreach (var (size, scale) in new[] { (new Size(780, 520), 1d), (new Size(1060, 640), .75), (new Size(900, 820), .5) })
+                foreach (var size in new[] { new Size(780, 520), new Size(1060, 640), new Size(900, 820) })
                 {
                     Width = size.Width; Height = size.Height;
                     Position = new PixelPoint(Math.Max(0, bounds.Width - (int)(size.Width * RenderScaling) - 16), 16);
-                    transmissionScale.SelectedIndex = scale == 1 ? 0 : scale == .75 ? 1 : 2;
-                    var dimensions = TransmissionGeometry.Dimensions(script.SourceWidth, script.SourceHeight, scale);
-                    await Until(() => !applying && session.Configuration.TransmissionScale == scale && preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height);
+                    var dimensions = TransmissionGeometry.Dimensions(script.SourceWidth, script.SourceHeight, 1);
+                    await Until(() => !applying && session.Configuration.TransmissionScale == 1 && preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height);
                     await Task.Delay(200);
-                    Check(preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height, "Real decoded dimensions at " + scale + "×", new { size, dimensions.Width, dimensions.Height });
+                    Check(preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height, "Native decoded dimensions at resized window", new { size, dimensions.Width, dimensions.Height });
                     var watermarkOrigin = watermark.PointToScreen(new Point());
                     var clientOrigin = this.PointToScreen(new Point());
                     Check(watermark.VerifyPassThrough(preview.SourceWindow) && watermarkOrigin.X >= clientOrigin.X && watermarkOrigin.Y >= clientOrigin.Y &&
@@ -3464,13 +4775,13 @@ static partial class FfmpegUi
                         var screen = new InteractionPoint { X = x, Y = y }; ClientToScreen(preview.SourceWindow, ref screen);
                         SendMessage(preview.SourceWindow, 0x020A, (nuint)(120 << 16), (nint)((screen.Y << 16) | (screen.X & 0xFFFF)));
                         await Task.Delay(100);
-                        expected.Add(new { Scale = scale, WindowWidth = size.Width, WindowHeight = size.Height, TargetX = targetX, TargetY = targetY,
+                        expected.Add(new { Scale = 1, WindowWidth = size.Width, WindowHeight = size.Height, TargetX = targetX, TargetY = targetY,
                             PixelTolerance = Math.Ceiling(Math.Max(script.SourceWidth / (double)rectangle.Right, script.SourceHeight / (double)rectangle.Bottom)) + 2 });
                     }
                     await SetInputAsync(false);
                 }
                 var invalid = await session.ApplyAsync(config.InitialPreset, (int)Math.Round(bitrate.Value * 1000), .25);
-                Check(!invalid.Success && session.Configuration.TransmissionScale == .5, "Invalid scale preserves current stream");
+                Check(!invalid.Success && session.Configuration.TransmissionScale == 1, "Invalid scale preserves native stream");
                 if (script.Input)
                 {
                 await SetInputAsync(true);
@@ -4115,17 +5426,20 @@ public sealed record RemoteOptions(string Host, int Port, string Token);
 sealed record RemoteRequest(string Kind, string Token = "", int VideoPort = 0, int DiagnosticPort = 0,
     string Session = "", ControlCommand? Command = null);
 sealed record RemoteWelcome(string Session, int SenderPort, int Width, int Height, int SourceWidth, int SourceHeight,
-    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1, double MaximumBitrateMbps = 100);
+    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1,
+    double MaximumBitrateMbps = 100, CodecProbeSample[]? ProbeSamples = null);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
-    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0);
+    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0, int UdpInputPort = 0,
+    int Generation = 0, int Width = 0, int Height = 0);
 
 static class RemoteWire
 {
     public static async Task WriteAsync<T>(NetworkStream stream, T value, CancellationToken token)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(value);
-        if (bytes.Length > 65536) throw new InvalidDataException("Remote control message exceeds 64 KiB.");
+        if (bytes.Length > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
+            throw new InvalidDataException("Remote control message exceeds its size limit.");
         var header = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
         await stream.WriteAsync(header, token); await stream.WriteAsync(bytes, token);
     }
@@ -4134,7 +5448,8 @@ static class RemoteWire
     {
         var header = new byte[4]; await stream.ReadExactlyAsync(header, token);
         var size = BinaryPrimitives.ReadInt32LittleEndian(header);
-        if (size is < 1 or > 65536) throw new InvalidDataException("Invalid remote control message length.");
+        if (size < 1 || size > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
+            throw new InvalidDataException("Invalid remote control message length.");
         var bytes = new byte[size]; await stream.ReadExactlyAsync(bytes, token);
         return JsonSerializer.Deserialize<T>(bytes) ?? throw new InvalidDataException("Empty remote message.");
     }
@@ -4153,13 +5468,13 @@ sealed class RemoteConnection : IDisposable
         return new(await FrdNetwork.ConnectAsync(options.Host, options.Port, token));
     }
 
-    public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token)
+    public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token, TimeSpan? timeoutDuration = null)
     {
         await gate.WaitAsync(token);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            if (timeoutDuration is { } duration) timeout.CancelAfter(duration);
             var started = Stopwatch.GetTimestamp();
             await RemoteWire.WriteAsync(client.GetStream(), request, timeout.Token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), timeout.Token);
@@ -4214,7 +5529,10 @@ public sealed partial class DemoSession
     readonly Dictionary<long, long> remotePresented = new();
     readonly Queue<long> remotePresentationTicks = new();
     long remoteHistorySweep;
+    long lastRemoteStatusTick;
     public bool IsRemote => remoteOptions != null;
+    public double RemoteStatusWaitSeconds => remoteOptions == null || Volatile.Read(ref lastRemoteStatusTick) == 0
+        ? 0 : Math.Max(0, (Stopwatch.GetTimestamp() - Volatile.Read(ref lastRemoteStatusTick)) / (double)Stopwatch.Frequency);
     public AppConfiguration Configuration => config;
     internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
@@ -4236,10 +5554,13 @@ public sealed partial class DemoSession
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
         diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
-        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
+        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port),
+            stop.Token, TimeSpan.FromSeconds(15));
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
+        Volatile.Write(ref lastRemoteStatusTick, Stopwatch.GetTimestamp());
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,
             InitialPreset = welcome.InitialPreset, InitialBitrateKbps = welcome.InitialBitrateKbps, Presets = welcome.Presets, TransmissionScale = welcome.TransmissionScale, MaximumBitrateMbps = welcome.MaximumBitrateMbps };
+        config = await Task.Run(() => AutoCodecProbe.SelectReceiver(config, welcome.ProbeSamples), stop.Token);
         receiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         diagnosticsReceiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         for (var i = 0; i < 4; i++) await remote.ExchangeAsync(new("status"), stop.Token);
@@ -4264,10 +5585,53 @@ public sealed partial class DemoSession
 
     async Task<NetworkSnapshot> ReadRemoteStatusAsync()
     {
+        await controlGate.WaitAsync(stop.Token);
+        try
+        {
         var reply = await remote!.ExchangeAsync(new("status"), stop.Token);
+        Volatile.Write(ref lastRemoteStatusTick, Stopwatch.GetTimestamp());
+        if (reply.Generation > AppliedGeneration)
+        {
+            if (reply.Width is < 64 or > 8192 || reply.Height is < 64 or > 8192 ||
+                (reply.Width & 1) != 0 || (reply.Height & 1) != 0 ||
+                !config.Presets.TryGetValue(reply.Preset, out var preset))
+                throw new InvalidDataException("Host reported an invalid stream resolution or preset.");
+            VideoDecoder? decoder = new(preset.DecoderArguments);
+            lock (decoderGate)
+            {
+                if (decoders.TryGetValue(reply.Generation, out var existing) &&
+                    presetNames.TryGetValue(reply.Generation, out var existingPreset) && existingPreset != reply.Preset)
+                {
+                    existing.Dispose();
+                    decoders.Remove(reply.Generation);
+                    presetNames.Remove(reply.Generation);
+                }
+                if (!decoders.ContainsKey(reply.Generation))
+                {
+                    decoders[reply.Generation] = decoder;
+                    presetNames[reply.Generation] = reply.Preset;
+                    decoder = null;
+                }
+            }
+            decoder?.Dispose();
+            config = config with { Width = reply.Width, Height = reply.Height };
+            if (welcome != null) welcome = welcome with { SourceWidth = reply.Width, SourceHeight = reply.Height };
+            Volatile.Write(ref appliedGeneration, reply.Generation);
+            var previous = Volatile.Read(ref requestedGeneration);
+            while (previous < reply.Generation)
+            {
+                var actual = Interlocked.CompareExchange(ref requestedGeneration, reply.Generation, previous);
+                if (actual == previous) break;
+                previous = actual;
+            }
+            Console.Error.WriteLine($"[video] Remote source changed to {reply.Width}x{reply.Height}, generation {reply.Generation}; requesting clean frame.");
+            RequestRecovery();
+        }
         activePreset = reply.Preset; appliedLimit = reply.LimitKbps; packetDiagnosticsEnabled = reply.Diagnostics;
-        message = "远端发送；预设和码率完全手动";
+        message = string.IsNullOrWhiteSpace(reply.Message) ? "远端发送；预设和码率完全手动" : reply.Message;
         return remoteNetwork = reply.Network ?? throw new InvalidDataException("Missing sender network statistics.");
+        }
+        finally { controlGate.Release(); }
     }
 
     public async Task<RemoteInputClient> ConnectRemoteInputAsync(CancellationToken token)
@@ -4279,7 +5643,8 @@ public sealed partial class DemoSession
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
-            return new(client);
+            if (reply.UdpInputPort is < 1 or > 65535) throw new InvalidDataException("Remote UDP input port is missing.");
+            return new(client, new(remote.Endpoint.Address, reply.UdpInputPort), Convert.FromHexString(welcome.Session));
         }
         catch { client.Dispose(); throw; }
     }
@@ -4333,7 +5698,8 @@ public sealed partial class DemoSession
     }
 
     internal RemoteReply SenderStatus() => new(true, Message: message, Network: sender?.Snapshot, Preset: activePreset,
-        LimitKbps: appliedLimit, Diagnostics: packetDiagnosticsEnabled);
+        LimitKbps: appliedLimit, Diagnostics: packetDiagnosticsEnabled,
+        Generation: AppliedGeneration, Width: config.Width, Height: config.Height);
 
     void ApplyRemoteDiagnostic(FrameTimeline clock, FrameDiagnostic diagnostic)
     {
@@ -4408,25 +5774,30 @@ public sealed partial class DemoSession
 sealed class RemoteHost : IAsyncDisposable
 {
     readonly AppConfiguration config;
+    readonly CodecProbeSample[] probeSamples;
     readonly string token;
     readonly TcpListener[] listeners;
     readonly CancellationTokenSource stop = new();
     readonly ConcurrentDictionary<int, Task> peers = new();
     readonly object gate = new();
     CancellationTokenSource? activeStop;
+    DesktopStreamSource? activeCapture;
     string sessionId = "";
     IPAddress? controller;
     bool hasInput, hasClipboard, hasCursor;
+    bool inputAllowed = true, clipboardAllowed = true;
+    CancellationTokenSource? inputPermissionStop, clipboardPermissionStop;
     nint clipboardOwner;
     int peerId;
     Task? acceptTask;
     public event Action<string>? Status;
+    public event Action<IPAddress?>? ControllerChanged;
     public event Action<Exception>? Failed;
-    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token) { }
-    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token)
+    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token, []) { }
+    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        this.config = config; this.token = token;
+        this.config = config; this.token = token; this.probeSamples = probeSamples ?? [];
         listeners = addresses.Select(address =>
         {
             var listener = new TcpListener(address, port);
@@ -4444,6 +5815,23 @@ sealed class RemoteHost : IAsyncDisposable
         var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
         Console.Error.WriteLine($"Remote listener ready: {endpoints}");
         Status?.Invoke($"被控端正在监听 {endpoints}\n等待主控连接；关闭此窗口停止监听。");
+    }
+
+    public void DisconnectActive()
+    {
+        lock (gate) activeStop?.Cancel();
+    }
+
+    public void SetInputAllowed(bool allowed)
+    {
+        lock (gate) { inputAllowed = allowed; if (!allowed) inputPermissionStop?.Cancel(); }
+        Console.Error.WriteLine($"[host permission] Keyboard and mouse {(allowed ? "allowed" : "revoked")}.");
+    }
+
+    public void SetClipboardAllowed(bool allowed)
+    {
+        lock (gate) { clipboardAllowed = allowed; if (!allowed) clipboardPermissionStop?.Cancel(); }
+        Console.Error.WriteLine($"[host permission] Clipboard {(allowed ? "allowed" : "revoked")}.");
     }
 
     async Task AcceptAsync(TcpListener listener)
@@ -4497,17 +5885,24 @@ sealed class RemoteHost : IAsyncDisposable
                         await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
                         await CursorWire.ServeAsync(client, cursorToken);
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasCursor = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-cursor-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasCursor = false; }
+                    }
                     return;
                 }
                 if (hello.Kind == "clipboard")
                 {
                     CancellationToken clipboardToken;
+                    CancellationTokenSource clipboardChannel;
                     lock (gate)
                     {
-                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasClipboard || clipboardOwner == 0)
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasClipboard || clipboardOwner == 0 || !clipboardAllowed)
                             throw new InvalidDataException("Clipboard channel does not belong to an available active session.");
-                        hasClipboard = true; clipboardToken = activeStop.Token;
+                        hasClipboard = true;
+                        clipboardPermissionStop = clipboardChannel = CancellationTokenSource.CreateLinkedTokenSource(activeStop.Token);
+                        clipboardToken = clipboardChannel.Token;
                     }
                     try
                     {
@@ -4515,25 +5910,61 @@ sealed class RemoteHost : IAsyncDisposable
                         await using var clipboard = new ClipboardSyncSession(client, new WindowsClipboard(clipboardOwner), token: clipboardToken);
                         await clipboard.Completion;
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasClipboard = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-clipboard-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasClipboard = false; clipboardPermissionStop = null; }
+                        clipboardChannel.Dispose();
+                    }
                     return;
                 }
                 if (hello.Kind == "input")
                 {
                     CancellationToken inputToken;
+                    CancellationTokenSource inputChannel;
                     lock (gate)
                     {
-                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasInput)
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasInput || !inputAllowed)
                             throw new InvalidDataException("Input channel does not belong to the active controller.");
-                        hasInput = true; inputToken = activeStop.Token;
+                        hasInput = true;
+                        inputPermissionStop = inputChannel = CancellationTokenSource.CreateLinkedTokenSource(activeStop.Token);
+                        inputToken = inputChannel.Token;
                     }
                     try
                     {
-                        await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
-                        using var injector = new Win32InputInjector();
-                        await RemoteInputServer.ServePeerAsync(injector, client, inputToken);
+                        var local = ((IPEndPoint)client.Client.LocalEndPoint!).Address;
+                        using var udp = new Socket(local.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                        if (local.Equals(IPAddress.IPv6Any)) udp.DualMode = true;
+                        udp.Bind(new IPEndPoint(local, 0));
+                        var ordinary = new Win32InputInjector();
+                        ordinary.RegisterControllerWindow(clipboardOwner);
+                        using var injector = new SecureDesktopInputRouter(ordinary,
+                            () => Volatile.Read(ref activeCapture)?.SecureActive == true);
+                        using var udpStop = CancellationTokenSource.CreateLinkedTokenSource(inputToken);
+                        var udpEnabled = 0;
+                        var udpWorker = ReceiveMouseAsync(udp, injector, address, hello.Session, () => Volatile.Read(ref udpEnabled) != 0, udpStop.Token);
+                        try
+                        {
+                            await RemoteWire.WriteAsync(stream, new RemoteReply(true, UdpInputPort: ((IPEndPoint)udp.LocalEndPoint!).Port), timeout.Token);
+                            await RemoteInputServer.ServePeerAsync(injector, client, inputToken,
+                                enabledChanged: value =>
+                                {
+                                    Volatile.Write(ref udpEnabled, value ? 1 : 0);
+                                    injector.SetEnabled(value);
+                                });
+                        }
+                        finally
+                        {
+                            udpStop.Cancel();
+                            await udpWorker;
+                        }
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasInput = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-input-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasInput = false; inputPermissionStop = null; }
+                        inputChannel.Dispose();
+                    }
                     return;
                 }
                 if (hello.Kind != "hello" || hello.VideoPort is < 1 or > 65535 || hello.DiagnosticPort is < 1 or > 65535 || hello.VideoPort == hello.DiagnosticPort)
@@ -4547,28 +5978,38 @@ sealed class RemoteHost : IAsyncDisposable
                     hasInput = hasClipboard = hasCursor = false;
                     controller = address; sessionId = id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
                 }
+                ControllerChanged?.Invoke(address);
                 try
                 {
                     using var capture = CreateCapture();
+                    Volatile.Write(ref activeCapture, capture);
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
-                    using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                    using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth,
+                        capture.SourceHeight, capture.CaptureMapped, capture.SetPixelMode, () => (capture.Width, capture.Height));
                     session.Failed += error => { lifetime.Cancel(); Failed?.Invoke(error); };
                     session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
                     var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
                         capture.SourceWidth, capture.SourceHeight,
-                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale, config.MaximumBitrateMbps);
+                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale,
+                        config.MaximumBitrateMbps, probeSamples.Where(sample => sample.Width == capture.Width && sample.Height == capture.Height).ToArray());
                     await SendAsync(new(true, Welcome: welcome), received);
                     Status?.Invoke($"主控已连接：{address}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。");
                     while (!lifetime.IsCancellationRequested)
                     {
-                        using var idle = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-                        idle.CancelAfter(TimeSpan.FromSeconds(20));
-                        var request = await RemoteWire.ReadAsync<RemoteRequest>(stream, idle.Token);
+                        var request = await RemoteWire.ReadAsync<RemoteRequest>(stream, lifetime.Token);
                         received = Stopwatch.GetTimestamp();
-                        if (request.Kind == "status") await SendAsync(session.SenderStatus(), received);
+                        if (request.Kind == "status")
+                        {
+                            var status = session.SenderStatus();
+                            if (capture.WaitingForSecureTransition)
+                                status = status with { Message = "安全桌面切换中：正在等待捕获画面恢复；会话保持连接" };
+                            else if (capture.SecureActive)
+                                status = status with { Message = "安全桌面画面已连接；键鼠通过 SYSTEM 辅助进程转发" };
+                            await SendAsync(status, received);
+                        }
                         else if (request.Kind == "control" && request.Command != null)
                         {
-                            var result = await session.SubmitControlAsync(request.Command, idle.Token);
+                            var result = await session.SubmitControlAsync(request.Command, lifetime.Token);
                             await SendAsync(new(true, Control: result), received);
                         }
                         else throw new InvalidDataException("Unknown remote request.");
@@ -4578,21 +6019,68 @@ sealed class RemoteHost : IAsyncDisposable
                 }
                 finally
                 {
+                    SessionTrace.Event("host-control-tcp", "closed");
                     lifetime.Cancel();
+                    Volatile.Write(ref activeCapture, null);
                     lifetime.Dispose();
                     lock (gate) { activeStop = null; controller = null; sessionId = ""; }
+                    ControllerChanged?.Invoke(null);
                     Status?.Invoke("主控已断开；已停止捕获发送并释放输入。等待重新连接。");
                 }
             }
-            catch (EndOfStreamException) { Console.Error.WriteLine("Remote controller disconnected."); }
-            catch (OperationCanceledException) { Console.Error.WriteLine("Remote connection cancelled or timed out."); }
+            catch (EndOfStreamException) { SessionTrace.Event("host-control-tcp", "eof"); Console.Error.WriteLine("Remote controller disconnected."); }
+            catch (OperationCanceledException) { SessionTrace.Event("host-control-tcp", "cancelled-or-timeout"); Console.Error.WriteLine("Remote connection cancelled or timed out."); }
             catch (Exception error)
             {
+                SessionTrace.Error("host-tcp", error);
                 Console.Error.WriteLine(error); Status?.Invoke(error.Message);
                 try { await RemoteWire.WriteAsync(client.GetStream(), new RemoteReply(false, error.Message), stop.Token); }
                 catch (Exception replyError) { Console.Error.WriteLine("Remote error reply failed: " + replyError.Message); }
             }
         }
+    }
+
+    internal static async Task ReceiveMouseAsync(Socket socket, IRemoteInputInjector injector, IPAddress controller, string session,
+        Func<bool> enabled, CancellationToken token)
+    {
+        var nonce = Convert.FromHexString(session);
+        var packet = new byte[40];
+        long latest = 0;
+        var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var received = await socket.ReceiveFromAsync(packet, SocketFlags.None, new IPEndPoint(any, 0), token);
+                var newest = latest;
+                double x = 0, y = 0;
+                Consider(received.ReceivedBytes, received.RemoteEndPoint);
+                // Drain already queued positions so input injection follows the newest available coordinate.
+                for (var i = 0; i < 256 && socket.Available > 0; i++)
+                {
+                    EndPoint source = new IPEndPoint(any, 0);
+                    var size = socket.ReceiveFrom(packet, SocketFlags.None, ref source);
+                    Consider(size, source);
+                }
+                if (newest <= latest) continue;
+                latest = newest;
+                var result = injector.Inject(new(RemoteInputKind.MouseMove, x, y));
+                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP mouse position rejected: " + result.Message);
+
+                void Consider(int size, EndPoint source)
+                {
+                    if (size != packet.Length || !enabled() ||
+                        !FrdNetwork.Canonical(((IPEndPoint)source).Address).Equals(controller) ||
+                        !CryptographicOperations.FixedTimeEquals(packet.AsSpan(0, nonce.Length), nonce)) return;
+                    var sequence = BinaryPrimitives.ReadInt64LittleEndian(packet.AsSpan(16));
+                    if (sequence <= newest) return;
+                    newest = sequence;
+                    x = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(24));
+                    y = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(32));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP mouse input stopped."); }
     }
 
     public async ValueTask DisposeAsync()
@@ -4605,7 +6093,7 @@ sealed class RemoteHost : IAsyncDisposable
     DesktopStreamSource CreateCapture()
     {
         DesktopStreamSource? capture = null;
-        try { capture = new(config.TransmissionScale); capture.Capture(); return capture; }
+        try { capture = new(config.TransmissionScale, secureDesktop: true); capture.Capture(); return capture; }
         catch (Exception error)
         {
             Console.Error.WriteLine(error);
@@ -4653,7 +6141,7 @@ static class RemoteLaunch
         if (values.Keys.Any(key => key is "--test-seconds" or "--report" or "--interaction-script")) throw new ArgumentException(Usage);
         return new(true, null, FrdNetwork.ListenAddresses(listen), port, token, 0, null, null);
     }
-    public static int Run(AppConfiguration config, Options options)
+    public static int Run(AppConfiguration config, Options options, CodecProbeSample[]? probeSamples = null)
     {
         if (!options.Host)
         {
@@ -4661,9 +6149,11 @@ static class RemoteLaunch
             FfmpegUi.Run(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
             return Environment.ExitCode;
         }
-        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token);
+        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token, probeSamples);
         hostExitCode = 0;
-        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return hostExitCode;
+        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]);
+        SessionTrace.Event("host-process", $"exit-code-{hostExitCode}");
+        return hostExitCode;
     }
 
     static void ShowMessage(string text)
@@ -4687,18 +6177,59 @@ static class RemoteLaunch
     sealed class HostWindow : Window
     {
         readonly RemoteHost server;
+        readonly TextBlock status = new() { Text = "FRD · 等待主控", FontSize = 12,
+            VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+        readonly StackPanel permissions = new() { Orientation = Avalonia.Layout.Orientation.Horizontal,
+            Spacing = 6, IsVisible = false };
         bool closing, finished;
-        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token)
+        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
         {
-            Title = $"FRD 被控端 · TCP {port}"; Width = 600; Height = 200;
-            var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
-            Content = status; server = new(config, addresses, port, token);
-            server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
+            Title = $"FRD 被控端 · TCP {port}"; Width = 290; Height = 50;
+            CanResize = false; ShowInTaskbar = false; Topmost = true;
+            WindowDecorations = Avalonia.Controls.WindowDecorations.None;
+            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#B825303C"));
+            Foreground = Avalonia.Media.Brushes.White;
+            var disconnect = new Button { Content = "断开", FontSize = 10, Padding = new Thickness(4, 0) };
+            var clipboard = new CheckBox { Content = "剪贴板", FontSize = 10, IsChecked = true,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            var input = new CheckBox { Content = "键鼠", FontSize = 10, IsChecked = true,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            var sound = new CheckBox { Content = "声音", FontSize = 10, IsChecked = false, IsEnabled = false,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            permissions.Children.Add(disconnect); permissions.Children.Add(clipboard);
+            permissions.Children.Add(input); permissions.Children.Add(sound);
+            var content = new StackPanel { Spacing = 1, Margin = new Thickness(6, 3) };
+            content.Children.Add(status); content.Children.Add(permissions);
+            var surface = new Border { Child = content };
+            surface.PointerPressed += (_, e) =>
+            {
+                if (e.Source is Border or StackPanel or TextBlock) BeginMoveDrag(e);
+            };
+            Content = surface;
+            server = new(config, addresses, port, token, probeSamples);
+            disconnect.Click += (_, _) => server.DisconnectActive();
+            clipboard.IsCheckedChanged += (_, _) => server.SetClipboardAllowed(clipboard.IsChecked == true);
+            input.IsCheckedChanged += (_, _) => server.SetInputAllowed(input.IsChecked == true);
+            server.ControllerChanged += address => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                status.Text = address == null ? "FRD · 等待主控" : $"正在被 {address} 控制";
+                permissions.IsVisible = address != null;
+            });
+            server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => ToolTip.SetTip(status, text));
             server.Failed += error => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             { Console.Error.WriteLine(error); hostExitCode = 1; Close(); });
             Opened += (_, _) =>
             {
-                try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); }
+                try
+                {
+                    var screen = Screens.Primary?.WorkingArea;
+                    if (screen is { } area) Position = new(area.Right - (int)Width - 8, area.Bottom - (int)Height - 8);
+                    var handle = TryGetPlatformHandle()?.Handle ?? 0;
+                    if (handle == 0 || !SetWindowDisplayAffinity(handle, 0x11))
+                        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),
+                            "被控端提示窗口无法排除出屏幕捕获");
+                    server.Start(handle);
+                }
                 catch (Exception error)
                 {
                     Console.Error.WriteLine(error); status.Text = error.Message; hostExitCode = 1;
@@ -4714,6 +6245,684 @@ static class RemoteLaunch
                 finally { finished = true; Avalonia.Threading.Dispatcher.UIThread.Post(Close); }
             };
         }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool SetWindowDisplayAffinity(nint window, uint affinity);
+    }
+}
+
+// Source: FfmpegSecureDesktop.cs
+static class SecureDesktopUdp
+{
+    public const int Port = 59873, ChunkSize = 60000, HeaderSize = 36;
+    const uint Magic = 0x46524455;
+    public static string KeyPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "FRD", "SecureDesktopProbe", "capture.key");
+
+    public static byte[] ReadKey()
+    {
+        var key = File.ReadAllBytes(KeyPath);
+        if (key.Length != 32) throw new InvalidDataException("Secure capture UDP key must contain 32 bytes.");
+        return key;
+    }
+
+    public static (int Packets, int CompressedBytes) Send(Socket socket, byte[] key, uint frameId, int width, int height, byte[]? pixels)
+    {
+        byte[] payload;
+        if (pixels == null) payload = [];
+        else
+        {
+            using var buffer = new MemoryStream();
+            using (var encoder = new ZLibStream(buffer, CompressionLevel.Fastest, leaveOpen: true)) encoder.Write(pixels);
+            payload = buffer.ToArray();
+        }
+        var count = Math.Max(1, (payload.Length + ChunkSize - 1) / ChunkSize);
+        if (count > ushort.MaxValue) throw new InvalidDataException("Secure capture frame has too many UDP packets.");
+        var endpoint = new IPEndPoint(IPAddress.Loopback, Port);
+        for (var pass = 0; pass < 2; pass++)
+        for (var index = 0; index < count; index++)
+        {
+            var offset = index * ChunkSize;
+            var size = Math.Min(ChunkSize, payload.Length - offset);
+            var packet = new byte[HeaderSize + size];
+            BitConverter.GetBytes(Magic).CopyTo(packet, 0);
+            BitConverter.GetBytes(frameId).CopyTo(packet, 4);
+            BitConverter.GetBytes((ushort)index).CopyTo(packet, 8);
+            BitConverter.GetBytes((ushort)count).CopyTo(packet, 10);
+            BitConverter.GetBytes(width).CopyTo(packet, 12);
+            BitConverter.GetBytes(height).CopyTo(packet, 16);
+            BitConverter.GetBytes(payload.Length).CopyTo(packet, 20);
+            if (size > 0) payload.AsSpan(offset, size).CopyTo(packet.AsSpan(HeaderSize));
+            Sign(key, packet).CopyTo(packet.AsSpan(24, 12));
+            socket.SendTo(packet, endpoint);
+            var next = Stopwatch.GetTimestamp() + Stopwatch.Frequency / 2000;
+            while (Stopwatch.GetTimestamp() < next) Thread.SpinWait(64);
+        }
+        return (count, payload.Length);
+    }
+
+    public static bool Verify(byte[] key, ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < HeaderSize || BitConverter.ToUInt32(packet) != Magic) return false;
+        return CryptographicOperations.FixedTimeEquals(Sign(key, packet), packet.Slice(24, 12));
+    }
+
+    static byte[] Sign(byte[] key, ReadOnlySpan<byte> packet)
+    {
+        var signed = new byte[24 + packet.Length - HeaderSize];
+        packet[..24].CopyTo(signed);
+        packet[HeaderSize..].CopyTo(signed.AsSpan(24));
+        return HMACSHA256.HashData(key, signed)[..12];
+    }
+}
+
+sealed class SecureDesktopFrames : IDisposable
+{
+    readonly CancellationTokenSource stop = new();
+    readonly Socket socket;
+    readonly Task reader;
+    readonly object gate = new();
+    readonly byte[] key;
+    readonly SecureDesktopShared? shared;
+    byte[]? latest;
+    int latestWidth, latestHeight;
+    long version, consumed;
+    bool active, disposed;
+
+    public static SecureDesktopFrames? TryStart()
+    {
+        if (!File.Exists(SecureDesktopUdp.KeyPath))
+        {
+            Console.Error.WriteLine("[secure capture] UDP helper key is absent; secure desktop capture is unavailable.");
+            return null;
+        }
+        return new(ReadKeyForHost());
+    }
+
+    static byte[] ReadKeyForHost() => SecureDesktopUdp.ReadKey();
+
+    internal SecureDesktopFrames(byte[] key, bool useShared = true)
+    {
+        this.key = key;
+        if (useShared)
+        {
+            try { shared = SecureDesktopShared.TryOpen(writer: false); }
+            catch (Exception error) { Console.Error.WriteLine("[secure capture] Shared frame buffer unavailable; using loopback UDP: " + error); }
+        }
+        socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+            { ExclusiveAddressUse = true, ReceiveBufferSize = 8 * 1024 * 1024 };
+        socket.Bind(new IPEndPoint(IPAddress.Loopback, SecureDesktopUdp.Port));
+        reader = Task.Run(ReadAsync);
+    }
+
+    public bool Active { get { lock (gate) return shared?.Active == true || active; } }
+
+    public (bool Active, SharedFrame? Frame, int Width, int Height) TakeSharedMapped(bool repeat = false) =>
+        shared?.Take(repeat) ?? (false, null, 0, 0);
+
+    public (bool Active, byte[]? Pixels, int Width, int Height) Take(bool repeat = false)
+    {
+        if (shared?.Take(repeat) is { Active: true } sharedFrame)
+        {
+            if (sharedFrame.Frame == null) return (true, null, sharedFrame.Width, sharedFrame.Height);
+            using (sharedFrame.Frame)
+            {
+                var pixels = new byte[checked(sharedFrame.Width * sharedFrame.Height * 4)];
+                System.Runtime.InteropServices.Marshal.Copy(sharedFrame.Frame.Pixels, pixels, 0, pixels.Length);
+                return (true, pixels, sharedFrame.Width, sharedFrame.Height);
+            }
+        }
+        lock (gate)
+        {
+            if (!active || latest == null) return (false, null, 0, 0);
+            if (!repeat && consumed == version) return (true, null, latestWidth, latestHeight);
+            consumed = version;
+            return (true, latest, latestWidth, latestHeight);
+        }
+    }
+
+    async Task ReadAsync()
+    {
+        var packet = new byte[SecureDesktopUdp.HeaderSize + SecureDesktopUdp.ChunkSize];
+        uint frameId = 0;
+        uint lastCompletedId = 0;
+        long lastCompletedTick = 0;
+        byte[]? compressed = null;
+        bool[]? received = null;
+        int receivedCount = 0, frameWidth = 0, frameHeight = 0;
+        long frameStarted = 0;
+        bool invalidAuthenticationLogged = false;
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                var datagram = await socket.ReceiveFromAsync(packet, SocketFlags.None,
+                    new IPEndPoint(IPAddress.Loopback, 0), stop.Token);
+                if (!((IPEndPoint)datagram.RemoteEndPoint).Address.Equals(IPAddress.Loopback)) continue;
+                if (!SecureDesktopUdp.Verify(key, packet.AsSpan(0, datagram.ReceivedBytes)))
+                {
+                    if (!invalidAuthenticationLogged)
+                        Console.Error.WriteLine("[secure capture] Rejected an unauthenticated local UDP packet.");
+                    invalidAuthenticationLogged = true;
+                    continue;
+                }
+                var span = packet.AsSpan(0, datagram.ReceivedBytes);
+                var id = BitConverter.ToUInt32(span[4..]);
+                var index = BitConverter.ToUInt16(span[8..]);
+                var count = BitConverter.ToUInt16(span[10..]);
+                var width = BitConverter.ToInt32(span[12..]);
+                var height = BitConverter.ToInt32(span[16..]);
+                var total = BitConverter.ToInt32(span[20..]);
+                if (count == 0 || count > 2048 || index >= count || total < 0 || total > 32 * 1024 * 1024 ||
+                    width < 0 || height < 0 || width > 8192 || height > 8192) continue;
+                if (total == 0)
+                {
+                    var changed = false;
+                    lock (gate)
+                    {
+                        changed = active;
+                        active = false; latest = null; latestWidth = latestHeight = 0; version++;
+                    }
+                    compressed = null;
+                    if (changed) Console.Error.WriteLine("[secure capture] Returned to ordinary desktop.");
+                    continue;
+                }
+                if (width < 64 || height < 64 || (long)width * height * 4 > 128 * 1024 * 1024) continue;
+                if (id == lastCompletedId && Stopwatch.GetElapsedTime(lastCompletedTick) < TimeSpan.FromSeconds(2)) continue;
+                if (compressed == null || id != frameId || Stopwatch.GetElapsedTime(frameStarted) > TimeSpan.FromSeconds(2))
+                {
+                    if (compressed != null && receivedCount > 0)
+                        Console.Error.WriteLine($"[secure capture] Dropped incomplete UDP frame {frameId}: {receivedCount}/{received!.Length} packets.");
+                    frameId = id; frameWidth = width; frameHeight = height; frameStarted = Stopwatch.GetTimestamp();
+                    compressed = new byte[total]; received = new bool[count]; receivedCount = 0;
+                    Console.Error.WriteLine($"[secure capture] Receiving UDP frame {id}: {count} packets, {total} bytes.");
+                }
+                if (width != frameWidth || height != frameHeight || total != compressed.Length || received!.Length != count || received[index]) continue;
+                var offset = index * SecureDesktopUdp.ChunkSize;
+                var size = span.Length - SecureDesktopUdp.HeaderSize;
+                if (offset + size > total || size != Math.Min(SecureDesktopUdp.ChunkSize, total - offset))
+                    continue;
+                span[SecureDesktopUdp.HeaderSize..].CopyTo(compressed.AsSpan(offset));
+                received[index] = true;
+                if (++receivedCount != count) continue;
+                try
+                {
+                    var pixels = new byte[checked(width * height * 4)];
+                    using var input = new MemoryStream(compressed, writable: false);
+                    using var decoder = new ZLibStream(input, CompressionMode.Decompress);
+                    var decodeStarted = Stopwatch.GetTimestamp();
+                    decoder.ReadExactly(pixels);
+                    if (decoder.ReadByte() != -1) throw new InvalidDataException("Secure capture frame has excess decoded bytes.");
+                    lock (gate) { latest = pixels; latestWidth = width; latestHeight = height; active = true; version++; }
+                    lastCompletedId = id; lastCompletedTick = Stopwatch.GetTimestamp();
+                    Console.Error.WriteLine($"[secure capture] Authenticated UDP frame {width}x{height}, {count} packets; receive+decode={Stopwatch.GetElapsedTime(frameStarted).TotalMilliseconds:F1}ms, decode={Stopwatch.GetElapsedTime(decodeStarted).TotalMilliseconds:F1}ms.");
+                }
+                catch (Exception error) { Console.Error.WriteLine("[secure capture] Invalid UDP frame: " + error); }
+                compressed = null;
+            }
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("[secure capture] UDP receiver stopped."); }
+        catch (Exception error) { Console.Error.WriteLine("[secure capture] UDP receiver failed: " + error); }
+    }
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        stop.Cancel(); socket.Dispose();
+        try { reader.GetAwaiter().GetResult(); }
+        catch (Exception error) { Console.Error.WriteLine("[secure capture] UDP shutdown error: " + error); }
+        stop.Dispose();
+        shared?.Dispose();
+    }
+}
+
+// Source: FfmpegSecureInput.cs
+static class SecureInputWire
+{
+    public const int Port = 59874, PacketSize = 80, AckSize = 48;
+    const uint Magic = 0x4652494E, AckMagic = 0x46524941;
+
+    public static void Write(Span<byte> packet, ReadOnlySpan<byte> key, ReadOnlySpan<byte> session, long sequence,
+        RemoteInputEvent? input)
+    {
+        packet.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(packet, Magic);
+        session.CopyTo(packet[4..20]);
+        BinaryPrimitives.WriteInt64LittleEndian(packet[20..], sequence);
+        BinaryPrimitives.WriteInt64LittleEndian(packet[28..], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        packet[36] = input == null ? (byte)7 : (byte)input.Kind;
+        if (input != null)
+        {
+            packet[37] = (byte)input.Button;
+            packet[38] = input.Extended ? (byte)1 : (byte)0;
+            BinaryPrimitives.WriteDoubleLittleEndian(packet[40..], input.X);
+            BinaryPrimitives.WriteDoubleLittleEndian(packet[48..], input.Y);
+            BinaryPrimitives.WriteInt32LittleEndian(packet[56..], input.WheelDelta);
+            BinaryPrimitives.WriteInt32LittleEndian(packet[60..], input.ScanCode);
+        }
+        Sign(key, packet[..64]).CopyTo(packet[64..]);
+    }
+
+    public static bool TryRead(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> key, out long sequence,
+        out RemoteInputEvent? input)
+    {
+        sequence = 0; input = null;
+        if (packet.Length != PacketSize || BinaryPrimitives.ReadUInt32LittleEndian(packet) != Magic ||
+            !CryptographicOperations.FixedTimeEquals(Sign(key, packet[..64]), packet[64..])) return false;
+        var age = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - BinaryPrimitives.ReadInt64LittleEndian(packet[28..]);
+        if (age is < -2000 or > 2000) return false;
+        sequence = BinaryPrimitives.ReadInt64LittleEndian(packet[20..]);
+        if (sequence <= 0 || packet[36] > 7 || packet[37] > 2 || packet[38] > 1 || packet[39] != 0) return false;
+        if (packet[36] == 7) return true;
+        var kind = (RemoteInputKind)packet[36];
+        var x = BinaryPrimitives.ReadDoubleLittleEndian(packet[40..]);
+        var y = BinaryPrimitives.ReadDoubleLittleEndian(packet[48..]);
+        var wheel = BinaryPrimitives.ReadInt32LittleEndian(packet[56..]);
+        var scan = BinaryPrimitives.ReadInt32LittleEndian(packet[60..]);
+        if (!double.IsFinite(x) || !double.IsFinite(y) || x is < 0 or > 1 || y is < 0 or > 1 ||
+            wheel is < -12000 or > 12000 || scan is < 0 or > ushort.MaxValue) return false;
+        input = new(kind, x, y, (RemoteMouseButton)packet[37], wheel, scan, packet[38] != 0);
+        return true;
+    }
+
+    public static void WriteAck(Span<byte> ack, ReadOnlySpan<byte> key, ReadOnlySpan<byte> session, long sequence, bool accepted)
+    {
+        ack.Clear();
+        BinaryPrimitives.WriteUInt32LittleEndian(ack, AckMagic);
+        session.CopyTo(ack[4..20]);
+        BinaryPrimitives.WriteInt64LittleEndian(ack[20..], sequence);
+        ack[28] = accepted ? (byte)1 : (byte)0;
+        Sign(key, ack[..32]).CopyTo(ack[32..]);
+    }
+
+    public static bool TryReadAck(ReadOnlySpan<byte> ack, ReadOnlySpan<byte> key, ReadOnlySpan<byte> session,
+        long sequence, out bool accepted)
+    {
+        accepted = false;
+        if (ack.Length != AckSize || BinaryPrimitives.ReadUInt32LittleEndian(ack) != AckMagic ||
+            !CryptographicOperations.FixedTimeEquals(ack[4..20], session) ||
+            BinaryPrimitives.ReadInt64LittleEndian(ack[20..]) != sequence ||
+            !CryptographicOperations.FixedTimeEquals(Sign(key, ack[..32]), ack[32..])) return false;
+        accepted = ack[28] == 1;
+        return true;
+    }
+
+    static byte[] Sign(ReadOnlySpan<byte> key, ReadOnlySpan<byte> bytes) => HMACSHA256.HashData(key, bytes)[..16];
+}
+
+sealed class SecureDesktopInputClient : IDisposable
+{
+    readonly Socket socket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+    readonly IPEndPoint target;
+    readonly byte[] key;
+    readonly byte[] session = RandomNumberGenerator.GetBytes(16);
+    readonly object gate = new();
+    long sequence;
+
+    public SecureDesktopInputClient(byte[] key, int port = SecureInputWire.Port)
+    {
+        this.key = key;
+        target = new(IPAddress.Loopback, port);
+        socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        socket.ReceiveTimeout = 60;
+    }
+
+    public RemoteInputResult Send(RemoteInputEvent? input)
+    {
+        lock (gate)
+        {
+            var id = ++sequence;
+            Span<byte> packet = stackalloc byte[SecureInputWire.PacketSize];
+            SecureInputWire.Write(packet, key, session, id, input);
+            var acknowledge = input != null && input.Kind != RemoteInputKind.MouseMove;
+            for (var attempt = 0; attempt < (acknowledge ? 3 : 1); attempt++)
+            {
+                try
+                {
+                    socket.SendTo(packet, target);
+                    if (!acknowledge) return new(true, "Secure desktop input sent.");
+                    var ack = new byte[SecureInputWire.AckSize];
+                    EndPoint peer = new IPEndPoint(IPAddress.Loopback, 0);
+                    var count = socket.ReceiveFrom(ack, ref peer);
+                    if (!((IPEndPoint)peer).Address.Equals(IPAddress.Loopback) ||
+                        !SecureInputWire.TryReadAck(ack.AsSpan(0, count), key, session, id, out var accepted)) continue;
+                    return accepted ? new(true, "Secure desktop input applied.") : new(false, "Secure desktop input rejected by SYSTEM worker.");
+                }
+                catch (SocketException error) when (error.SocketErrorCode == SocketError.TimedOut && acknowledge)
+                { Console.Error.WriteLine($"[secure input] ACK timeout, attempt {attempt + 1}."); }
+                catch (Exception error)
+                { Console.Error.WriteLine("[secure input] Local send failed: " + error); return new(false, error.Message); }
+            }
+            return new(false, "Secure desktop input worker did not acknowledge the event.");
+        }
+    }
+
+    public void Dispose() => socket.Dispose();
+}
+
+sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
+{
+    readonly Win32InputInjector ordinary;
+    readonly SecureDesktopInputClient? secure;
+    readonly Func<bool> secureActive;
+    readonly Timer heartbeat;
+    readonly object gate = new();
+    bool enabled, previousSecure;
+
+    public SecureDesktopInputRouter(Win32InputInjector ordinary, Func<bool> secureActive)
+    {
+        this.ordinary = ordinary;
+        this.secureActive = secureActive;
+        if (File.Exists(SecureDesktopUdp.KeyPath)) secure = new(SecureDesktopUdp.ReadKey());
+        else Console.Error.WriteLine("[secure input] SYSTEM helper key absent; ordinary desktop input remains available.");
+        heartbeat = new(_ => Heartbeat(), null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    public void SetEnabled(bool value)
+    {
+        lock (gate)
+        {
+            enabled = value;
+            heartbeat.Change(value ? 500 : Timeout.Infinite, value ? 500 : Timeout.Infinite);
+            if (!value) ReleaseAllCore();
+        }
+    }
+
+    public RemoteInputResult Inject(RemoteInputEvent input)
+    {
+        lock (gate)
+        {
+            var active = secureActive();
+            if (active != previousSecure)
+            {
+                var released = active ? ordinary.ReleaseAll() : secure?.Send(new(RemoteInputKind.ReleaseAll)) ?? new(true, "No secure worker.");
+                if (!released.Accepted) Console.Error.WriteLine("[secure input] Desktop transition release: " + released.Message);
+                previousSecure = active;
+            }
+            return active ? secure?.Send(input) ?? new(false, "Secure desktop input worker is unavailable.") : ordinary.Inject(input);
+        }
+    }
+
+    public RemoteInputResult ReleaseAll() { lock (gate) return ReleaseAllCore(); }
+
+    RemoteInputResult ReleaseAllCore()
+    {
+        var ordinaryResult = ordinary.ReleaseAll();
+        var secureResult = secure?.Send(new(RemoteInputKind.ReleaseAll)) ?? new(true, "No secure worker.");
+        return !ordinaryResult.Accepted ? ordinaryResult : secureResult;
+    }
+
+    void Heartbeat()
+    {
+        lock (gate)
+        {
+            if (!enabled || !secureActive()) return;
+            var result = secure?.Send(null) ?? new(false, "Secure desktop input worker is unavailable.");
+            if (!result.Accepted) Console.Error.WriteLine("[secure input] Heartbeat failed: " + result.Message);
+        }
+    }
+
+    public void Dispose()
+    {
+        heartbeat.Dispose();
+        var result = ReleaseAll();
+        if (!result.Accepted) Console.Error.WriteLine("[secure input] Release failed: " + result.Message);
+        secure?.Dispose(); ordinary.Dispose();
+    }
+}
+
+static class SecureDesktopInputWorker
+{
+    public static void Run(byte[] key, IRemoteInputInjector injector, Func<bool> active,
+        Action<string> log, CancellationToken token, int port = SecureInputWire.Port)
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)
+            { ExclusiveAddressUse = true, ReceiveTimeout = 250 };
+        socket.Bind(new IPEndPoint(IPAddress.Loopback, port));
+        log($"Input listener ready on 127.0.0.1:{port}.");
+        var packet = new byte[SecureInputWire.PacketSize];
+        var ack = new byte[SecureInputWire.AckSize];
+        var session = new byte[16];
+        long lastSequence = 0, lastActivity = Stopwatch.GetTimestamp();
+        RemoteInputResult lastResult = new(true, "No input.");
+        var pendingRelease = false;
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                EndPoint peer = new IPEndPoint(IPAddress.Loopback, 0);
+                var count = socket.ReceiveFrom(packet, ref peer);
+                if (!((IPEndPoint)peer).Address.Equals(IPAddress.Loopback) ||
+                    !SecureInputWire.TryRead(packet.AsSpan(0, count), key, out var sequence, out var input)) continue;
+                var desktopActive = active();
+                if (!CryptographicOperations.FixedTimeEquals(packet.AsSpan(4, 16), session))
+                {
+                    if (desktopActive)
+                    {
+                        var released = injector.ReleaseAll();
+                        pendingRelease = !released.Accepted;
+                        if (!released.Accepted) log("Prior session release failed: " + released.Message);
+                    }
+                    else pendingRelease = true;
+                    packet.AsSpan(4, 16).CopyTo(session);
+                    lastSequence = 0;
+                    log("Authenticated local input session changed.");
+                }
+                if (desktopActive && pendingRelease)
+                {
+                    var released = injector.ReleaseAll();
+                    pendingRelease = !released.Accepted;
+                    if (!released.Accepted) log("Pending input release failed: " + released.Message);
+                }
+                if (sequence < lastSequence) continue;
+                if (sequence > lastSequence)
+                {
+                    lastSequence = sequence;
+                    if (!desktopActive && input?.Kind == RemoteInputKind.ReleaseAll)
+                    {
+                        pendingRelease = true;
+                        lastResult = new(true, "Release deferred until Winlogon is active.");
+                    }
+                    else if (!desktopActive) lastResult = new(false, "Winlogon desktop is not active.");
+                    else if (input == null) lastResult = new(true, "Heartbeat.");
+                    else lastResult = injector.Inject(input);
+                    if (!lastResult.Accepted) log($"Input {input?.Kind} rejected: {lastResult.Message}");
+                    else if (input != null && input.Kind != RemoteInputKind.MouseMove)
+                        log($"Input {input.Kind} applied.");
+                }
+                lastActivity = Stopwatch.GetTimestamp();
+                if (input == null || input.Kind == RemoteInputKind.MouseMove) continue;
+                SecureInputWire.WriteAck(ack, key, session, sequence, lastResult.Accepted);
+                socket.SendTo(ack, peer);
+            }
+            catch (SocketException error) when (error.SocketErrorCode == SocketError.TimedOut)
+            {
+                if (Stopwatch.GetElapsedTime(lastActivity) <= TimeSpan.FromSeconds(2)) continue;
+                try
+                {
+                    if (active())
+                    {
+                        var released = injector.ReleaseAll();
+                        pendingRelease = !released.Accepted;
+                        if (!released.Accepted) log("Input lease expired; release failed: " + released.Message);
+                    }
+                    else pendingRelease = true;
+                }
+                catch (Exception checkError) { log("Input lease desktop check failed: " + checkError); }
+                lastActivity = Stopwatch.GetTimestamp();
+            }
+            catch (Exception error) { log("Input listener error: " + error); }
+        }
+        var finalRelease = injector.ReleaseAll();
+        if (!finalRelease.Accepted) log("Final input release failed: " + finalRelease.Message);
+    }
+}
+
+// Source: FfmpegSecureShared.cs
+sealed unsafe class SecureDesktopShared : IDisposable
+{
+    const int Magic = 0x46524453, Version = 1, HeaderSize = 64, SlotHeaderSize = 16, Slots = 3;
+    const int MaxWidth = 3840, MaxHeight = 2160;
+    const int MaxPixels = MaxWidth * MaxHeight * 4;
+    const int SlotSize = SlotHeaderSize + MaxPixels;
+    public const long Capacity = HeaderSize + (long)Slots * SlotSize;
+    readonly FileStream file;
+    readonly MemoryMappedFile mapping;
+    readonly MemoryMappedViewAccessor view;
+    readonly bool writer;
+    byte* address;
+    long published, consumed;
+    bool disposed;
+
+    public static string PathName => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+        "FRD", "SecureDesktopProbe", "frames.map");
+
+    public static SecureDesktopShared? TryOpen(bool writer)
+    {
+        if (!writer && !File.Exists(PathName)) return null;
+        return new(PathName, writer);
+    }
+
+    internal SecureDesktopShared(string path, bool writer)
+    {
+        this.writer = writer;
+        if (writer) Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        file = new(path, writer ? FileMode.OpenOrCreate : FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        if (writer && file.Length != Capacity) file.SetLength(Capacity);
+        if (file.Length != Capacity) throw new InvalidDataException("Secure desktop shared frame file has an unexpected size.");
+        mapping = MemoryMappedFile.CreateFromFile(file, null, Capacity, MemoryMappedFileAccess.ReadWrite,
+            HandleInheritability.None, leaveOpen: true);
+        view = mapping.CreateViewAccessor(0, Capacity, MemoryMappedFileAccess.ReadWrite);
+        view.SafeMemoryMappedViewHandle.AcquirePointer(ref address);
+        address += view.PointerOffset;
+        if (writer)
+        {
+            Volatile.Write(ref Int32(8), 0);
+            for (var slot = 0; slot < Slots; slot++) Volatile.Write(ref State(slot), 0);
+            published = Stopwatch.GetTimestamp();
+            Interlocked.Exchange(ref Int64(16), published);
+            Volatile.Write(ref Int32(4), Version);
+            Volatile.Write(ref Int32(0), Magic);
+        }
+    }
+
+    public bool Active => Valid && Volatile.Read(ref Int32(8)) == 1;
+    bool Valid => Volatile.Read(ref Int32(0)) == Magic && Volatile.Read(ref Int32(4)) == Version;
+    public void SetInactive()
+    {
+        if (!writer) throw new InvalidOperationException("Only the secure worker may publish frames.");
+        Volatile.Write(ref Int32(8), 0);
+    }
+
+    public bool Publish(int width, int height, byte[] pixels)
+    {
+        if (!writer) throw new InvalidOperationException("Only the secure worker may publish frames.");
+        if (width < 64 || height < 64 || width > MaxWidth || height > MaxHeight ||
+            pixels.Length != checked(width * height * 4)) return false;
+        var latest = Volatile.Read(ref Int32(12));
+        var chosen = -1;
+        for (var slot = 0; slot < Slots; slot++)
+            if (Interlocked.CompareExchange(ref State(slot), 1, 0) == 0) { chosen = slot; break; }
+        if (chosen < 0)
+            for (var slot = 0; slot < Slots; slot++)
+                if (slot != latest && Interlocked.CompareExchange(ref State(slot), 1, 2) == 2)
+                { chosen = slot; break; }
+        if (chosen < 0) return false;
+        var target = address + HeaderSize + chosen * SlotSize;
+        try
+        {
+            fixed (byte* source = pixels) Buffer.MemoryCopy(source, target + SlotHeaderSize, MaxPixels, pixels.Length);
+            *(int*)target = width;
+            *(int*)(target + 4) = height;
+            *(int*)(target + 8) = pixels.Length;
+            Volatile.Write(ref State(chosen), 2);
+            Volatile.Write(ref Int32(12), chosen);
+            Interlocked.Exchange(ref Int64(16), ++published);
+            Volatile.Write(ref Int32(8), 1);
+            return true;
+        }
+        catch
+        {
+            Volatile.Write(ref State(chosen), 0);
+            throw;
+        }
+    }
+
+    public (bool Active, SharedFrame? Frame, int Width, int Height) Take(bool repeat = false)
+    {
+        if (!Active) return (false, null, 0, 0);
+        var sequence = Volatile.Read(ref Int64(16));
+        var slot = Volatile.Read(ref Int32(12));
+        if (slot is < 0 or >= Slots) return (false, null, 0, 0);
+        var header = address + HeaderSize + slot * SlotSize;
+        var width = *(int*)header;
+        var height = *(int*)(header + 4);
+        var length = *(int*)(header + 8);
+        if (width < 64 || height < 64 || width > MaxWidth || height > MaxHeight ||
+            length != checked(width * height * 4)) return (false, null, 0, 0);
+        if (!repeat && sequence == consumed) return (true, null, width, height);
+        if (Interlocked.CompareExchange(ref State(slot), 3, 2) != 2) return (true, null, width, height);
+        if (!Active || sequence != Volatile.Read(ref Int64(16)))
+        {
+            Volatile.Write(ref State(slot), 2);
+            return (true, null, width, height);
+        }
+        consumed = sequence;
+        return (true, new((nint)(header + SlotHeaderSize), width, height,
+            () => Volatile.Write(ref State(slot), 2)), width, height);
+    }
+
+    ref int Int32(int offset) => ref *(int*)(address + offset);
+    ref long Int64(int offset) => ref *(long*)(address + offset);
+    ref int State(int slot) => ref Int32(32 + slot * 4);
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+        view.SafeMemoryMappedViewHandle.ReleasePointer();
+        view.Dispose(); mapping.Dispose(); file.Dispose();
+    }
+}
+
+sealed class SharedFrame(nint pixels, int width, int height, Action release) : IDisposable
+{
+    Action? releaseFrame = release;
+    public nint Pixels { get; } = pixels;
+    public int Width { get; } = width;
+    public int Height { get; } = height;
+    public void Dispose() => Interlocked.Exchange(ref releaseFrame, null)?.Invoke();
+}
+
+// Source: FfmpegSessionTrace.cs
+static class SessionTrace
+{
+    static readonly object gate = new();
+    static readonly string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "FRD", $"session-{Environment.ProcessId}.log");
+    static long sequence;
+
+    public static void Event(string channel, string state) => Write(channel, state, null);
+    public static void Error(string channel, Exception error) => Write(channel, "error", error);
+
+    static void Write(string channel, string state, Exception? error)
+    {
+        var number = Interlocked.Increment(ref sequence);
+        var details = error == null ? "" : $" type={error.GetType().FullName} hresult=0x{error.HResult:X8}" +
+            (error.InnerException is { } inner ? $" inner={inner.GetType().FullName} innerHresult=0x{inner.HResult:X8}" : "") +
+            (error.StackTrace is { } stack ? " stack=" + stack.Replace('\r', ' ').Replace('\n', '|') : "");
+        var line = $"{DateTimeOffset.UtcNow:O} pid={Environment.ProcessId} seq={number} channel={channel} state={state}{details}{Environment.NewLine}";
+        try
+        {
+            lock (gate)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.AppendAllText(path, line);
+            }
+        }
+        catch (Exception failure) { Console.Error.WriteLine($"[session trace] {failure.GetType().Name}: {failure.Message}"); }
     }
 }
 
@@ -4740,7 +6949,7 @@ static class VideoDatagram
     static readonly ConcurrentDictionary<(string Operation, SocketError Error), byte> transientErrors = new();
     public const uint Magic = 0x32445246;
     public const int Header = 36, MaxSize = 1172, Payload = MaxSize - Header, FeedbackSize = 72;
-    public const int MaxFrameSize = 8 * 1024 * 1024, MaxBufferedBytes = 16 * 1024 * 1024;
+    public const int MaxFrameSize = 40 * 1024 * 1024, MaxBufferedBytes = 80 * 1024 * 1024;
     public static long Now => Stopwatch.GetTimestamp();
     public static double Seconds(long ticks) => (double)ticks / Stopwatch.Frequency;
     public static void Log(string message, Exception? error = null) =>
@@ -4852,7 +7061,7 @@ public sealed class UdpVideoSender : IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         if (video.Data.Length is <= 0 or > VideoDatagram.MaxFrameSize)
-            throw new ArgumentOutOfRangeException(nameof(video), "Encoded access units must contain 1–8388608 bytes.");
+            throw new ArgumentOutOfRangeException(nameof(video), $"Encoded access units must contain 1–{VideoDatagram.MaxFrameSize} bytes.");
         lock (sendGate)
         {
             long firstSendTick = 0;
@@ -5342,6 +7551,7 @@ static partial class FfmpegUi
         createWindow = () => new DesktopWindow(config, autoCloseSeconds, reportPath, remote);
         AppBuilder.Configure<DemoApplication>().UsePlatformDetect().LogToTrace().StartWithClassicDesktopLifetime([]);
         if (regressionExitCode != 0) Environment.ExitCode = regressionExitCode;
+        SessionTrace.Event("controller-process", $"exit-code-{Environment.ExitCode}");
     }
 
     public static void RunPresentationRegression(AppConfiguration config, string reportPath)
@@ -5373,15 +7583,18 @@ static partial class FfmpegUi
         readonly string? reportPath;
         readonly int autoCloseSeconds;
         readonly ComboBox presets = new() { Name = "EncoderPreset", HorizontalAlignment = HorizontalAlignment.Stretch };
-        readonly ComboBox transmissionScale = new() { Name = "TransmissionScale", Width = 165, IsEnabled = false };
+        readonly Border presetMenu = new() { IsVisible = false };
         readonly Slider bitrate = new() { Name = "BitrateLimit", Minimum = .1, Maximum = 100, TickFrequency = .1, IsSnapToTickEnabled = true };
         readonly TextBlock bitrateLabel = new() { Name = "BitrateValueMbps", FontSize = 11, Opacity = .75 };
+        readonly Button[] fpsButtons = new[] { 10, 20, 30, 60 }.Select(value => new Button
+            { Name = $"Fps{value}", Content = $"{value}", Tag = value, MinWidth = 35, Padding = new Thickness(5, 2) }).ToArray();
+        int selectedFps;
         readonly TextBlock metrics = new() { TextWrapping = TextWrapping.Wrap, FontSize = 12 };
         readonly TextBlock operation = new() { TextWrapping = TextWrapping.Wrap };
         readonly TextBlock captureDetails = new() { TextWrapping = TextWrapping.Wrap, Opacity = .8, Margin = new Thickness(0, 4, 0, 6) };
         readonly TextBlock summary = new() { Text = "FRD · 真实屏幕 / FFmpeg / UDP", VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis };
         readonly TextBlock[] timings = Enumerable.Range(0, 6).Select(_ => new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 3, 8, 3) }).ToArray();
-        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto") };
+        readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto") };
         readonly DiagnosticWatermark watermark = new();
         readonly TextBlock controlTitle = new() { Text = "FRD 控制", VerticalAlignment = VerticalAlignment.Center };
         readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Ctrl+Alt 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
@@ -5404,6 +7617,7 @@ static partial class FfmpegUi
         readonly LinkedList<RemoteInputEvent> inputQueue = new();
         readonly SemaphoreSlim inputReady = new(0, 1), inputTransition = new(1, 1);
         readonly CancellationTokenSource inputStop = new();
+        CancellationTokenSource? inputChannelStop;
         readonly List<string> errors = new();
         readonly DateTime startedUtc = DateTime.UtcNow;
         DesktopStreamSource? capture;
@@ -5421,7 +7635,7 @@ static partial class FfmpegUi
         bool updatingInput, changingDiagnostics, updatingDiagnostics;
         long inputSent, inputRejected, coalescedMoves;
         SessionStatus? pendingStatus;
-        bool started, stopping, allowClose, applying, applyAgain;
+        bool started, stopping, allowClose, applying, applyAgain, disconnected, restartRequested, scheduledClose;
         long receivedFrames, shownFrames;
         int successfulChanges;
         object? overlayCheck;
@@ -5431,13 +7645,14 @@ static partial class FfmpegUi
         {
             remoteOptions = remote;
             this.config = config; this.autoCloseSeconds = autoCloseSeconds; this.reportPath = reportPath;
+            selectedFps = config.FramesPerSecond;
             ToolTip.SetTip(inputEnabled, "转发鼠标移动、点击、拖动、滚轮和键盘；Ctrl+Alt 退出并释放按键。");
             preview.Presented += (frameId, tick) => { Interlocked.Increment(ref shownFrames); session?.ReportPresented(frameId, tick); };
             preview.Failed += ex => { if (Dispatcher.UIThread.CheckAccess()) ReportError(ex); else Dispatcher.UIThread.Post(() => ReportError(ex)); };
             preview.Input += QueueInput;
             preview.InputExitRequested += () => inputEnabled.IsChecked = false;
             preview.LocalShortcutRequested += HandleLocalShortcut;
-            Title = autoCloseSeconds > 0 ? "FRD — 自动回归（完成后关闭）" : "FRD — FFmpeg 真实屏幕 / localhost UDP";
+            Title = autoCloseSeconds > 0 ? "FRD — 自动回归（完成后关闭）" : "FRD — 真实屏幕 / localhost UDP";
             if (remote != null) { Title = $"FRD 主控端 — {remote.Host}:{remote.Port}"; ToolTip.SetTip(inputEnabled, "转发到被控端；Ctrl+Alt 退出并释放按键。"); }
             Width = 1280; Height = 860; MinWidth = 680; MinHeight = 460; CanResize = true;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
@@ -5452,18 +7667,30 @@ static partial class FfmpegUi
             }).ToArray();
             presets.ItemsSource = entries;
             presets.SelectedItem = entries.FirstOrDefault(item => Equals(item.Tag, config.InitialPreset));
+            RebuildPresetMenu();
             bitrate.Maximum = config.MaximumBitrateMbps;
             bitrate.Value = Math.Clamp(config.InitialBitrateKbps / 1000d, .1, config.MaximumBitrateMbps); UpdateBitrateLabel();
             presets.IsEnabled = bitrate.IsEnabled = false;
-            presets.SelectionChanged += (_, _) => ScheduleApply();
-            transmissionScale.SelectionChanged += (_, _) => ScheduleApply();
+            foreach (var button in fpsButtons)
+            {
+                button.IsEnabled = false;
+                button.Click += (_, _) =>
+                {
+                    selectedFps = (int)button.Tag!;
+                    UpdateFpsButtons();
+                    ScheduleApply();
+                };
+            }
+            UpdateFpsButtons();
+            presets.SelectionChanged += (_, _) => { UpdateBitrateAvailability(); ScheduleApply(); };
             bitrate.PropertyChanged += (_, args) =>
             {
                 if (args.Property == Slider.ValueProperty) { UpdateBitrateLabel(); ScheduleApply(); }
             };
             refresh.Tick += (_, _) => RefreshStatus();
             debounce.Tick += (_, _) => ApplySelection();
-            autoClose.Tick += (_, _) => { autoClose.Stop(); Close(); };
+            autoClose.Tick += (_, _) => { scheduledClose = true; autoClose.Stop(); Close(); };
+            reconnect.Click += (_, _) => { restartRequested = true; Close(); };
             collapse.Click += (_, _) => ToggleDetails();
             inputEnabled.IsCheckedChanged += (_, _) => ChangeInputToggle();
             clipboardEnabled.IsCheckedChanged += async (_, _) =>
@@ -5493,10 +7720,26 @@ static partial class FfmpegUi
             };
             Opened += Start;
             Closing += Shutdown;
+            Closed += (_, _) =>
+            {
+                SessionTrace.Event("window", restartRequested ? "closed-for-manual-new-session" : disconnected ?
+                    "closed-after-disconnect" : scheduledClose ? "scheduled-close" : "user-or-test-close");
+                if (restartRequested) LaunchNewSession();
+            };
         }
 
         static void Add(Grid grid, Control child, int row) { Grid.SetRow(child, row); grid.Children.Add(child); }
-        void UpdateBitrateLabel() => bitrateLabel.Text = $"码率上限 · {bitrate.Value:0.0##} Mbps";
+        bool HasSelectedBitrateCap() => presets.SelectedItem is ComboBoxItem { Tag: string id } &&
+            config.Presets.TryGetValue(id, out var preset) && preset.BitrateControlled;
+
+        void UpdateBitrateAvailability()
+        {
+            bitrate.IsEnabled = started && !stopping && HasSelectedBitrateCap();
+            UpdateBitrateLabel();
+        }
+
+        void UpdateBitrateLabel() => bitrateLabel.Text = HasSelectedBitrateCap()
+            ? $"码率上限 · {bitrate.Value:0.0##} Mbps" : "无损模式 · 不限制码率";
 
         void ExcludeFromCapture(Window window, string description)
         {
@@ -5514,7 +7757,8 @@ static partial class FfmpegUi
                 if (remoteOptions == null)
                 {
                     capture = new(config.TransmissionScale); config = config with { Width = capture.Width, Height = capture.Height };
-                    session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                    session = new(config, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight,
+                        capture.CaptureMapped, capture.SetPixelMode);
                 }
                 else session = new(config, remoteOptions);
                 session.Failed += error => Dispatcher.UIThread.Post(() => ReportError(error));
@@ -5524,12 +7768,13 @@ static partial class FfmpegUi
                 if (remoteOptions != null)
                 {
                     config = session.Configuration;
+                    selectedFps = config.FramesPerSecond; UpdateFpsButtons();
                     bitrate.Maximum = config.MaximumBitrateMbps;
                     bitrate.Value = config.InitialBitrateKbps / 1000d;
                     presets.ItemsSource = config.Presets.Select(entry => new ComboBoxItem
                         { Content = entry.Value.Label, Tag = entry.Key, IsEnabled = entry.Value.Enabled }).ToArray();
                     presets.SelectedItem = presets.Items.Cast<ComboBoxItem>().FirstOrDefault(item => (string?)item.Tag == config.InitialPreset);
-                    transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
+                    RebuildPresetMenu();
                 }
                 if (stopping) return;
                 await StartInputAsync();
@@ -5539,12 +7784,17 @@ static partial class FfmpegUi
                         if (stopping) return;
                         try { preview.SetRemoteCursor(update); if (InteractionScriptPath != null) interactionCursors.Add(update); }
                         catch (Exception error) { ReportError(error); }
-                    }), error => Dispatcher.UIThread.Post(() => ReportError(error)), inputStop.Token);
+                    }), error => Dispatcher.UIThread.Post(() =>
+                    {
+                        Console.Error.WriteLine("[cursor] Auxiliary channel failed; video session remains active: " + error);
+                        operation.Text = "远端光标同步中断；视频会话仍在运行。";
+                    }), inputStop.Token);
                 if (stopping) return;
-                started = true; presets.IsEnabled = bitrate.IsEnabled = transmissionScale.IsEnabled = true;
+                started = true; presets.IsEnabled = true; UpdateBitrateAvailability();
+                foreach (var button in fpsButtons) button.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
                 clipboardEnabled.IsEnabled = session.IsRemote;
-                operation.Text = $"已连接：{config.InitialPreset} / {config.InitialBitrateKbps / 1000d:0.###} Mbps / {config.TransmissionScale}× {config.Width}×{config.Height}";
+                operation.Text = $"已连接：{config.InitialPreset} / {(HasSelectedBitrateCap() ? $"{config.InitialBitrateKbps / 1000d:0.###} Mbps" : "无损不限码率")} / 原始分辨率 {config.Width}×{config.Height}";
                 if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
                 if (InteractionScriptPath != null)
                 {
@@ -5577,8 +7827,13 @@ static partial class FfmpegUi
         {
             if (session?.IsRemote == true)
             {
+                if (inputWorker != null) await inputWorker;
                 inputClient = await session.ConnectRemoteInputAsync(inputStop.Token);
-                inputWorker = Task.Run(SendInputLoopAsync); return;
+                inputChannelStop?.Dispose();
+                inputChannelStop = CancellationTokenSource.CreateLinkedTokenSource(inputStop.Token);
+                var connected = inputClient;
+                var channelToken = inputChannelStop.Token;
+                inputWorker = Task.Run(() => SendInputLoopAsync(connected, channelToken)); return;
             }
             inputInjector = new();
             inputInjector.RegisterControllerWindow(TryGetPlatformHandle()?.Handle ?? 0);
@@ -5590,7 +7845,9 @@ static partial class FfmpegUi
             var client = await RemoteInputClient.ConnectAsync(inputServer.Endpoint, inputStop.Token);
             if (stopping || inputStop.IsCancellationRequested) { client.Dispose(); return; }
             inputClient = client;
-            inputWorker = Task.Run(SendInputLoopAsync);
+            inputChannelStop = CancellationTokenSource.CreateLinkedTokenSource(inputStop.Token);
+            var localToken = inputChannelStop.Token;
+            inputWorker = Task.Run(() => SendInputLoopAsync(client, localToken));
         }
 
         async Task SetClipboardAsync(bool enabled)
@@ -5641,7 +7898,7 @@ static partial class FfmpegUi
             catch (Exception ex) { ReportError(ex); }
         }
 
-        async Task SetInputAsync(bool enabled)
+        async Task SetInputAsync(bool enabled, CancellationToken token = default)
         {
             if (!enabled) { preview.SetInputEnabled(false); lock (inputGate) inputQueue.Clear(); }
             await inputTransition.WaitAsync();
@@ -5649,8 +7906,9 @@ static partial class FfmpegUi
             try
             {
                 enabled &= !stopping;
+                if (enabled && inputClient == null) await StartInputAsync();
                 if (inputClient == null) throw new InvalidOperationException("输入通道尚未连接");
-                var result = await inputClient.SetEnabledAsync(enabled);
+                var result = await inputClient.SetEnabledAsync(enabled, token);
                 if (!result.Accepted) throw new InvalidOperationException(result.Message);
                 if (enabled && stopping) { await inputClient.SetEnabledAsync(false); enabled = false; }
                 preview.SetInputEnabled(enabled);
@@ -5682,17 +7940,18 @@ static partial class FfmpegUi
                 else
                 {
                     preview.SetInputEnabled(false);
-                    inputEnabled.IsChecked = false;
-                    ReportError(new InvalidOperationException("键鼠转发积压，已停止输入并释放按键；未继续累积事件。"));
+                    var overflow = new InvalidOperationException("键鼠转发积压，已停止输入并释放按键；未继续累积事件。");
+                    if (session?.IsRemote == true) HandleInputFailure(inputClient!, overflow);
+                    else ReportError(overflow);
                     return;
                 }
                 if (inputReady.CurrentCount == 0) inputReady.Release();
             }
         }
 
-        async Task SendInputLoopAsync()
+        async Task SendInputLoopAsync(RemoteInputClient connected, CancellationToken channelToken)
         {
-            using var sending = CancellationTokenSource.CreateLinkedTokenSource(inputStop.Token);
+            using var sending = CancellationTokenSource.CreateLinkedTokenSource(channelToken);
             List<Task> confirmations = new();
             Exception? failure = null;
             try
@@ -5706,7 +7965,7 @@ static partial class FfmpegUi
                         lock (inputGate) { next = inputQueue.First?.Value; if (next != null) inputQueue.RemoveFirst(); }
                         if (next == null) break;
                         // Preserve wire order, but let the next input leave before this event's remote confirmation.
-                        var confirmation = await inputClient!.QueueAsync(next, sending.Token);
+                        var confirmation = await connected.QueueAsync(next, sending.Token);
                         confirmations.RemoveAll(task => task.IsCompleted);
                         confirmations.Add(ObserveAsync(confirmation));
                     }
@@ -5742,20 +8001,39 @@ static partial class FfmpegUi
             {
                 if (Interlocked.CompareExchange(ref failure, error, null) != null) return;
                 Console.Error.WriteLine(error);
-                inputClient?.Dispose();
+                connected.Dispose();
                 sending.Cancel();
-                Dispatcher.UIThread.Post(() => { preview.SetInputEnabled(false); inputEnabled.IsChecked = false; ReportError(error); });
+                Dispatcher.UIThread.Post(() => HandleInputFailure(connected, error));
             }
+        }
+
+        void HandleInputFailure(RemoteInputClient connected, Exception error)
+        {
+            if (stopping || !ReferenceEquals(inputClient, connected)) return;
+            SessionTrace.Error("input-auxiliary", error);
+            inputChannelStop?.Cancel(); connected.Dispose(); inputClient = null;
+            preview.SetInputEnabled(false);
+            lock (inputGate) inputQueue.Clear();
+            updatingInput = true; inputEnabled.IsChecked = false; updatingInput = false;
+            operation.Text = "键鼠通道已中断；视频仍在运行。重新勾选“键鼠”可建立新的输入通道。";
+        }
+
+        void UpdateFpsButtons()
+        {
+            foreach (var button in fpsButtons)
+                button.Opacity = (int)button.Tag! == selectedFps ? 1 : .55;
         }
 
         async Task StopInputAsync()
         {
             preview.SetInputEnabled(false);
-            try { if (inputClient != null) await SetInputAsync(false); }
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+            try { if (inputClient != null) await SetInputAsync(false, timeout.Token); }
             finally
             {
-                inputStop.Cancel(); inputClient?.Dispose();
+                inputStop.Cancel(); inputChannelStop?.Cancel(); inputClient?.Dispose();
                 if (inputWorker != null) await inputWorker;
+                inputChannelStop?.Dispose();
                 inputServer?.Dispose();
                 inputInjector?.Dispose();
             }
@@ -5769,14 +8047,15 @@ static partial class FfmpegUi
             if (presets.SelectedItem is not ComboBoxItem { Tag: string presetId }) return;
             applying = true;
             var limit = (int)Math.Round(bitrate.Value * 1000);
-            operation.Text = $"正在请求被控端应用 {presetId} / {limit / 1000d:0.###} Mbps…";
+            var rateText = HasSelectedBitrateCap() ? $"{limit / 1000d:0.###} Mbps" : "无损不限码率";
+            operation.Text = $"正在请求被控端应用 {presetId} / {rateText} / {selectedFps} FPS…";
             try
             {
-                var scale = transmissionScale.SelectedItem is ComboBoxItem { Tag: double selectedScale } ? selectedScale : config.TransmissionScale;
-                var result = await session.ApplyAsync(presetId, limit, scale);
+                var result = await session.ApplyAsync(presetId, limit, framesPerSecond: selectedFps);
                 config = session.Configuration;
                 if (result.Success) successfulChanges++;
-                operation.Text = result.Success ? $"已应用：{presetId} / {limit / 1000d:0.###} Mbps / {config.TransmissionScale}× {config.Width}×{config.Height}（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
+                if (!result.Success) { selectedFps = config.FramesPerSecond; UpdateFpsButtons(); }
+                operation.Text = result.Success ? $"已应用：{presetId} / {rateText} / {config.FramesPerSecond} FPS / {config.Width}×{config.Height}（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
                 if (!result.Success) Console.Error.WriteLine($"[UI control] {result.Message}");
             }
             catch (Exception ex) { ReportError(ex); }
@@ -5789,19 +8068,34 @@ static partial class FfmpegUi
 
         void RefreshStatus()
         {
+            if (!stopping && session?.IsRemote == true && inputClient is { Failure: { } inputError } failedInput)
+                HandleInputFailure(failedInput, inputError);
+            if (disconnected)
+            {
+                summary.Text = "原会话已断开 · 等待手动建立新会话";
+                metrics.Text = "查看控制栏中的断连原因；原 TCP 连接不会自动重新握手。";
+                return;
+            }
             SessionStatus? status;
             lock (receiveGate) status = pendingStatus;
+            var remoteWait = session?.RemoteStatusWaitSeconds ?? 0;
             if (status is { } currentStatus)
             {
                 string Mean(double value) => currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming ? $"{value:F2}" : "—";
                 var latency = currentStatus.HasRenderTiming ? $"最近 {currentStatus.CaptureToRenderMs:F1} / 近 1 秒平均 {Mean(currentStatus.MeanCaptureToRenderMs)} ms（{currentStatus.RenderTimingSamples} 帧）" : "等待首次 GPU 确认";
-                summary.Text = $"{currentStatus.ActivePreset} · {currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
+                var cap = currentStatus.AppliedLimitKbps > 0 ? $"{currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps" : "无损不限码率";
+                summary.Text = $"{currentStatus.ActivePreset} · {cap} · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
                 metrics.Text = $"发送 {currentStatus.SentMbps:F3} / 接收 {currentStatus.ReceivedMbps:F3} Mbps  |  带宽估计 {currentStatus.EstimatedMbps:F3} Mbps（参考）\n诊断包：{(currentStatus.PacketDiagnosticsEnabled ? "开" : "关")}，开销 {currentStatus.DiagnosticMbps * 1000:F2} kbps（已计入流量）\n捕获 → GPU 完成：{latency}  |  绘制 {currentStatus.RenderedFps:F1} / 解码 {currentStatus.DecodedFps:F1} FPS\n网络延迟趋势 {currentStatus.DelayTrendMs:+0.00;-0.00;0.00} ms  |  丢包 {currentStatus.LossRate:P1}  |  {currentStatus.Message}";
                 if (!changingDiagnostics) { updatingDiagnostics = true; packetDiagnostics.IsChecked = currentStatus.PacketDiagnosticsEnabled; updatingDiagnostics = false; }
                 metrics.Text += "\n" + currentStatus.TimingDescription;
                 metrics.Text += status.SimulatedCapacityMbps > 0
                     ? $" · 专项链路模拟 {status.SimulatedCapacityMbps:0.##} Mbps"
                     : " · UDP 即时发送，滑条仅限制编码码率";
+                if (remoteWait >= 3)
+                {
+                    summary.Text = $"网络路径暂停 {remoteWait:F0} 秒 · 等待原会话恢复";
+                    metrics.Text = $"控制连接仍未被明确关闭；已等待 {remoteWait:F1} 秒。画面与统计可能暂时停留在上一状态。\n" + metrics.Text;
+                }
                 timings[0].Text = $"捕获  {currentStatus.CaptureMs:F2} / {Mean(currentStatus.MeanCaptureMs)}";
                 timings[1].Text = $"编码  {currentStatus.EncodeMs:F2} / {Mean(currentStatus.MeanEncodeMs)}";
                 var transfer = currentStatus.TransferDetails;
@@ -5813,7 +8107,7 @@ static partial class FfmpegUi
                 if (session?.IsRemote == true && !currentStatus.HasRenderTiming)
                     foreach (var timing in timings) timing.Text = (timing.Text ?? "").Split(' ')[0] + "  — / —";
                 var stages = capture?.Statistics;
-                captureDetails.Text = session?.IsRemote == true ? $"被控桌面 {session.RemoteSourceWidth}×{session.RemoteSourceHeight} → {config.Width}×{config.Height}；本机仅接收、解码、渲染" : stages == null ? $"捕获后端：{capture?.Backend ?? "启动中"}" :
+                captureDetails.Text = session?.IsRemote == true ? $"被控桌面 {session.RemoteSourceWidth}×{session.RemoteSourceHeight} → {session.Configuration.Width}×{session.Configuration.Height}；本机仅接收、解码、渲染" : stages == null ? $"捕获后端：{capture?.Backend ?? "启动中"}" :
                     $"DXGI 捕获最近一次（ms）：取帧 {stages.AcquireMs:F2} / 缩放提交 {stages.GpuScaleSubmitMs:F2} / 回读等待 {stages.MapWaitAndReadbackMs:F2} / 像素复制 {stages.CpuRowCopyMs:F2}";
             }
         }
@@ -5824,7 +8118,8 @@ static partial class FfmpegUi
             args.Cancel = true;
             if (stopping) return;
             stopping = true; debounce.Stop(); autoClose.Stop();
-            presets.IsEnabled = bitrate.IsEnabled = transmissionScale.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
+            SessionTrace.Event("window", disconnected ? "closing-after-disconnect" : scheduledClose ? "closing-scheduled" : "closing-by-user-or-test");
+            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
             try { await SetClipboardAsync(false); } catch (Exception ex) { ReportError(ex); }
             try { if (cursorClient != null) await cursorClient.DisposeAsync(); } catch (Exception ex) { ReportError(ex); }
             try { await StopInputAsync(); } catch (Exception ex) { ReportError(ex); }
@@ -5844,9 +8139,37 @@ static partial class FfmpegUi
 
         void ReportError(Exception ex)
         {
+            SessionTrace.Error("controller-window", ex);
             Console.Error.WriteLine(ex); errors.Add(ex.ToString()); operation.Text = "错误：" + ex.Message;
             regressionExitCode = 1;
-            if (!stopping) Dispatcher.UIThread.Post(Close);
+            if (stopping) return;
+            if (remoteOptions == null) { Dispatcher.UIThread.Post(Close); return; }
+            disconnected = true;
+            preview.SetInputEnabled(false);
+            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false;
+            foreach (var button in fpsButtons) button.IsEnabled = false;
+            reconnect.IsVisible = true;
+            operation.Text = $"原连接已中断：{ex.Message}；点击“重新建立会话”将创建新连接。";
+            SessionTrace.Event("window", "disconnected-awaiting-user");
+        }
+
+        void LaunchNewSession()
+        {
+            if (remoteOptions == null) return;
+            try
+            {
+                var executable = Path.Combine(AppContext.BaseDirectory, "FRD.exe");
+                var start = new ProcessStartInfo(executable) { UseShellExecute = false };
+                foreach (var argument in new[] { "--connect", remoteOptions.Host, "--port", remoteOptions.Port.ToString(),
+                    "--token", remoteOptions.Token }) start.ArgumentList.Add(argument);
+                using var launched = Process.Start(start) ?? throw new InvalidOperationException("未能启动新的主控进程。");
+                SessionTrace.Event("window", "user-requested-new-process-and-session");
+            }
+            catch (Exception error)
+            {
+                SessionTrace.Error("manual-new-session", error);
+                Console.Error.WriteLine(error);
+            }
         }
 
         void WriteReport()
@@ -6268,7 +8591,7 @@ static partial class FfmpegUi
                 origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
                 origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
             Control[] expandedControls = [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel,
-                clipboardEnabled, transmissionScale, fullScreen, showWatermark];
+                clipboardEnabled, fullScreen, showWatermark];
             Control[] controls = expanded ? expandedControls : [floatingOrb];
             var visible = controls.All(control => control.IsEffectivelyVisible && control.Bounds.Width > 0 && control.Bounds.Height > 0);
             var rectangles = controls.Select(control =>

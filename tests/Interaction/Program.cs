@@ -67,9 +67,10 @@ static class Program
             }
             finally { NativeCursor.Release(cursor); }
         }
-        foreach (var (source, scale, expected) in new[] { ((2880, 1800), 1d, (2880, 1800)), ((2880, 1800), .75, (2160, 1350)), ((2880, 1800), .5, (1440, 900)), ((2560, 1440), .75, (1920, 1080)), ((1366, 768), .75, (1024, 576)) })
+        foreach (var (source, scale, expected) in new[] { ((2880, 1800), 1d, (2880, 1800)), ((2560, 1440), 1d, (2560, 1440)), ((1366, 768), 1d, (1366, 768)) })
             Check(TransmissionGeometry.Dimensions(source.Item1, source.Item2, scale) == expected, $"Transmission geometry {source} at {scale}");
-        Check(!TransmissionGeometry.IsValidScale(double.NaN) && !TransmissionGeometry.IsValidScale(2), "Invalid transmission scale rejected");
+        Check(!TransmissionGeometry.IsValidScale(double.NaN) && !TransmissionGeometry.IsValidScale(2) &&
+            !TransmissionGeometry.IsValidScale(.75) && !TransmissionGeometry.IsValidScale(.5), "Invalid transmission scale rejected");
         foreach (var path in new[] { "../escape", "C:/absolute", "r/a:ads", "r/CON", "r/../x", "r/trailing.", "r\\x" })
         {
             var refused = false;

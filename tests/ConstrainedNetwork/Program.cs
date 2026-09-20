@@ -19,15 +19,25 @@ static class Program
         var watch = Stopwatch.StartNew();
         var smokeOnly = args.Contains("--smoke-only", StringComparer.Ordinal);
         var delayComparison = args.Contains("--delay-vs-queue", StringComparer.Ordinal);
-        var expectedCases = delayComparison ? 2 : smokeOnly ? 1 : 5;
+        var mouseSweep = args.Contains("--mouse-sweep", StringComparer.Ordinal);
+        var expectedCases = mouseSweep ? 6 : delayComparison ? 2 : smokeOnly ? 1 : 5;
         var report = Path.GetFullPath(args.FirstOrDefault(x => !x.StartsWith("--", StringComparison.Ordinal)) ??
-            (delayComparison ? "results/input-latency/delay-vs-queue.json" : "results/input-latency/constrained-network.json"));
+            (mouseSweep ? "results/input-latency/mouse-follow-sweep.json" : delayComparison ? "results/input-latency/delay-vs-queue.json" : "results/input-latency/constrained-network.json"));
         List<CaseResult> results = new();
         Exception? failure = null;
         try
         {
-            if (smokeOnly && delayComparison) throw new ArgumentException("Choose either --smoke-only or --delay-vs-queue.");
-            Scenario[] scenarios = delayComparison ?
+            if ((smokeOnly ? 1 : 0) + (delayComparison ? 1 : 0) + (mouseSweep ? 1 : 0) > 1)
+                throw new ArgumentException("Choose only one of --smoke-only, --delay-vs-queue or --mouse-sweep.");
+            Scenario[] scenarios = mouseSweep ?
+            [
+                new("mouse-idle", false, false, false, false, 3, 5, 10, 0),
+                new("mouse-video-1Mbps", false, false, true, false, 3, 5, 10, 1),
+                new("mouse-video-3Mbps", false, false, true, false, 3, 5, 10, 3),
+                new("mouse-video-5Mbps", false, false, true, false, 3, 5, 10, 5),
+                new("mouse-video-7Mbps", false, false, true, false, 3, 5, 10, 7),
+                new("mouse-video-7Mbps-control-first", false, true, true, false, 3, 5, 10, 7)
+            ] : delayComparison ?
             [
                 new("high-propagation-ample-capacity", false, false, true, false, 3.5, 10, 80),
                 new("low-propagation-overloaded-capacity", false, false, true, false, 3.5, 1, 2)
@@ -42,7 +52,7 @@ static class Program
             foreach (var scenario in scenarios.Take(expectedCases))
             {
                 Console.WriteLine("Starting " + scenario.Name);
-                var result = await Run(smokeOnly ? scenario with { Seconds = .1 } : scenario, delayComparison); results.Add(result);
+                var result = await Run(smokeOnly ? scenario with { Seconds = .1 } : scenario, delayComparison, mouseSweep); results.Add(result);
                 Console.WriteLine($"{scenario.Name}: injected {result.InputCount}, input mean {result.Input.MeanMs:F2}/p95 {result.Input.P95Ms:F2} ms; ACK p95 {result.Acknowledgement.P95Ms:F2} ms; complete video {result.CompleteVideoFrames}/{result.SentVideoFrames}; drop {result.DroppedVideoPackets}");
             }
         }
@@ -54,9 +64,10 @@ static class Program
         File.WriteAllText(report, JsonSerializer.Serialize(new
         {
             Passed = failure is null && results.Count == expectedCases && results.All(x => x.IntegrityPassed), DiagnosticSmokeOnly = smokeOnly,
+            MouseSweep = mouseSweep,
             DelayVersusQueueComparison = delayComparison, DurationSeconds = watch.Elapsed.TotalSeconds,
             PassMeaning = "Pass means input ordering, UDP smoke/frame integrity and experiment completion. It does not mean overloaded video is usable; inspect VideoDeliveryState, VideoStarved, complete frame counts and goodput.",
-            Scope = "Network-only experiment: production pipelined TCP input with mock injector plus production UDP fragmentation/reassembly. Synthetic video payloads, no encoding/decoding/rendering, physical input, real Internet, TCP loss/retransmission, firewall or production tuning changes.",
+            Scope = "Network-only experiment: production pipelined TCP input with mock injector plus production UDP fragmentation/reassembly. Mouse sweep measures generated position to mock application and application ACK, not physical cursor display or video rendering. It bypasses the production UI's unsent-move coalescing. Synthetic video payloads; no encoder, real Internet, TCP loss/retransmission, firewall or production tuning changes.",
             Model = new
             {
                 Capacity = "Shared airtime: all directions/classes serialize through one link. Full duplex: each direction independently receives the configured capacity.",
@@ -67,9 +78,9 @@ static class Program
                 Priority = "Experimental scheduler can identify control traffic; non-video work overtakes queued video but cannot preempt a packet already serializing. This is not a guarantee from public Internet QoS.",
                 Scheduling = "Dedicated thread + high-resolution waitable timer; absolute next serialization/delivery deadline, no fixed frame/packet sleep tick. Scheduler wakeup overrun and actual queue wait are recorded.",
                 TimingBoundary = "Scheduled serialization and configured propagation are simulator inputs, not measurements of a real line. QueueWait, ActualProxyRelease, delivery overrun, mock injection and frame-complete times are measured by Stopwatch. Packet traces use link-construction origin; InputEvents/VideoFrames use timed-load origin. RequestSequence and frame/offset correlation link them without pretending the clocks share the same zero.",
-                Video = "4 Mbps generated payload at 30 FPS before transport overhead, capped by finite link only; no automatic rate adaptation.",
+                Video = mouseSweep ? "0/1/3/5/7 Mbps generated payload at 30 FPS before transport overhead through one 5 Mbps shared link; no automatic rate adaptation." : "4 Mbps generated payload at 30 FPS before transport overhead, capped by finite link only; no automatic rate adaptation.",
                 IntegritySmoke = "Before timed load, a 4 KB payload traverses real UDP fragmentation/reassembly and SHA256 verification. Timed overload is allowed to produce zero complete video frames; such frame-age samples remain absent. Link per-class counters include this startup smoke, but reported timed video goodput excludes its 4352 wire bytes.",
-                Input = "60 generated events per second; generation to mock injection and generation to true application ACK measured on one monotonic clock. ACK does not mean target repaint."
+                Input = mouseSweep ? "120 generated mouse moves per second; generation to mock coordinate application and application ACK measured on one monotonic clock. Mock application does not move the OS pointer; ACK does not mean target repaint." : "60 generated events per second; generation to mock injection and generation to true application ACK measured on one monotonic clock. ACK does not mean target repaint."
             }, Cases = results,
             DelayComparisonMeaning = delayComparison ? "Both cases keep the sender at 4 Mbps and use FIFO shared capacity. Compare configured propagation with measured link queue wait; absolute RTT or ACK age alone does not identify congestion. No bitrate controller, baseline-delay estimator or automatic adaptation is implemented." : null,
             CausalComparison = new
@@ -78,13 +89,20 @@ static class Program
                 SharedFifoMinusPriorityInputP95Ms = fifo is null || priority is null ? (double?)null : fifo.Input.P95Ms - priority.Input.P95Ms,
                 SharedFifoMinusPriorityAckP95Ms = fifo is null || priority is null ? (double?)null : fifo.Acknowledgement.P95Ms - priority.Acknowledgement.P95Ms,
                 Note = "Observed differences are reported without hard-coded latency pass thresholds. Pass checks delivery integrity/order and clean completion, not a desired speedup."
-            }, Error = failure?.ToString()
+            }, MouseSweepComparison = mouseSweep ? new
+            {
+                CapacityMbps = 5,
+                IdleInputP95Ms = results.FirstOrDefault(x => x.Name == "mouse-idle")?.Input.P95Ms,
+                Video7MbpsInputP95Ms = results.FirstOrDefault(x => x.Name == "mouse-video-7Mbps")?.Input.P95Ms,
+                ControlFirst7MbpsInputP95Ms = results.FirstOrDefault(x => x.Name == "mouse-video-7Mbps-control-first")?.Input.P95Ms,
+                Note = "Input means remote mock application of mouse coordinates; visual feedback, physical pointer and real Wi-Fi remain unmeasured."
+            } : null, Error = failure?.ToString()
         }, Json));
         Console.WriteLine($"Finished in {watch.Elapsed.TotalSeconds:F2}s: {report}");
         return failure is null && results.Count == expectedCases && results.All(x => x.IntegrityPassed) ? 0 : 1;
     }
 
-    static async Task<CaseResult> Run(Scenario scenario, bool detailedTiming)
+    static async Task<CaseResult> Run(Scenario scenario, bool detailedTiming, bool mouseSweep = false)
     {
         var generation = new ConcurrentQueue<long>();
         var injection = new ConcurrentBag<double>(); var acknowledgements = new ConcurrentBag<double>();
@@ -95,13 +113,13 @@ static class Program
         var smoke = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var ages = new ConcurrentBag<double>();
         long completedBytes = 0, completedFrames = 0; int inputCount = 0, sentFrames = 0;
-        var source = new MockInput(generation, injection, faults, eventClocks);
+        var source = new MockInput(generation, injection, faults, eventClocks, mouseSweep);
         using var server = new RemoteInputServer(source);
         using var receiver = new UdpVideoReceiver();
         using var link = new FiniteLink(scenario.FullDuplex, scenario.Priority, scenario.Step ? 5 : scenario.CapacityMbps, scenario.PropagationMs, detailedTiming);
         await using var relay = new NetworkRelay(link, server.Endpoint, new(IPAddress.Loopback, receiver.Port), faults);
         using var sender = new UdpVideoSender(relay.UdpEndpoint);
-        sender.SetEncoderBitrateKbps(4000);
+        sender.SetEncoderBitrateKbps(Math.Max(1, (int)(scenario.VideoMbps * 1000)));
         relay.SetSender(new(IPAddress.Loopback, sender.ActualPort));
         receiver.SetExpectedSource(relay.UdpEndpoint);
         receiver.Failed += error => faults.Enqueue(error.ToString()); sender.Failed += error => faults.Enqueue(error.ToString());
@@ -132,11 +150,13 @@ static class Program
             using var timer = new PrecisionTimer(); List<Task> pending = new(); var count = 0;
             while (true)
             {
-                var due = start + (long)(count * Stopwatch.Frequency / 60d);
+                var due = start + (long)(count * Stopwatch.Frequency / (mouseSweep ? 120d : 60d));
                 if (due >= end) break;
                 timer.WaitUntil(due);
                 var at = Stopwatch.GetTimestamp(); var eventId = count + 1; eventClocks[eventId] = new(at, due); generation.Enqueue(at);
-                var acknowledgement = await input.QueueAsync(new(RemoteInputKind.Wheel, (count + 1) / 1000d, .5, WheelDelta: 120)).WaitAsync(Timeout);
+                var move = new RemoteInputEvent(mouseSweep ? RemoteInputKind.MouseMove : RemoteInputKind.Wheel,
+                    (count + 1) / 1000d, .5, WheelDelta: mouseSweep ? 0 : 120);
+                var acknowledgement = await input.QueueAsync(move).WaitAsync(Timeout);
                 pending.Add(Observe(acknowledgement, at, eventId)); count++; Interlocked.Increment(ref inputCount);
             }
             await Task.WhenAll(pending).WaitAsync(Timeout);
@@ -157,7 +177,8 @@ static class Program
                 var due = start + (long)(index * Stopwatch.Frequency / 30d);
                 if (due >= end) break;
                 timer.WaitUntil(due);
-                var bytes = new byte[16_666]; new Random(index + 19).NextBytes(bytes);
+                var payloadBytes = scenario.VideoMbps == 4 ? 16_666 : checked((int)Math.Round(scenario.VideoMbps * 1_000_000 / 8 / 30));
+                var bytes = new byte[payloadBytes]; new Random(index + 19).NextBytes(bytes);
                 var hash = SHA256.HashData(bytes);
                 var now = Stopwatch.GetTimestamp(); frames[index] = (now, hash, bytes.Length, due);
                 sender.Send(new(1, index, true, bytes), CancellationToken.None); Interlocked.Increment(ref sentFrames);
@@ -189,7 +210,7 @@ static class Program
         await Task.Delay(220);
         var elapsed = (Stopwatch.GetTimestamp() - start) / (double)Stopwatch.Frequency;
         var integrity = faults.IsEmpty && !link.HasErrors && smoke.Task.IsCompletedSuccessfully && inputCount == injection.Count && inputCount == acknowledgements.Count && generation.IsEmpty;
-        return new(scenario.Name, scenario.FullDuplex ? "full-duplex" : "shared-airtime", scenario.Priority, scenario.Step ? 5 : scenario.CapacityMbps, scenario.PropagationMs, scenario.Seconds, elapsed,
+        return new(scenario.Name, scenario.FullDuplex ? "full-duplex" : "shared-airtime", scenario.Priority, scenario.Step ? 5 : scenario.CapacityMbps, scenario.PropagationMs, scenario.VideoMbps, scenario.Seconds, elapsed,
             inputCount, Summary(injection), Summary(acknowledgements), sentFrames, completedFrames, ages.IsEmpty ? null : Summary(ages),
             link.DroppedVideoPackets, Math.Max(0, link.DeliveredVideoBytes - 4352) * 8 / elapsed / 1_000_000,
             completedBytes * 8 / elapsed / 1_000_000,
@@ -216,9 +237,9 @@ static class Program
         return new(sorted.Length, sorted.Length == 0 ? 0 : sorted.Average(), Percentile(.5), Percentile(.95), sorted.LastOrDefault());
     }
 
-    sealed record Scenario(string Name, bool FullDuplex, bool Priority, bool Video, bool Step, double Seconds, double CapacityMbps = 1, double PropagationMs = 20);
+    sealed record Scenario(string Name, bool FullDuplex, bool Priority, bool Video, bool Step, double Seconds, double CapacityMbps = 1, double PropagationMs = 20, double VideoMbps = 4);
     public sealed record Distribution(int Count, double MeanMs, double P50Ms, double P95Ms, double MaxMs);
-    sealed record CaseResult(string Name, string Model, bool Priority, double InitialCapacityMbps, double OneWayPropagationMs, double ProductionSeconds, double MeasurementSeconds,
+    sealed record CaseResult(string Name, string Model, bool Priority, double InitialCapacityMbps, double OneWayPropagationMs, double VideoOfferedMbps, double ProductionSeconds, double MeasurementSeconds,
         int InputCount, Distribution Input, Distribution Acknowledgement, long SentVideoFrames, long CompleteVideoFrames,
         Distribution? VideoFrameAge, long DroppedVideoPackets, double VideoWireGoodputMbps, double CompleteFramePayloadGoodputMbps,
         string VideoDeliveryState, bool VideoStarved, bool IntegrityPassed, object Link, object[] RateTrace, object[] InputEvents, object[] VideoFrames, string[] Errors);
@@ -228,12 +249,12 @@ static class Program
         public long Generated = generated, Planned = planned, Injected, Acknowledged;
     }
 
-    sealed class MockInput(ConcurrentQueue<long> generation, ConcurrentBag<double> latency, ConcurrentQueue<string> faults, ConcurrentDictionary<int, EventClock> clocks) : IRemoteInputInjector
+    sealed class MockInput(ConcurrentQueue<long> generation, ConcurrentBag<double> latency, ConcurrentQueue<string> faults, ConcurrentDictionary<int, EventClock> clocks, bool mouseSweep) : IRemoteInputInjector
     {
         int ordinal;
         public RemoteInputResult Inject(RemoteInputEvent input)
         {
-            if (input.Kind != RemoteInputKind.Wheel || input.X != ++ordinal / 1000d || !generation.TryDequeue(out var started))
+            if (input.Kind != (mouseSweep ? RemoteInputKind.MouseMove : RemoteInputKind.Wheel) || input.X != ++ordinal / 1000d || !generation.TryDequeue(out var started))
             { faults.Enqueue("Unexpected or out-of-order input delivery."); return new(false, "Unexpected input"); }
             var injected = Stopwatch.GetTimestamp(); clocks[ordinal].Injected = injected;
             latency.Add(FiniteLink.Milliseconds(injected - started)); return new(true, "mock applied");

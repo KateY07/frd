@@ -49,15 +49,14 @@ static partial class FfmpegUi
                 }
                 if (details.IsVisible) ToggleDetails();
                 var bounds = Win32InputInjector.ReadPrimaryMonitor();
-                foreach (var (size, scale) in new[] { (new Size(780, 520), 1d), (new Size(1060, 640), .75), (new Size(900, 820), .5) })
+                foreach (var size in new[] { new Size(780, 520), new Size(1060, 640), new Size(900, 820) })
                 {
                     Width = size.Width; Height = size.Height;
                     Position = new PixelPoint(Math.Max(0, bounds.Width - (int)(size.Width * RenderScaling) - 16), 16);
-                    transmissionScale.SelectedIndex = scale == 1 ? 0 : scale == .75 ? 1 : 2;
-                    var dimensions = TransmissionGeometry.Dimensions(script.SourceWidth, script.SourceHeight, scale);
-                    await Until(() => !applying && session.Configuration.TransmissionScale == scale && preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height);
+                    var dimensions = TransmissionGeometry.Dimensions(script.SourceWidth, script.SourceHeight, 1);
+                    await Until(() => !applying && session.Configuration.TransmissionScale == 1 && preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height);
                     await Task.Delay(200);
-                    Check(preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height, "Real decoded dimensions at " + scale + "×", new { size, dimensions.Width, dimensions.Height });
+                    Check(preview.VideoWidth == dimensions.Width && preview.VideoHeight == dimensions.Height, "Native decoded dimensions at resized window", new { size, dimensions.Width, dimensions.Height });
                     var watermarkOrigin = watermark.PointToScreen(new Point());
                     var clientOrigin = this.PointToScreen(new Point());
                     Check(watermark.VerifyPassThrough(preview.SourceWindow) && watermarkOrigin.X >= clientOrigin.X && watermarkOrigin.Y >= clientOrigin.Y &&
@@ -91,13 +90,13 @@ static partial class FfmpegUi
                         var screen = new InteractionPoint { X = x, Y = y }; ClientToScreen(preview.SourceWindow, ref screen);
                         SendMessage(preview.SourceWindow, 0x020A, (nuint)(120 << 16), (nint)((screen.Y << 16) | (screen.X & 0xFFFF)));
                         await Task.Delay(100);
-                        expected.Add(new { Scale = scale, WindowWidth = size.Width, WindowHeight = size.Height, TargetX = targetX, TargetY = targetY,
+                        expected.Add(new { Scale = 1, WindowWidth = size.Width, WindowHeight = size.Height, TargetX = targetX, TargetY = targetY,
                             PixelTolerance = Math.Ceiling(Math.Max(script.SourceWidth / (double)rectangle.Right, script.SourceHeight / (double)rectangle.Bottom)) + 2 });
                     }
                     await SetInputAsync(false);
                 }
                 var invalid = await session.ApplyAsync(config.InitialPreset, (int)Math.Round(bitrate.Value * 1000), .25);
-                Check(!invalid.Success && session.Configuration.TransmissionScale == .5, "Invalid scale preserves current stream");
+                Check(!invalid.Success && session.Configuration.TransmissionScale == 1, "Invalid scale preserves native stream");
                 if (script.Input)
                 {
                 await SetInputAsync(true);

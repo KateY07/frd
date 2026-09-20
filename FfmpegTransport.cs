@@ -32,7 +32,7 @@ static class VideoDatagram
     static readonly ConcurrentDictionary<(string Operation, SocketError Error), byte> transientErrors = new();
     public const uint Magic = 0x32445246;
     public const int Header = 36, MaxSize = 1172, Payload = MaxSize - Header, FeedbackSize = 72;
-    public const int MaxFrameSize = 8 * 1024 * 1024, MaxBufferedBytes = 16 * 1024 * 1024;
+    public const int MaxFrameSize = 40 * 1024 * 1024, MaxBufferedBytes = 80 * 1024 * 1024;
     public static long Now => Stopwatch.GetTimestamp();
     public static double Seconds(long ticks) => (double)ticks / Stopwatch.Frequency;
     public static void Log(string message, Exception? error = null) =>
@@ -144,7 +144,7 @@ public sealed class UdpVideoSender : IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         if (video.Data.Length is <= 0 or > VideoDatagram.MaxFrameSize)
-            throw new ArgumentOutOfRangeException(nameof(video), "Encoded access units must contain 1–8388608 bytes.");
+            throw new ArgumentOutOfRangeException(nameof(video), $"Encoded access units must contain 1–{VideoDatagram.MaxFrameSize} bytes.");
         lock (sendGate)
         {
             long firstSendTick = 0;

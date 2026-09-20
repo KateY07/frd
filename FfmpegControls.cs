@@ -17,6 +17,8 @@ static partial class FfmpegUi
     {
         const double OrbSize = 50, ChromeMargin = 12;
         readonly Button fullScreen = new() { Name = "FullScreen", Content = "全屏", Padding = new Thickness(10, 4) };
+        readonly Button reconnect = new() { Name = "Reconnect", Content = "重新建立会话", IsVisible = false,
+            Padding = new Thickness(8, 2), Margin = new Thickness(8, 0, 0, 0) };
         readonly CheckBox showWatermark = new() { Name = "ShowWatermark", Content = "诊断水印", IsChecked = true };
         readonly Button floatingOrb = new()
         {
@@ -38,10 +40,9 @@ static partial class FfmpegUi
         void BuildControls()
         {
             overlay.FontSize = 12;
-            presets.MinHeight = transmissionScale.MinHeight = 28;
-            presets.Height = transmissionScale.Height = double.NaN;
+            presets.MinHeight = 28;
+            presets.Height = double.NaN;
             presets.MinWidth = 130;
-            transmissionScale.Width = 110;
             bitrate.VerticalAlignment = VerticalAlignment.Center;
             controlTitle.Text = "编码预设"; controlTitle.FontSize = 11; controlTitle.Opacity = .75;
             inputEnabled.Content = "键鼠"; inputEnabled.Margin = new Thickness(0);
@@ -55,32 +56,38 @@ static partial class FfmpegUi
             ToolTip.SetTip(packetDiagnostics, "主控切换独立诊断包；关闭后跨机延迟不可测");
             ToolTip.SetTip(clipboardEnabled, clipboardMessage);
 
-            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,110,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
+            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
             controls.Children.Add(controlTitle);
-            var scaleTitle = new TextBlock { Text = "传输比例", FontSize = 11, Opacity = .75 };
             Grid.SetColumn(bitrateLabel, 2); controls.Children.Add(bitrateLabel);
-            Grid.SetColumn(scaleTitle, 4); controls.Children.Add(scaleTitle);
             Grid.SetRow(presets, 2); controls.Children.Add(presets);
             Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 2); controls.Children.Add(bitrate);
-            Grid.SetColumn(transmissionScale, 4); Grid.SetRow(transmissionScale, 2); controls.Children.Add(transmissionScale);
-            Grid.SetColumn(fullScreen, 6); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
-            Grid.SetColumn(collapse, 8); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
+            Grid.SetColumn(fullScreen, 4); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
+            Grid.SetColumn(collapse, 6); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
             Add(details, controls, 0);
-            transmissionScale.ItemsSource = new[] { 1d, .75, .5 }.Select(scale =>
-                new ComboBoxItem { Content = scale == 1 ? "1× 原始" : $"{scale}×", Tag = scale }).ToArray();
-            transmissionScale.SelectedIndex = config.TransmissionScale == 1 ? 0 : config.TransmissionScale == .75 ? 1 : 2;
-            ToolTip.SetTip(transmissionScale, "传输分辨率比例，与窗口缩放无关");
+            presetMenu.CornerRadius = new CornerRadius(4);
+            presetMenu.Margin = new Thickness(0, 5, 0, 0);
+            Add(details, presetMenu, 1);
             var options = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 4) };
             foreach (var check in new[] { inputEnabled, clipboardEnabled, showWatermark, packetDiagnostics })
             {
                 check.FontSize = 12; check.MinHeight = 24; check.Margin = new Thickness(0, 0, 16, 0);
                 options.Children.Add(check);
             }
-            Add(details, options, 1);
+            options.Children.Add(new TextBlock { Text = "FPS", VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 5, 0), Opacity = .75 });
+            foreach (var button in fpsButtons)
+            {
+                button.Margin = new Thickness(0, 0, 3, 0);
+                options.Children.Add(button);
+            }
+            Add(details, options, 2);
             operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
             operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
             operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
-            Add(details, operation, 2);
+            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto") };
+            connectionRow.Children.Add(operation);
+            Grid.SetColumn(reconnect, 1); connectionRow.Children.Add(reconnect);
+            Add(details, connectionRow, 3);
             controlPanel.Child = details;
             chromeRoot.Children.Add(controlPanel); chromeRoot.Children.Add(floatingOrb);
             overlay.Content = chromeRoot;
@@ -96,7 +103,7 @@ static partial class FfmpegUi
             };
             summary.FontSize = 12; diagnosticBody.Children.Add(summary);
             metrics.FontSize = 11; metrics.Margin = new Thickness(0, 3, 0, 4);
-            metrics.Text = "正在启动真实捕获与 FFmpeg…"; diagnosticBody.Children.Add(metrics);
+            metrics.Text = "正在启动真实捕获与编解码…"; diagnosticBody.Children.Add(metrics);
             diagnosticBody.Children.Add(new TextBlock { Text = "分层耗时：最近 / 近 1 秒平均（ms）", Opacity = .8 });
             var timingGrid = new Grid { ColumnDefinitions = new("*,*,*"), RowDefinitions = new("Auto,Auto") };
             for (var i = 0; i < timings.Length; i++)
@@ -116,6 +123,15 @@ static partial class FfmpegUi
             overlay.Deactivated += (_, _) => fullScreenKeyHeld = false;
             showWatermark.IsCheckedChanged += (_, _) => SyncChromeVisibility();
             floatingOrb.Click += (_, _) => ToggleDetails();
+            ToolTip.SetTip(presets, "单击展开控制栏内的预设列表；也可用键盘选择");
+            presets.AddHandler(PointerReleasedEvent, (_, args) =>
+            {
+                if (args.GetCurrentPoint(presets).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonReleased) return;
+                presets.IsDropDownOpen = false;
+                presetMenu.IsVisible = !presetMenu.IsVisible;
+                PositionOverlay();
+                args.Handled = true;
+            }, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerPressedEvent, BeginOrbDrag, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerMovedEvent, ContinueOrbDrag, RoutingStrategies.Tunnel);
             chromeRoot.AddHandler(PointerReleasedEvent, EndOrbDrag, RoutingStrategies.Tunnel);
@@ -128,6 +144,33 @@ static partial class FfmpegUi
             };
         }
 
+        void RebuildPresetMenu()
+        {
+            var choices = new StackPanel { Spacing = 2, Margin = new Thickness(4) };
+            foreach (var item in presets.Items.OfType<ComboBoxItem>())
+            {
+                var choice = new Button
+                {
+                    Content = item.Content, Tag = item.Tag, IsEnabled = item.IsEnabled,
+                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    MinHeight = 27, Padding = new Thickness(8, 3),
+                    Background = Brushes.Transparent, BorderBrush = Brushes.Transparent, BorderThickness = new Thickness(0)
+                };
+                choice.PointerEntered += (_, _) => choice.Background = new SolidColorBrush(Color.Parse(
+                    ActualThemeVariant == ThemeVariant.Dark ? "#334D5A69" : "#E8EDF3"));
+                choice.PointerExited += (_, _) => choice.Background = Brushes.Transparent;
+                choice.Click += (_, _) =>
+                {
+                    presets.SelectedItem = item;
+                    presetMenu.IsVisible = false;
+                    PositionOverlay();
+                };
+                choices.Children.Add(choice);
+            }
+            presetMenu.Child = new ScrollViewer { Content = choices, MaxHeight = 220, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+        }
+
         void ApplyChromeColors()
         {
             var dark = ActualThemeVariant == ThemeVariant.Dark;
@@ -135,6 +178,9 @@ static partial class FfmpegUi
             overlay.Foreground = new SolidColorBrush(Color.Parse(dark ? "#EDF0F3" : "#20252B"));
             controlPanel.Background = new SolidColorBrush(Color.Parse(dark ? "#222529" : "#FAFAFA"));
             controlPanel.BorderBrush = new SolidColorBrush(Color.Parse(dark ? "#484E56" : "#D7DCE1"));
+            presetMenu.Background = controlPanel.Background;
+            presetMenu.BorderBrush = controlPanel.BorderBrush;
+            presetMenu.BorderThickness = new Thickness(1);
         }
 
         void HandleLocalKeyDown(object? sender, KeyEventArgs args)

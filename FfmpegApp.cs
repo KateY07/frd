@@ -13,6 +13,10 @@ public sealed record CodecPreset
     public string Label { get; init; } = "";
     public string EncoderArguments { get; init; } = "";
     public string DecoderArguments { get; init; } = "";
+    public string InputPixelMode { get; init; } = "bgra";
+    public bool BitrateControlled { get; init; } = true;
+    public bool AutoProbe { get; init; }
+    public int MinimumAutoBitrateKbps { get; init; } = 100;
     public bool Enabled { get; init; } = true;
     public string? UnavailableReason { get; init; }
 }
@@ -25,6 +29,7 @@ public sealed record AppConfiguration
     public double TransmissionScale { get; init; } = 1;
     public int FramesPerSecond { get; init; } = 30;
     public string InitialPreset { get; init; } = "h264";
+    public bool AutoSelectCodec { get; init; } = true;
     public int InitialBitrateKbps { get; init; } = 1000;
     public double MaximumBitrateMbps { get; init; } = 100;
     [System.Text.Json.Serialization.JsonIgnore]
@@ -40,9 +45,17 @@ public sealed record AppConfiguration
             throw new InvalidDataException("Expected schemaVersion=3 and even video dimensions between 64 and 7680×4320.");
         if (!double.IsFinite(config.MaximumBitrateMbps) || config.MaximumBitrateMbps is < .1 or > 1000)
             throw new InvalidDataException("maximumBitrateMbps must be between 0.1 and 1000.");
-        if (config.FramesPerSecond is < 1 or > 30 || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
+        if (config.FramesPerSecond is not (10 or 20 or 30 or 60) || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
             throw new InvalidDataException("Invalid FPS, initial bitrate, or initial preset.");
         TransmissionGeometry.ValidateScale(config.TransmissionScale);
+        foreach (var (id, preset) in config.Presets.Where(entry => entry.Value.Enabled))
+        {
+            var pixelMode = CapturePixelModes.Parse(preset.InputPixelMode);
+            if (!preset.BitrateControlled || preset.MinimumAutoBitrateKbps < 100 ||
+                preset.EncoderArguments.Contains("frd_lz4", StringComparison.OrdinalIgnoreCase) ||
+                preset.DecoderArguments.Contains("frd_lz4", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Preset {id}: only bitrate-controlled FFmpeg codecs are supported.");
+        }
         var directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, config.LibraryDirectory));
         FfmpegRuntime.Initialize(directory);
         return config;
@@ -87,14 +100,18 @@ public sealed record ControlResult(bool Success, string Message, int Generation)
     public int Width { get; init; }
     public int Height { get; init; }
     public double TransmissionScale { get; init; } = 1;
+    public int FramesPerSecond { get; init; }
 }
-sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null);
+sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null, int? FramesPerSecond = null);
 sealed record PendingControl(ControlCommand Command, TaskCompletionSource<ControlResult> Completion);
 
 public sealed partial class DemoSession : IDisposable
 {
     AppConfiguration config;
     readonly Func<byte[]> capture;
+    readonly Func<bool, MappedBgraFrame?>? captureMapped;
+    readonly Func<(int Width, int Height)>? captureDimensions;
+    readonly Action<CapturePixelMode>? setCapturePixelMode;
     readonly Action<int, int>? resizeCapture;
     readonly int sourceWidth, sourceHeight;
     readonly CancellationTokenSource stop = new();
@@ -111,7 +128,7 @@ public sealed partial class DemoSession : IDisposable
     long presentationCount;
     TransferTimings? lastTransfer;
     readonly Queue<TransferTimings> transferSamples = new();
-    readonly Dictionary<int, FfmpegDecoder> decoders = new();
+    readonly Dictionary<int, VideoDecoder> decoders = new();
     readonly Dictionary<int, string> presetNames = new();
     readonly ConcurrentQueue<object> changes = new();
     readonly TcpListener controlServer = new(IPAddress.Loopback, 0);
@@ -155,9 +172,18 @@ public sealed partial class DemoSession : IDisposable
             Transfer / Math.Max(1, count), Decode / Math.Max(1, count), Render / Math.Max(1, count));
     }
 
-    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null, int sourceWidth = 0, int sourceHeight = 0)
+    public DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture = null,
+        int sourceWidth = 0, int sourceHeight = 0)
+        : this(config, capture, resizeCapture, sourceWidth, sourceHeight, null) { }
+
+    internal DemoSession(AppConfiguration config, Func<byte[]> capture, Action<int, int>? resizeCapture,
+        int sourceWidth, int sourceHeight, Func<bool, MappedBgraFrame?>? captureMapped,
+        Action<CapturePixelMode>? setCapturePixelMode = null, Func<(int Width, int Height)>? captureDimensions = null)
     {
         this.config = config; this.capture = capture; this.resizeCapture = resizeCapture;
+        this.captureMapped = captureMapped;
+        this.captureDimensions = captureDimensions;
+        this.setCapturePixelMode = setCapturePixelMode;
         this.sourceWidth = sourceWidth; this.sourceHeight = sourceHeight;
     }
 
@@ -190,9 +216,10 @@ public sealed partial class DemoSession : IDisposable
         if (!result.Success) throw new InvalidOperationException(result.Message);
     }
 
-    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null)
+    public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null, int? framesPerSecond = null)
     {
-        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "传输比例仅支持 1×、0.75×、0.5×。", AppliedGeneration);
+        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "仅支持原始分辨率 1×。", AppliedGeneration);
+        if (framesPerSecond is { } fps && fps is not (10 or 20 or 30 or 60)) return new(false, "仅支持 10/20/30/60 FPS。", AppliedGeneration);
         if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
         if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
         if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
@@ -200,18 +227,19 @@ public sealed partial class DemoSession : IDisposable
         var generation = Interlocked.Increment(ref requestedGeneration);
         try
         {
-            FfmpegDecoder decoder;
+            VideoDecoder decoder;
             try { decoder = new(preset.DecoderArguments); }
             catch (Exception ex) { Console.Error.WriteLine(ex); return new(false, ex.Message, AppliedGeneration); }
             lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = presetId; }
-            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale));
+            var result = await ExchangeAsync(new("apply", generation, presetId, limitKbps, Scale: transmissionScale, FramesPerSecond: framesPerSecond));
             if (!result.Success || result.Generation != generation)
             {
                 lock (decoderGate) { decoders.Remove(generation); presetNames.Remove(generation); decoder.Dispose(); }
             }
             changes.Enqueue(new { Preset = presetId, LimitKbps = limitKbps, Result = result });
             if (result.Success && result.Width > 0 && result.Height > 0)
-                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale };
+                config = config with { Width = result.Width, Height = result.Height, TransmissionScale = result.TransmissionScale,
+                    FramesPerSecond = result.FramesPerSecond > 0 ? result.FramesPerSecond : config.FramesPerSecond };
             return result;
         }
         finally { controlGate.Release(); }
@@ -270,7 +298,7 @@ public sealed partial class DemoSession : IDisposable
 
     void EncodeLoop()
     {
-        FfmpegEncoder? encoder = null;
+        VideoEncoder? encoder = null;
         var force = true;
         try
         {
@@ -293,27 +321,39 @@ public sealed partial class DemoSession : IDisposable
                         if (!config.Presets.TryGetValue(cmd.PresetId, out var preset) || !preset.Enabled) throw new InvalidDataException("Preset unavailable on sender.");
                         if (cmd.LimitKbps < 100 || cmd.LimitKbps > config.MaximumBitrateKbps || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
                         var scale = cmd.Scale ?? config.TransmissionScale;
+                        var fps = cmd.FramesPerSecond ?? config.FramesPerSecond;
+                        if (fps is not (10 or 20 or 30 or 60)) throw new InvalidDataException("Unsupported FPS.");
                         TransmissionGeometry.ValidateScale(scale);
-                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) : TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
+                        var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) :
+                            captureDimensions?.Invoke() ?? TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
                         if (resizeCapture == null && cmd.Scale is { } requestedScale && requestedScale != config.TransmissionScale)
                             throw new InvalidOperationException("This capture source cannot change transmission scale.");
                         var resize = dimensions.Width != config.Width || dimensions.Height != config.Height;
                         ControlResult Applied(string text, int revision) => new(true, text, revision)
-                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
-                        if (!resize && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
+                            { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale, FramesPerSecond = fps };
+                        if (!resize && fps == config.FramesPerSecond && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
                         {
-                            sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, cmd.LimitKbps);
+                            sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, encoder.HasBitrateCap ? cmd.LimitKbps : 0);
                             pending.Completion.TrySetResult(Applied("发送端已在原会话更新码率上限", AppliedGeneration));
                             continue;
                         }
-                        var replacement = new FfmpegEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height, config.FramesPerSecond, cmd.LimitKbps);
-                        try { if (resize) resizeCapture!(dimensions.Width, dimensions.Height); }
+                        var pixelMode = CapturePixelModes.Parse(preset.InputPixelMode);
+                        if (pixelMode != CapturePixelMode.Bgra && setCapturePixelMode == null)
+                            throw new NotSupportedException("This capture source cannot provide packed color pixels.");
+                        var replacement = new VideoEncoder(preset.EncoderArguments, dimensions.Width, dimensions.Height,
+                            fps, cmd.LimitKbps, pixelMode);
+                        try
+                        {
+                            if (resize) resizeCapture!(dimensions.Width, dimensions.Height);
+                            setCapturePixelMode?.Invoke(pixelMode);
+                        }
                         catch { replacement.Dispose(); throw; }
                         encoder?.Dispose(); encoder = replacement;
-                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale };
+                        config = config with { Width = dimensions.Width, Height = dimensions.Height, TransmissionScale = scale,
+                            FramesPerSecond = fps };
                         sender!.SetEncoderBitrateKbps(cmd.LimitKbps);
-                        activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, cmd.LimitKbps); Volatile.Write(ref appliedGeneration, cmd.Generation);
-                        force = true; message = "手动控制；带宽估计仅参考";
+                        activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, replacement.HasBitrateCap ? cmd.LimitKbps : 0); Volatile.Write(ref appliedGeneration, cmd.Generation);
+                        force = true; next = Stopwatch.GetTimestamp(); message = "手动控制；带宽估计仅参考";
                         pending.Completion.TrySetResult(Applied("发送端已应用；等待新预设首帧", cmd.Generation));
                     }
                     catch (Exception ex) { Console.Error.WriteLine(ex); pending.Completion.TrySetResult(new(false, ex.Message, AppliedGeneration)); }
@@ -322,13 +362,45 @@ public sealed partial class DemoSession : IDisposable
                 var waitMs = (next - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency;
                 if (waitMs > 0 && stop.Token.WaitHandle.WaitOne((int)Math.Ceiling(waitMs))) break;
                 var captureStart = Stopwatch.GetTimestamp();
-                var pixels = capture();
+                MappedBgraFrame? mapped = null;
+                byte[]? pixels = null;
+                if (encoder.SupportsMappedBgra && captureMapped != null) mapped = captureMapped(force);
+                else pixels = capture();
+                if (mapped == null && pixels == null)
+                {
+                    next = Math.Max(next + Stopwatch.Frequency / config.FramesPerSecond, Stopwatch.GetTimestamp());
+                    continue;
+                }
+                var frameSize = mapped != null ? (mapped.Width, mapped.Height) : captureDimensions?.Invoke() ?? (config.Width, config.Height);
+                if (frameSize.Width != config.Width || frameSize.Height != config.Height)
+                {
+                    if (frameSize.Width is < 64 or > 8192 || frameSize.Height is < 64 or > 8192 ||
+                        (frameSize.Width & 1) != 0 || (frameSize.Height & 1) != 0)
+                        throw new InvalidDataException($"Invalid source resolution {frameSize.Width}x{frameSize.Height}.");
+                    var preset = config.Presets[activePreset];
+                    var replacement = new VideoEncoder(preset.EncoderArguments, frameSize.Width, frameSize.Height,
+                        config.FramesPerSecond, appliedLimit, CapturePixelModes.Parse(preset.InputPixelMode));
+                    encoder.Dispose(); encoder = replacement;
+                    config = config with { Width = frameSize.Width, Height = frameSize.Height };
+                    var generation = Interlocked.Increment(ref appliedGeneration);
+                    Interlocked.Exchange(ref requestedGeneration, generation);
+                    if (diagnosticDestination == null)
+                    {
+                        var decoder = new VideoDecoder(preset.DecoderArguments);
+                        lock (decoderGate) { decoders[generation] = decoder; presetNames[generation] = activePreset; }
+                    }
+                    force = true;
+                    Console.Error.WriteLine($"[video] Source resolution changed to {frameSize.Width}x{frameSize.Height}; encoder generation {generation}, keyframe required.");
+                }
                 var capturedTick = Stopwatch.GetTimestamp();
                 Interlocked.Add(ref captureTicks, capturedTick - captureStart);
                 var encodeStart = Stopwatch.GetTimestamp();
                 var inputId = nextFrameId++; inputClocks[inputId] = (captureStart, capturedTick);
                 inputClocks.Remove(inputId - 4096);
-                var packets = encoder.Encode(pixels, inputId, force); force = false;
+                IReadOnlyList<CodecPacket> packets;
+                try { packets = mapped != null ? encoder.EncodeMapped(mapped, inputId, force) : encoder.Encode(pixels!, inputId, force); }
+                finally { mapped?.Dispose(); }
+                force = false;
                 var encodedTick = Stopwatch.GetTimestamp();
                 Interlocked.Add(ref encodeTicks, encodedTick - encodeStart);
                 Interlocked.Increment(ref encodedFrames);
@@ -468,6 +540,7 @@ public sealed partial class DemoSession : IDisposable
 
     void ReportError(string stage, Exception ex)
     {
+        SessionTrace.Error(stage, ex);
         message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
         stop.Cancel();
         if (Interlocked.Exchange(ref failureReported, 1) == 0) Failed?.Invoke(ex);
@@ -542,7 +615,7 @@ public sealed partial class DemoSession : IDisposable
         Network = sender?.Snapshot ?? remoteNetwork, Changes = changes.ToArray(), Message = message,
         Mode = IsRemote ? "remote-controller" : diagnosticDestination != null ? "remote-host" : "localhost-demo",
         ClockTiming = IsRemote ? RemoteTimingDescription : "One local monotonic clock",
-        Scope = "Capture start -> FFmpeg encode -> immediate UDP (unless explicit simulation is enabled) -> FFmpeg decode -> BGRA -> DXGI Present -> D3D11 GPU completion. Only confirmed presentations contribute to timing; physical scanout is not measured. Separate optional diagnostic UDP packets do not change video packets or gate rendering. Local mode uses one monotonic clock; remote mode estimates clock offset with the uncertainty shown in ClockTiming. The slider controls encoder bitrate only."
+        Scope = "Capture start -> selected encoder -> immediate UDP (unless explicit simulation is enabled) -> selected decoder -> BGRA -> DXGI Present -> D3D11 GPU completion. Only confirmed presentations contribute to timing; physical scanout is not measured. Separate optional diagnostic UDP packets do not change video packets or gate rendering. Local mode uses one monotonic clock; remote mode estimates clock offset with the uncertainty shown in ClockTiming. The slider caps encoder bitrate; it does not pace UDP sends."
     };
 
     TransferTimings[] GetTransferSamples()
@@ -586,26 +659,65 @@ static class Program
                     .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
                 return 0;
             }
+            if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
+                return AutoCodecProbe.RunWorker(args);
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
-                "--presentation-regression" or "--static-regression" or "--demo-regression")) throw new ArgumentException(RemoteLaunch.Usage);
+                "--presentation-regression" or "--static-regression" or "--demo-regression" or "--cpu-presets-regression" or
+                "--auto-probe-regression" or "--gpu-prereadback-regression" or "--gpu-quantized-encode-regression" or "--packed-presets-regression")) throw new ArgumentException(RemoteLaunch.Usage);
             var remoteOptions = args.Length > 0 && args[0] is "--host" or "--connect" ? RemoteLaunch.Parse(args) : null;
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
-            if (remoteOptions != null) return RemoteLaunch.Run(config, remoteOptions);
+            if (args.Length > 0 && args[0] == "--gpu-prereadback-regression")
+                return GpuPreReadbackRegression.Run(args.Length > 1 ? args[1] : "results/gpu-prereadback.json");
+            if (args.Length > 0 && args[0] == "--gpu-quantized-encode-regression")
+                return GpuQuantizedEncodeRegression.Run(args.Length > 1 ? args[1] : "results/gpu-quantized-encode.json", args.Length > 2 ? args[2] : null);
+            if (args.Length > 0 && args[0] == "--packed-presets-regression")
+            {
+                GpuQuantizedEncodeRegression.RunSessionAsync(config, args.Length > 1 ? args[1] : "results/packed-presets.json")
+                    .GetAwaiter().GetResult();
+                return 0;
+            }
+            if (args.Length > 0 && args[0] == "--auto-probe-regression")
+            {
+                var selected = AutoCodecProbe.SelectSender(config);
+                var receiver = AutoCodecProbe.SelectReceiver(config, selected.Samples);
+                var output = args.Length > 1 ? args[1] : "results/auto-codec-probe.json";
+                Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
+                File.WriteAllText(output, JsonSerializer.Serialize(new
+                {
+                    SelectedPreset = selected.Configuration.InitialPreset,
+                    ReceiverSelectedPreset = receiver.InitialPreset,
+                    Candidates = selected.Samples.Select(sample => new
+                    { sample.PresetId, sample.CaptureMs, sample.EncodeMs, sample.LocalDecodeMs, Bytes = sample.Packet.Length })
+                }, AppConfiguration.JsonOptions));
+                return selected.Samples.Length > 0 ? 0 : 1;
+            }
+            if (remoteOptions != null)
+            {
+                var selected = remoteOptions.Host ? AutoCodecProbe.SelectSender(config) : (config, Array.Empty<CodecProbeSample>());
+                return RemoteLaunch.Run(selected.Item1, remoteOptions, selected.Item2);
+            }
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--presentation-regression") { FfmpegUi.RunPresentationRegression(config, args.Length > 1 ? args[1] : "results/ffmpeg-presentation.json"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--static-regression") { FfmpegRegression.RunStaticLowBandwidth(config, args.Length > 1 ? args[1] : "results/ffmpeg-static"); return Environment.ExitCode; }
+            if (args.Length > 0 && args[0] == "--cpu-presets-regression")
+            {
+                CpuPresetRegression.Run(config, args.Length > 1 ? args[1] : "results/cpu-presets.json").GetAwaiter().GetResult();
+                return 0;
+            }
             if (args.Length > 0 && args[0] == "--demo-regression")
             {
                 var seconds = args.Length > 1 ? int.Parse(args[1]) : 10;
                 var output = args.Length > 2 ? args[2] : "results/ffmpeg-demo.json";
                 FfmpegUi.Run(config, seconds, output); return Environment.ExitCode;
             }
+            config = AutoCodecProbe.SelectSender(config).Configuration;
             FfmpegUi.Run(config); return Environment.ExitCode;
         }
         catch (Exception ex)
         {
+            SessionTrace.Error("process-startup", ex);
             Console.Error.WriteLine(ex);
             try { File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "startup-error.txt"), ex.ToString()); }
             catch (Exception logError) { Console.Error.WriteLine("Cannot write startup-error.txt: " + logError); }

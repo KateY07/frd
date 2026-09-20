@@ -28,7 +28,7 @@ static class Program
             await CancelDisableWaitingForSlot();
             await DelayedEnableCannotReviveDisable();
             await RejectedDisableClosesConnection();
-            await WindowAndTimeout();
+            await WindowAndPathPause();
         }
         catch (Exception error) { Console.Error.WriteLine(error); failure = error; }
         var report = Path.GetFullPath(args.FirstOrDefault() ?? "results/input-latency/pipeline-regression.json");
@@ -258,7 +258,7 @@ static class Program
             new { Result = result, client.Enabled, mock.Held, mock.Releases });
     }
 
-    static async Task WindowAndTimeout()
+    static async Task WindowAndPathPause()
     {
         using var peer = await ScriptedPeer.Create();
         await peer.Enable();
@@ -277,10 +277,14 @@ static class Program
         Check(released.Sequence == 66 && (await replies[0].WaitAsync(Deadline)).Accepted && !extra.IsCompleted,
             "One ACK releases exactly one window slot and preserves sequence");
         var outstanding = replies.Skip(1).Append(extra).ToArray();
-        var errors = await Task.WhenAll(outstanding.Select(Fault)).WaitAsync(TimeSpan.FromSeconds(6));
-        Check(errors.All(x => x is TimeoutException) && !peer.Client.Enabled && outstanding.All(x => x.IsFaulted),
-            "One missing ACK timeout faults every remaining request and closes forwarding", new { Outstanding = errors.Length, Seconds = watch.Elapsed.TotalSeconds });
-        Check(watch.Elapsed.TotalSeconds is >= 4.5 and < 7, "The configured acknowledgement deadline is approximately five seconds; tested once", watch.Elapsed.TotalSeconds);
+        await Task.Delay(5300);
+        Check(peer.Client.Enabled && peer.Client.Failure == null && outstanding.All(x => !x.IsCompleted),
+            "A delayed ACK does not close an otherwise open TCP connection", new { Outstanding = outstanding.Length, Seconds = watch.Elapsed.TotalSeconds });
+        foreach (var request in requests.Skip(1)) await peer.Reply(request);
+        await peer.Reply(released);
+        var completed = await Task.WhenAll(outstanding).WaitAsync(Deadline);
+        Check(completed.All(x => x.Accepted) && peer.Client.Enabled && peer.Client.Failure == null,
+            "All queued input ACKs complete in order when the original path resumes", new { Count = completed.Length, Seconds = watch.Elapsed.TotalSeconds });
     }
 
     static async Task<Exception?> Fault(Task task)

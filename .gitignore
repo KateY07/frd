@@ -10,6 +10,12 @@ artifacts/
 *.user
 *.log
 startup-error.txt
+*.obj
+tests/NativeVplBench/*.exe
+tests/NativeVplBench/vendor/
+tests/SecureDesktopProbe/*.zip
+tests/SecureDesktopProbe/publish/
+tests/SecureDesktopProbe/remote-update-*/
 third_party/ffmpeg/runtime/
 third_party/ffmpeg/ffmpeg-*/
 third_party/ffmpeg/*.7z

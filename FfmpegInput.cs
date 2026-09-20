@@ -135,7 +135,8 @@ public sealed class RemoteInputServer : IDisposable
         catch (Exception error) { Report(error); }
     }
 
-    internal static async Task ServePeerAsync(IRemoteInputInjector injector, TcpClient peer, CancellationToken token, Action<Exception>? failure = null)
+    internal static async Task ServePeerAsync(IRemoteInputInjector injector, TcpClient peer, CancellationToken token, Action<Exception>? failure = null,
+        Action<bool>? enabledChanged = null)
     {
         peer.NoDelay = true;
         var stream = peer.GetStream();
@@ -154,6 +155,7 @@ public sealed class RemoteInputServer : IDisposable
                     if (request.Input is not null) throw new InvalidDataException("Input enable and event are mutually exclusive.");
                     result = enable ? new(true, "Input forwarding enabled.") : injector.ReleaseAll();
                     enabled = enable;
+                    enabledChanged?.Invoke(enabled);
                 }
                 else if (request.Input is null) result = new(false, "No input event supplied.");
                 else if (!enabled) result = new(false, "Input forwarding is disabled.");
@@ -166,6 +168,7 @@ public sealed class RemoteInputServer : IDisposable
         catch (Exception error) { if (failure != null) failure(error); else InputProtocol.Log("Input peer failed", error); }
         finally
         {
+            enabledChanged?.Invoke(false);
             var released = injector.ReleaseAll();
             if (!released.Accepted) InputProtocol.Log(released.Message);
         }
@@ -191,9 +194,12 @@ public sealed class RemoteInputServer : IDisposable
 public sealed class RemoteInputClient : IDisposable
 {
     const int MaximumInFlight = 64;
-    static readonly TimeSpan AcknowledgementTimeout = TimeSpan.FromSeconds(5);
+    static readonly TimeSpan AcknowledgementWarning = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
+    readonly Socket? mouseSocket;
+    readonly IPEndPoint? mouseEndpoint;
+    readonly byte[]? mouseSession;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
     readonly object pendingGate = new();
@@ -201,13 +207,23 @@ public sealed class RemoteInputClient : IDisposable
     readonly Task reader;
     Exception? failure;
     long sequence, repliedSequence;
+    long mouseSequence;
     long enableRevision;
+    int warnedAboutDelay;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
+    public Exception? Failure => Volatile.Read(ref failure);
 
-    internal RemoteInputClient(TcpClient connection)
+    internal RemoteInputClient(TcpClient connection, IPEndPoint? mouseEndpoint = null, byte[]? mouseSession = null)
     {
         this.connection = connection;
+        this.mouseEndpoint = mouseEndpoint;
+        this.mouseSession = mouseSession;
+        if (mouseEndpoint != null)
+        {
+            if (mouseSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(mouseSession));
+            mouseSocket = new Socket(mouseEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        }
         connection.NoDelay = true;
         stream = connection.GetStream();
         reader = Task.Run(ReadRepliesAsync);
@@ -256,6 +272,26 @@ public sealed class RemoteInputClient : IDisposable
     public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(input);
+        if (input.Kind == RemoteInputKind.MouseMove && mouseSocket != null && Enabled)
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                Span<byte> packet = stackalloc byte[40];
+                mouseSession!.CopyTo(packet);
+                BinaryPrimitives.WriteInt64LittleEndian(packet[16..], Interlocked.Increment(ref mouseSequence));
+                BinaryPrimitives.WriteDoubleLittleEndian(packet[24..], input.X);
+                BinaryPrimitives.WriteDoubleLittleEndian(packet[32..], input.Y);
+                mouseSocket.SendTo(packet, SocketFlags.None, mouseEndpoint!);
+                return Task.FromResult(new RemoteInputResult(true, "Mouse position sent over UDP."));
+            }
+            catch (Exception error) when (error is SocketException or ObjectDisposedException)
+            {
+                InputProtocol.Log("UDP mouse position failed", error);
+                throw;
+            }
+        }
         return !Enabled ? Task.FromResult(new RemoteInputResult(false, "Input forwarding is disabled.")) :
             await QueueRequestAsync(null, input, token).ConfigureAwait(false);
     }
@@ -303,7 +339,13 @@ public sealed class RemoteInputClient : IDisposable
 
     async Task<RemoteInputResult> AwaitAcknowledgementAsync(PendingInput request, CancellationToken token)
     {
-        try { return await request.Completion.Task.WaitAsync(AcknowledgementTimeout, token).ConfigureAwait(false); }
+        try
+        {
+            if (await Task.WhenAny(request.Completion.Task, Task.Delay(AcknowledgementWarning, token)).ConfigureAwait(false) != request.Completion.Task &&
+                Interlocked.Exchange(ref warnedAboutDelay, 1) == 0)
+                InputProtocol.Log("Input acknowledgement delayed; preserving the open TCP channel while the path recovers.");
+            return await request.Completion.Task.WaitAsync(token).ConfigureAwait(false);
+        }
         catch (Exception error) { Fail(error); throw; }
     }
 
@@ -320,6 +362,7 @@ public sealed class RemoteInputClient : IDisposable
                     if (reply.Sequence != repliedSequence + 1 || !pending.Remove(reply.Sequence, out var request))
                         throw new InvalidDataException("Input reply sequence mismatch.");
                     repliedSequence = reply.Sequence;
+                    Volatile.Write(ref warnedAboutDelay, 0);
                     slots.Release();
                     request.Completion.TrySetResult(new(reply.Accepted, reply.Message));
                 }
@@ -355,6 +398,7 @@ public sealed class RemoteInputClient : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
         Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
+        mouseSocket?.Dispose();
         // The reader handles shutdown itself; disposal never blocks its own continuation.
         ObserveFault(reader);
     }

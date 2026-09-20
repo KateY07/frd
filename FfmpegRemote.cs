@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -18,17 +19,20 @@ public sealed record RemoteOptions(string Host, int Port, string Token);
 sealed record RemoteRequest(string Kind, string Token = "", int VideoPort = 0, int DiagnosticPort = 0,
     string Session = "", ControlCommand? Command = null);
 sealed record RemoteWelcome(string Session, int SenderPort, int Width, int Height, int SourceWidth, int SourceHeight,
-    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1, double MaximumBitrateMbps = 100);
+    int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1,
+    double MaximumBitrateMbps = 100, CodecProbeSample[]? ProbeSamples = null);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
-    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0);
+    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0, int UdpInputPort = 0,
+    int Generation = 0, int Width = 0, int Height = 0);
 
 static class RemoteWire
 {
     public static async Task WriteAsync<T>(NetworkStream stream, T value, CancellationToken token)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(value);
-        if (bytes.Length > 65536) throw new InvalidDataException("Remote control message exceeds 64 KiB.");
+        if (bytes.Length > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
+            throw new InvalidDataException("Remote control message exceeds its size limit.");
         var header = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
         await stream.WriteAsync(header, token); await stream.WriteAsync(bytes, token);
     }
@@ -37,7 +41,8 @@ static class RemoteWire
     {
         var header = new byte[4]; await stream.ReadExactlyAsync(header, token);
         var size = BinaryPrimitives.ReadInt32LittleEndian(header);
-        if (size is < 1 or > 65536) throw new InvalidDataException("Invalid remote control message length.");
+        if (size < 1 || size > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
+            throw new InvalidDataException("Invalid remote control message length.");
         var bytes = new byte[size]; await stream.ReadExactlyAsync(bytes, token);
         return JsonSerializer.Deserialize<T>(bytes) ?? throw new InvalidDataException("Empty remote message.");
     }
@@ -56,13 +61,13 @@ sealed class RemoteConnection : IDisposable
         return new(await FrdNetwork.ConnectAsync(options.Host, options.Port, token));
     }
 
-    public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token)
+    public async Task<RemoteReply> ExchangeAsync(RemoteRequest request, CancellationToken token, TimeSpan? timeoutDuration = null)
     {
         await gate.WaitAsync(token);
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            if (timeoutDuration is { } duration) timeout.CancelAfter(duration);
             var started = Stopwatch.GetTimestamp();
             await RemoteWire.WriteAsync(client.GetStream(), request, timeout.Token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), timeout.Token);
@@ -117,7 +122,10 @@ public sealed partial class DemoSession
     readonly Dictionary<long, long> remotePresented = new();
     readonly Queue<long> remotePresentationTicks = new();
     long remoteHistorySweep;
+    long lastRemoteStatusTick;
     public bool IsRemote => remoteOptions != null;
+    public double RemoteStatusWaitSeconds => remoteOptions == null || Volatile.Read(ref lastRemoteStatusTick) == 0
+        ? 0 : Math.Max(0, (Stopwatch.GetTimestamp() - Volatile.Read(ref lastRemoteStatusTick)) / (double)Stopwatch.Frequency);
     public AppConfiguration Configuration => config;
     internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
@@ -139,10 +147,13 @@ public sealed partial class DemoSession
         diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
         diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
-        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port), stop.Token);
+        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port),
+            stop.Token, TimeSpan.FromSeconds(15));
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
+        Volatile.Write(ref lastRemoteStatusTick, Stopwatch.GetTimestamp());
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,
             InitialPreset = welcome.InitialPreset, InitialBitrateKbps = welcome.InitialBitrateKbps, Presets = welcome.Presets, TransmissionScale = welcome.TransmissionScale, MaximumBitrateMbps = welcome.MaximumBitrateMbps };
+        config = await Task.Run(() => AutoCodecProbe.SelectReceiver(config, welcome.ProbeSamples), stop.Token);
         receiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         diagnosticsReceiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
         for (var i = 0; i < 4; i++) await remote.ExchangeAsync(new("status"), stop.Token);
@@ -167,10 +178,53 @@ public sealed partial class DemoSession
 
     async Task<NetworkSnapshot> ReadRemoteStatusAsync()
     {
+        await controlGate.WaitAsync(stop.Token);
+        try
+        {
         var reply = await remote!.ExchangeAsync(new("status"), stop.Token);
+        Volatile.Write(ref lastRemoteStatusTick, Stopwatch.GetTimestamp());
+        if (reply.Generation > AppliedGeneration)
+        {
+            if (reply.Width is < 64 or > 8192 || reply.Height is < 64 or > 8192 ||
+                (reply.Width & 1) != 0 || (reply.Height & 1) != 0 ||
+                !config.Presets.TryGetValue(reply.Preset, out var preset))
+                throw new InvalidDataException("Host reported an invalid stream resolution or preset.");
+            VideoDecoder? decoder = new(preset.DecoderArguments);
+            lock (decoderGate)
+            {
+                if (decoders.TryGetValue(reply.Generation, out var existing) &&
+                    presetNames.TryGetValue(reply.Generation, out var existingPreset) && existingPreset != reply.Preset)
+                {
+                    existing.Dispose();
+                    decoders.Remove(reply.Generation);
+                    presetNames.Remove(reply.Generation);
+                }
+                if (!decoders.ContainsKey(reply.Generation))
+                {
+                    decoders[reply.Generation] = decoder;
+                    presetNames[reply.Generation] = reply.Preset;
+                    decoder = null;
+                }
+            }
+            decoder?.Dispose();
+            config = config with { Width = reply.Width, Height = reply.Height };
+            if (welcome != null) welcome = welcome with { SourceWidth = reply.Width, SourceHeight = reply.Height };
+            Volatile.Write(ref appliedGeneration, reply.Generation);
+            var previous = Volatile.Read(ref requestedGeneration);
+            while (previous < reply.Generation)
+            {
+                var actual = Interlocked.CompareExchange(ref requestedGeneration, reply.Generation, previous);
+                if (actual == previous) break;
+                previous = actual;
+            }
+            Console.Error.WriteLine($"[video] Remote source changed to {reply.Width}x{reply.Height}, generation {reply.Generation}; requesting clean frame.");
+            RequestRecovery();
+        }
         activePreset = reply.Preset; appliedLimit = reply.LimitKbps; packetDiagnosticsEnabled = reply.Diagnostics;
-        message = "远端发送；预设和码率完全手动";
+        message = string.IsNullOrWhiteSpace(reply.Message) ? "远端发送；预设和码率完全手动" : reply.Message;
         return remoteNetwork = reply.Network ?? throw new InvalidDataException("Missing sender network statistics.");
+        }
+        finally { controlGate.Release(); }
     }
 
     public async Task<RemoteInputClient> ConnectRemoteInputAsync(CancellationToken token)
@@ -182,7 +236,8 @@ public sealed partial class DemoSession
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
-            return new(client);
+            if (reply.UdpInputPort is < 1 or > 65535) throw new InvalidDataException("Remote UDP input port is missing.");
+            return new(client, new(remote.Endpoint.Address, reply.UdpInputPort), Convert.FromHexString(welcome.Session));
         }
         catch { client.Dispose(); throw; }
     }
@@ -236,7 +291,8 @@ public sealed partial class DemoSession
     }
 
     internal RemoteReply SenderStatus() => new(true, Message: message, Network: sender?.Snapshot, Preset: activePreset,
-        LimitKbps: appliedLimit, Diagnostics: packetDiagnosticsEnabled);
+        LimitKbps: appliedLimit, Diagnostics: packetDiagnosticsEnabled,
+        Generation: AppliedGeneration, Width: config.Width, Height: config.Height);
 
     void ApplyRemoteDiagnostic(FrameTimeline clock, FrameDiagnostic diagnostic)
     {
@@ -311,25 +367,30 @@ public sealed partial class DemoSession
 sealed class RemoteHost : IAsyncDisposable
 {
     readonly AppConfiguration config;
+    readonly CodecProbeSample[] probeSamples;
     readonly string token;
     readonly TcpListener[] listeners;
     readonly CancellationTokenSource stop = new();
     readonly ConcurrentDictionary<int, Task> peers = new();
     readonly object gate = new();
     CancellationTokenSource? activeStop;
+    DesktopStreamSource? activeCapture;
     string sessionId = "";
     IPAddress? controller;
     bool hasInput, hasClipboard, hasCursor;
+    bool inputAllowed = true, clipboardAllowed = true;
+    CancellationTokenSource? inputPermissionStop, clipboardPermissionStop;
     nint clipboardOwner;
     int peerId;
     Task? acceptTask;
     public event Action<string>? Status;
+    public event Action<IPAddress?>? ControllerChanged;
     public event Action<Exception>? Failed;
-    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token) { }
-    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token)
+    public RemoteHost(AppConfiguration config, IPAddress address, int port, string token) : this(config, [address], port, token, []) { }
+    public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        this.config = config; this.token = token;
+        this.config = config; this.token = token; this.probeSamples = probeSamples ?? [];
         listeners = addresses.Select(address =>
         {
             var listener = new TcpListener(address, port);
@@ -347,6 +408,23 @@ sealed class RemoteHost : IAsyncDisposable
         var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
         Console.Error.WriteLine($"Remote listener ready: {endpoints}");
         Status?.Invoke($"被控端正在监听 {endpoints}\n等待主控连接；关闭此窗口停止监听。");
+    }
+
+    public void DisconnectActive()
+    {
+        lock (gate) activeStop?.Cancel();
+    }
+
+    public void SetInputAllowed(bool allowed)
+    {
+        lock (gate) { inputAllowed = allowed; if (!allowed) inputPermissionStop?.Cancel(); }
+        Console.Error.WriteLine($"[host permission] Keyboard and mouse {(allowed ? "allowed" : "revoked")}.");
+    }
+
+    public void SetClipboardAllowed(bool allowed)
+    {
+        lock (gate) { clipboardAllowed = allowed; if (!allowed) clipboardPermissionStop?.Cancel(); }
+        Console.Error.WriteLine($"[host permission] Clipboard {(allowed ? "allowed" : "revoked")}.");
     }
 
     async Task AcceptAsync(TcpListener listener)
@@ -400,17 +478,24 @@ sealed class RemoteHost : IAsyncDisposable
                         await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
                         await CursorWire.ServeAsync(client, cursorToken);
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasCursor = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-cursor-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasCursor = false; }
+                    }
                     return;
                 }
                 if (hello.Kind == "clipboard")
                 {
                     CancellationToken clipboardToken;
+                    CancellationTokenSource clipboardChannel;
                     lock (gate)
                     {
-                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasClipboard || clipboardOwner == 0)
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasClipboard || clipboardOwner == 0 || !clipboardAllowed)
                             throw new InvalidDataException("Clipboard channel does not belong to an available active session.");
-                        hasClipboard = true; clipboardToken = activeStop.Token;
+                        hasClipboard = true;
+                        clipboardPermissionStop = clipboardChannel = CancellationTokenSource.CreateLinkedTokenSource(activeStop.Token);
+                        clipboardToken = clipboardChannel.Token;
                     }
                     try
                     {
@@ -418,25 +503,61 @@ sealed class RemoteHost : IAsyncDisposable
                         await using var clipboard = new ClipboardSyncSession(client, new WindowsClipboard(clipboardOwner), token: clipboardToken);
                         await clipboard.Completion;
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasClipboard = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-clipboard-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasClipboard = false; clipboardPermissionStop = null; }
+                        clipboardChannel.Dispose();
+                    }
                     return;
                 }
                 if (hello.Kind == "input")
                 {
                     CancellationToken inputToken;
+                    CancellationTokenSource inputChannel;
                     lock (gate)
                     {
-                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasInput)
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasInput || !inputAllowed)
                             throw new InvalidDataException("Input channel does not belong to the active controller.");
-                        hasInput = true; inputToken = activeStop.Token;
+                        hasInput = true;
+                        inputPermissionStop = inputChannel = CancellationTokenSource.CreateLinkedTokenSource(activeStop.Token);
+                        inputToken = inputChannel.Token;
                     }
                     try
                     {
-                        await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
-                        using var injector = new Win32InputInjector();
-                        await RemoteInputServer.ServePeerAsync(injector, client, inputToken);
+                        var local = ((IPEndPoint)client.Client.LocalEndPoint!).Address;
+                        using var udp = new Socket(local.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                        if (local.Equals(IPAddress.IPv6Any)) udp.DualMode = true;
+                        udp.Bind(new IPEndPoint(local, 0));
+                        var ordinary = new Win32InputInjector();
+                        ordinary.RegisterControllerWindow(clipboardOwner);
+                        using var injector = new SecureDesktopInputRouter(ordinary,
+                            () => Volatile.Read(ref activeCapture)?.SecureActive == true);
+                        using var udpStop = CancellationTokenSource.CreateLinkedTokenSource(inputToken);
+                        var udpEnabled = 0;
+                        var udpWorker = ReceiveMouseAsync(udp, injector, address, hello.Session, () => Volatile.Read(ref udpEnabled) != 0, udpStop.Token);
+                        try
+                        {
+                            await RemoteWire.WriteAsync(stream, new RemoteReply(true, UdpInputPort: ((IPEndPoint)udp.LocalEndPoint!).Port), timeout.Token);
+                            await RemoteInputServer.ServePeerAsync(injector, client, inputToken,
+                                enabledChanged: value =>
+                                {
+                                    Volatile.Write(ref udpEnabled, value ? 1 : 0);
+                                    injector.SetEnabled(value);
+                                });
+                        }
+                        finally
+                        {
+                            udpStop.Cancel();
+                            await udpWorker;
+                        }
                     }
-                    finally { lock (gate) { if (sessionId == hello.Session) hasInput = false; } }
+                    finally
+                    {
+                        SessionTrace.Event("host-input-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasInput = false; inputPermissionStop = null; }
+                        inputChannel.Dispose();
+                    }
                     return;
                 }
                 if (hello.Kind != "hello" || hello.VideoPort is < 1 or > 65535 || hello.DiagnosticPort is < 1 or > 65535 || hello.VideoPort == hello.DiagnosticPort)
@@ -450,28 +571,38 @@ sealed class RemoteHost : IAsyncDisposable
                     hasInput = hasClipboard = hasCursor = false;
                     controller = address; sessionId = id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
                 }
+                ControllerChanged?.Invoke(address);
                 try
                 {
                     using var capture = CreateCapture();
+                    Volatile.Write(ref activeCapture, capture);
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
-                    using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth, capture.SourceHeight);
+                    using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth,
+                        capture.SourceHeight, capture.CaptureMapped, capture.SetPixelMode, () => (capture.Width, capture.Height));
                     session.Failed += error => { lifetime.Cancel(); Failed?.Invoke(error); };
                     session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
                     var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
                         capture.SourceWidth, capture.SourceHeight,
-                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale, config.MaximumBitrateMbps);
+                        config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale,
+                        config.MaximumBitrateMbps, probeSamples.Where(sample => sample.Width == capture.Width && sample.Height == capture.Height).ToArray());
                     await SendAsync(new(true, Welcome: welcome), received);
                     Status?.Invoke($"主控已连接：{address}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。");
                     while (!lifetime.IsCancellationRequested)
                     {
-                        using var idle = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-                        idle.CancelAfter(TimeSpan.FromSeconds(20));
-                        var request = await RemoteWire.ReadAsync<RemoteRequest>(stream, idle.Token);
+                        var request = await RemoteWire.ReadAsync<RemoteRequest>(stream, lifetime.Token);
                         received = Stopwatch.GetTimestamp();
-                        if (request.Kind == "status") await SendAsync(session.SenderStatus(), received);
+                        if (request.Kind == "status")
+                        {
+                            var status = session.SenderStatus();
+                            if (capture.WaitingForSecureTransition)
+                                status = status with { Message = "安全桌面切换中：正在等待捕获画面恢复；会话保持连接" };
+                            else if (capture.SecureActive)
+                                status = status with { Message = "安全桌面画面已连接；键鼠通过 SYSTEM 辅助进程转发" };
+                            await SendAsync(status, received);
+                        }
                         else if (request.Kind == "control" && request.Command != null)
                         {
-                            var result = await session.SubmitControlAsync(request.Command, idle.Token);
+                            var result = await session.SubmitControlAsync(request.Command, lifetime.Token);
                             await SendAsync(new(true, Control: result), received);
                         }
                         else throw new InvalidDataException("Unknown remote request.");
@@ -481,21 +612,68 @@ sealed class RemoteHost : IAsyncDisposable
                 }
                 finally
                 {
+                    SessionTrace.Event("host-control-tcp", "closed");
                     lifetime.Cancel();
+                    Volatile.Write(ref activeCapture, null);
                     lifetime.Dispose();
                     lock (gate) { activeStop = null; controller = null; sessionId = ""; }
+                    ControllerChanged?.Invoke(null);
                     Status?.Invoke("主控已断开；已停止捕获发送并释放输入。等待重新连接。");
                 }
             }
-            catch (EndOfStreamException) { Console.Error.WriteLine("Remote controller disconnected."); }
-            catch (OperationCanceledException) { Console.Error.WriteLine("Remote connection cancelled or timed out."); }
+            catch (EndOfStreamException) { SessionTrace.Event("host-control-tcp", "eof"); Console.Error.WriteLine("Remote controller disconnected."); }
+            catch (OperationCanceledException) { SessionTrace.Event("host-control-tcp", "cancelled-or-timeout"); Console.Error.WriteLine("Remote connection cancelled or timed out."); }
             catch (Exception error)
             {
+                SessionTrace.Error("host-tcp", error);
                 Console.Error.WriteLine(error); Status?.Invoke(error.Message);
                 try { await RemoteWire.WriteAsync(client.GetStream(), new RemoteReply(false, error.Message), stop.Token); }
                 catch (Exception replyError) { Console.Error.WriteLine("Remote error reply failed: " + replyError.Message); }
             }
         }
+    }
+
+    internal static async Task ReceiveMouseAsync(Socket socket, IRemoteInputInjector injector, IPAddress controller, string session,
+        Func<bool> enabled, CancellationToken token)
+    {
+        var nonce = Convert.FromHexString(session);
+        var packet = new byte[40];
+        long latest = 0;
+        var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var received = await socket.ReceiveFromAsync(packet, SocketFlags.None, new IPEndPoint(any, 0), token);
+                var newest = latest;
+                double x = 0, y = 0;
+                Consider(received.ReceivedBytes, received.RemoteEndPoint);
+                // Drain already queued positions so input injection follows the newest available coordinate.
+                for (var i = 0; i < 256 && socket.Available > 0; i++)
+                {
+                    EndPoint source = new IPEndPoint(any, 0);
+                    var size = socket.ReceiveFrom(packet, SocketFlags.None, ref source);
+                    Consider(size, source);
+                }
+                if (newest <= latest) continue;
+                latest = newest;
+                var result = injector.Inject(new(RemoteInputKind.MouseMove, x, y));
+                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP mouse position rejected: " + result.Message);
+
+                void Consider(int size, EndPoint source)
+                {
+                    if (size != packet.Length || !enabled() ||
+                        !FrdNetwork.Canonical(((IPEndPoint)source).Address).Equals(controller) ||
+                        !CryptographicOperations.FixedTimeEquals(packet.AsSpan(0, nonce.Length), nonce)) return;
+                    var sequence = BinaryPrimitives.ReadInt64LittleEndian(packet.AsSpan(16));
+                    if (sequence <= newest) return;
+                    newest = sequence;
+                    x = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(24));
+                    y = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(32));
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP mouse input stopped."); }
     }
 
     public async ValueTask DisposeAsync()
@@ -508,7 +686,7 @@ sealed class RemoteHost : IAsyncDisposable
     DesktopStreamSource CreateCapture()
     {
         DesktopStreamSource? capture = null;
-        try { capture = new(config.TransmissionScale); capture.Capture(); return capture; }
+        try { capture = new(config.TransmissionScale, secureDesktop: true); capture.Capture(); return capture; }
         catch (Exception error)
         {
             Console.Error.WriteLine(error);
@@ -556,7 +734,7 @@ static class RemoteLaunch
         if (values.Keys.Any(key => key is "--test-seconds" or "--report" or "--interaction-script")) throw new ArgumentException(Usage);
         return new(true, null, FrdNetwork.ListenAddresses(listen), port, token, 0, null, null);
     }
-    public static int Run(AppConfiguration config, Options options)
+    public static int Run(AppConfiguration config, Options options, CodecProbeSample[]? probeSamples = null)
     {
         if (!options.Host)
         {
@@ -564,9 +742,11 @@ static class RemoteLaunch
             FfmpegUi.Run(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
             return Environment.ExitCode;
         }
-        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token);
+        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token, probeSamples);
         hostExitCode = 0;
-        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]); return hostExitCode;
+        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]);
+        SessionTrace.Event("host-process", $"exit-code-{hostExitCode}");
+        return hostExitCode;
     }
 
     static void ShowMessage(string text)
@@ -590,18 +770,59 @@ static class RemoteLaunch
     sealed class HostWindow : Window
     {
         readonly RemoteHost server;
+        readonly TextBlock status = new() { Text = "FRD · 等待主控", FontSize = 12,
+            VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+        readonly StackPanel permissions = new() { Orientation = Avalonia.Layout.Orientation.Horizontal,
+            Spacing = 6, IsVisible = false };
         bool closing, finished;
-        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token)
+        public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
         {
-            Title = $"FRD 被控端 · TCP {port}"; Width = 600; Height = 200;
-            var status = new TextBlock { Text = "正在监听…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) };
-            Content = status; server = new(config, addresses, port, token);
-            server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => status.Text = text);
+            Title = $"FRD 被控端 · TCP {port}"; Width = 290; Height = 50;
+            CanResize = false; ShowInTaskbar = false; Topmost = true;
+            WindowDecorations = Avalonia.Controls.WindowDecorations.None;
+            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#B825303C"));
+            Foreground = Avalonia.Media.Brushes.White;
+            var disconnect = new Button { Content = "断开", FontSize = 10, Padding = new Thickness(4, 0) };
+            var clipboard = new CheckBox { Content = "剪贴板", FontSize = 10, IsChecked = true,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            var input = new CheckBox { Content = "键鼠", FontSize = 10, IsChecked = true,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            var sound = new CheckBox { Content = "声音", FontSize = 10, IsChecked = false, IsEnabled = false,
+                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+            permissions.Children.Add(disconnect); permissions.Children.Add(clipboard);
+            permissions.Children.Add(input); permissions.Children.Add(sound);
+            var content = new StackPanel { Spacing = 1, Margin = new Thickness(6, 3) };
+            content.Children.Add(status); content.Children.Add(permissions);
+            var surface = new Border { Child = content };
+            surface.PointerPressed += (_, e) =>
+            {
+                if (e.Source is Border or StackPanel or TextBlock) BeginMoveDrag(e);
+            };
+            Content = surface;
+            server = new(config, addresses, port, token, probeSamples);
+            disconnect.Click += (_, _) => server.DisconnectActive();
+            clipboard.IsCheckedChanged += (_, _) => server.SetClipboardAllowed(clipboard.IsChecked == true);
+            input.IsCheckedChanged += (_, _) => server.SetInputAllowed(input.IsChecked == true);
+            server.ControllerChanged += address => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                status.Text = address == null ? "FRD · 等待主控" : $"正在被 {address} 控制";
+                permissions.IsVisible = address != null;
+            });
+            server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => ToolTip.SetTip(status, text));
             server.Failed += error => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             { Console.Error.WriteLine(error); hostExitCode = 1; Close(); });
             Opened += (_, _) =>
             {
-                try { server.Start(TryGetPlatformHandle()?.Handle ?? 0); }
+                try
+                {
+                    var screen = Screens.Primary?.WorkingArea;
+                    if (screen is { } area) Position = new(area.Right - (int)Width - 8, area.Bottom - (int)Height - 8);
+                    var handle = TryGetPlatformHandle()?.Handle ?? 0;
+                    if (handle == 0 || !SetWindowDisplayAffinity(handle, 0x11))
+                        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),
+                            "被控端提示窗口无法排除出屏幕捕获");
+                    server.Start(handle);
+                }
                 catch (Exception error)
                 {
                     Console.Error.WriteLine(error); status.Text = error.Message; hostExitCode = 1;
@@ -617,5 +838,9 @@ static class RemoteLaunch
                 finally { finished = true; Avalonia.Threading.Dispatcher.UIThread.Post(Close); }
             };
         }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool SetWindowDisplayAffinity(nint window, uint affinity);
     }
 }

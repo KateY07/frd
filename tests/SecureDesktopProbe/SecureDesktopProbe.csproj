@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\FfmpegSecureDesktop.cs" Link="FfmpegSecureDesktop.cs" />
+    <Compile Include="..\..\FfmpegSecureShared.cs" Link="FfmpegSecureShared.cs" />
+    <Compile Include="..\..\FfmpegSecureInput.cs" Link="FfmpegSecureInput.cs" />
+    <Compile Include="..\..\FfmpegInput.cs" Link="FfmpegInput.cs" />
+    <Compile Include="..\..\FfmpegCursor.cs" Link="FfmpegCursor.cs" />
+  </ItemGroup>
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+</Project>

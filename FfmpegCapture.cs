@@ -29,11 +29,11 @@ sealed record DesktopCaptureStatistics(string Backend, int SourceWidth, int Sour
     int OutputWidth = 1280, int OutputHeight = 720, bool DesktopImageInSystemMemory = false,
     string SourceBindFlags = "", bool? DirectShaderResourceSupported = null);
 
-enum DesktopCapturePath { VideoProcessor, CpuSwscale, PixelShader, VideoProcessorLateRelease, NativeNoScale, DirectPixelShader }
+enum DesktopCapturePath { VideoProcessor, CpuSwscale, PixelShader, VideoProcessorLateRelease, NativeNoScale, DirectPixelShader, PixelShaderGray8, PixelShaderRgb332, PixelShaderRgb565, PixelShaderGray4 }
 
 sealed class DesktopCapture : IDisposable
 {
-    static readonly DesktopCapturePath[] DxgiPaths = [DesktopCapturePath.PixelShader, DesktopCapturePath.VideoProcessor];
+    static readonly DesktopCapturePath[] DxgiPaths = [DesktopCapturePath.NativeNoScale, DesktopCapturePath.PixelShader, DesktopCapturePath.VideoProcessor];
     readonly object gate = new();
     readonly int width, height, stretchMode;
     DxgiDesktopCapture? dxgi;
@@ -75,6 +75,34 @@ sealed class DesktopCapture : IDisposable
         }
     }
 
+    public MappedBgraFrame? CaptureMapped(bool allowUnchanged)
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (dxgi?.Path == DesktopCapturePath.NativeNoScale)
+            {
+                try { return dxgi.CaptureMapped(allowUnchanged); }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine($"[capture] Direct mapped capture failed; rebuilding desktop duplication: {error}");
+                    dxgi.Dispose(); dxgi = null;
+                    try { dxgi = new(width, height, DesktopCapturePath.NativeNoScale); return dxgi.CaptureMapped(allowUnchanged); }
+                    catch (Exception retryError)
+                    {
+                        Console.Error.WriteLine($"[capture] Direct mapped retry failed; using the next capture path: {retryError}");
+                        dxgi?.Dispose(); dxgi = null; pathIndex++;
+                        InitializeDxgi(retryError);
+                    }
+                }
+            }
+            var pixels = Capture();
+            if (!allowUnchanged && dxgi?.Statistics?.NewDesktopImage == false) return null;
+            var pin = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+            return new(pin.AddrOfPinnedObject(), width * 4, width, height, pin.Free);
+        }
+    }
+
     void InitializeDxgi(Exception? lastError = null)
     {
         while (pathIndex < DxgiPaths.Length)
@@ -112,6 +140,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     readonly int width, height;
     readonly DesktopCapturePath path;
     readonly bool probeDirectShaderResource;
+    readonly bool forceProcessUnchanged;
+    readonly int bytesPerPixel, rowBytes, renderWidth;
     int sourceWidth, sourceHeight;
     int contentWidth, contentHeight, contentLeft, contentTop;
     IDXGIAdapter1? adapter;
@@ -138,15 +168,28 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     readonly byte*[] cpuInputPlanes = new byte*[4], cpuOutputPlanes = new byte*[4];
     readonly int[] cpuInputStrides = new int[4], cpuOutputStrides = new int[4];
     byte[]? lastPixels;
+    bool stagingReady, borrowedMapped;
+    readonly bool reusePixelBuffer;
     bool? separateCursorVisible;
     bool desktopImageInSystemMemory;
     string sourceBindFlags = "";
     bool? directShaderResourceSupported;
     public DesktopCapturePath Path => path;
+    public int BytesPerPixel => bytesPerPixel;
+    public int BytesPerFrame => checked(rowBytes * height);
     public DesktopCaptureStatistics? Statistics { get; set; }
 
-    public DxgiDesktopCapture(int width, int height, DesktopCapturePath path = DesktopCapturePath.PixelShader, bool probeDirectShaderResource = false)
+    public DxgiDesktopCapture(int width, int height, DesktopCapturePath path = DesktopCapturePath.PixelShader, bool probeDirectShaderResource = false,
+        bool reusePixelBuffer = false, bool forceProcessUnchanged = false)
     {
+        this.reusePixelBuffer = reusePixelBuffer;
+        this.forceProcessUnchanged = forceProcessUnchanged;
+        bytesPerPixel = path is DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderGray4 ? 1
+            : path == DesktopCapturePath.PixelShaderRgb565 ? 2 : 4;
+        if (path == DesktopCapturePath.PixelShaderGray4 && (width & 1) != 0)
+            throw new ArgumentException("Packed Gray4 capture requires an even output width.", nameof(width));
+        rowBytes = path == DesktopCapturePath.PixelShaderGray4 ? width / 2 : checked(width * bytesPerPixel);
+        renderWidth = path == DesktopCapturePath.PixelShaderGray4 ? width / 2 : width;
         this.width = width; this.height = height; this.path = path; this.probeDirectShaderResource = probeDirectShaderResource;
         try
         {
@@ -177,8 +220,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             sourceWidth = checked((int)duplication.Description.ModeDescription.Width);
             sourceHeight = checked((int)duplication.Description.ModeDescription.Height);
             desktopImageInSystemMemory = duplication.Description.DesktopImageInSystemMemory;
-            if (path == DesktopCapturePath.NativeNoScale)
-            { width = sourceWidth; height = sourceHeight; this.width = width; this.height = height; }
+            if (path == DesktopCapturePath.NativeNoScale && (width != sourceWidth || height != sourceHeight))
+                throw new NotSupportedException($"Direct mapped capture needs native dimensions {sourceWidth}×{sourceHeight}, got {width}×{height}.");
             var scale = Math.Min(width / (double)sourceWidth, height / (double)sourceHeight);
             contentWidth = (int)Math.Round(sourceWidth * scale); contentHeight = (int)Math.Round(sourceHeight * scale);
             contentLeft = (width - contentWidth) / 2; contentTop = (height - contentHeight) / 2;
@@ -196,12 +239,14 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             {
                 if (path != DesktopCapturePath.DirectPixelShader)
                     desktop = device.CreateTexture2D(Texture(sourceWidth, sourceHeight, ResourceUsage.Default,
-                        path == DesktopCapturePath.PixelShader ? BindFlags.ShaderResource : BindFlags.None, CpuAccessFlags.None));
-                scaled = device.CreateTexture2D(Texture(width, height, ResourceUsage.Default, BindFlags.RenderTarget | BindFlags.ShaderResource, CpuAccessFlags.None));
-                staging = device.CreateTexture2D(Texture(width, height, ResourceUsage.Staging, BindFlags.None, CpuAccessFlags.Read));
+                        path is DesktopCapturePath.PixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4 ? BindFlags.ShaderResource : BindFlags.None, CpuAccessFlags.None));
+                var outputFormat = path is DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderGray4 ? Format.R8_UNorm
+                    : path == DesktopCapturePath.PixelShaderRgb565 ? Format.R16_UNorm : Format.B8G8R8A8_UNorm;
+                scaled = device.CreateTexture2D(Texture(renderWidth, height, ResourceUsage.Default, BindFlags.RenderTarget | BindFlags.ShaderResource, CpuAccessFlags.None, outputFormat));
+                staging = device.CreateTexture2D(Texture(renderWidth, height, ResourceUsage.Staging, BindFlags.None, CpuAccessFlags.Read, outputFormat));
                 clearView = device.CreateRenderTargetView(scaled);
             }
-            if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader) InitializePixelShader();
+            if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4) InitializePixelShader();
             if (path is DesktopCapturePath.VideoProcessor or DesktopCapturePath.VideoProcessorLateRelease)
             {
                 videoDevice = device.QueryInterface<ID3D11VideoDevice>(); videoContext = context.QueryInterface<ID3D11VideoContext>();
@@ -236,12 +281,13 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
         catch { Dispose(); throw; }
     }
 
-    static Texture2DDescription Texture(int width, int height, ResourceUsage usage, BindFlags bind, CpuAccessFlags cpu) => new()
-    { Width = (uint)width, Height = (uint)height, MipLevels = 1, ArraySize = 1, Format = Format.B8G8R8A8_UNorm, SampleDescription = new(1, 0), Usage = usage, BindFlags = bind, CPUAccessFlags = cpu };
+    static Texture2DDescription Texture(int width, int height, ResourceUsage usage, BindFlags bind, CpuAccessFlags cpu,
+        Format format = Format.B8G8R8A8_UNorm) => new()
+    { Width = (uint)width, Height = (uint)height, MipLevels = 1, ArraySize = 1, Format = format, SampleDescription = new(1, 0), Usage = usage, BindFlags = bind, CPUAccessFlags = cpu };
 
     void InitializePixelShader()
     {
-        const string source = """
+        const string common = """
             Texture2D<float4> Desktop : register(t0);
             SamplerState LinearClamp : register(s0);
             struct Vertex { float4 Position : SV_Position; float2 Uv : TEXCOORD0; };
@@ -251,8 +297,15 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 output.Position = float4(output.Uv.x * 2 - 1, 1 - output.Uv.y * 2, 0, 1);
                 return output;
             }
-            float4 PS(Vertex input) : SV_Target { return float4(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, 1); }
             """;
+        var source = common + (path switch
+        {
+            DesktopCapturePath.PixelShaderGray8 => "float PS(Vertex input) : SV_Target { return dot(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, float3(0.2126, 0.7152, 0.0722)); }",
+            DesktopCapturePath.PixelShaderGray4 => "static const float Bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}; float PS(Vertex input) : SV_Target { uint sourceWidth, sourceHeight; Desktop.GetDimensions(sourceWidth, sourceHeight); float2 step = float2(0.5 / sourceWidth, 0); float left = dot(Desktop.SampleLevel(LinearClamp, input.Uv - step, 0).rgb, float3(0.2126, 0.7152, 0.0722)); float right = dot(Desktop.SampleLevel(LinearClamp, input.Uv + step, 0).rgb, float3(0.2126, 0.7152, 0.0722)); uint2 position = uint2(input.Position.xy); float biasLeft = (Bayer[(position.y & 3) * 4 + ((position.x * 2) & 3)] - 7.5) / 16.0; float biasRight = (Bayer[(position.y & 3) * 4 + ((position.x * 2 + 1) & 3)] - 7.5) / 16.0; uint first = (uint)clamp(floor(left * 15 + biasLeft + 0.5), 0, 15); uint second = (uint)clamp(floor(right * 15 + biasRight + 0.5), 0, 15); return (first * 16 + second) / 255.0; }",
+            DesktopCapturePath.PixelShaderRgb332 => "static const float Bayer[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}; float PS(Vertex input) : SV_Target { float3 color = Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb; uint2 position = uint2(input.Position.xy); float bias = (Bayer[(position.y & 3) * 4 + (position.x & 3)] - 7.5) / 16.0; uint3 quantized = (uint3)clamp(floor(color * float3(7, 7, 3) + bias + 0.5), 0, float3(7, 7, 3)); uint packed = quantized.r * 32 + quantized.g * 4 + quantized.b; return packed / 255.0; }",
+            DesktopCapturePath.PixelShaderRgb565 => "float PS(Vertex input) : SV_Target { float3 color = Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb; uint3 quantized = (uint3)round(color * float3(31, 63, 31)); uint packed = quantized.r * 2048 + quantized.g * 32 + quantized.b; return packed / 65535.0; }",
+            _ => "float4 PS(Vertex input) : SV_Target { return float4(Desktop.SampleLevel(LinearClamp, input.Uv, 0).rgb, 1); }"
+        });
         vertexShader = device!.CreateVertexShader(CompileShader(source, "VS", "vs_5_0"));
         pixelShader = device.CreatePixelShader(CompileShader(source, "PS", "ps_5_0"));
         if (desktop != null) shaderInput = device.CreateShaderResourceView(desktop);
@@ -297,7 +350,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
     {
         ObjectDisposedException.ThrowIf(duplication == null, this);
         var started = Stopwatch.GetTimestamp();
-        var result = duplication.AcquireNextFrame(lastPixels == null ? 1000u : 0u, out var info, out var resource);
+        if (borrowedMapped) throw new InvalidOperationException("Release the borrowed desktop frame before another capture.");
+        var result = duplication.AcquireNextFrame(stagingReady ? 0u : 1000u, out var info, out var resource);
         var acquired = Stopwatch.GetTimestamp();
         double desktopCopyMs = 0, releaseMs = 0, scaleMs = 0, readbackCopyMs = 0, mapMs = 0, allocationMs = 0, rowCopyMs = 0, unmapMs = 0, cpuScaleMs = 0;
         var changed = result.Success && (lastPixels == null || info.LastPresentTime != 0);
@@ -335,12 +389,14 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                             else if (path is DesktopCapturePath.CpuSwscale or DesktopCapturePath.NativeNoScale)
                             {
                                 context!.CopyResource(staging!, texture);
+                                stagingReady = true;
                                 readbackCopyMs = Stopwatch.GetElapsedTime(copyStarted).TotalMilliseconds;
                             }
                             else
                             {
                                 context!.CopyResource(desktop!, texture);
                                 desktopCopyMs = Stopwatch.GetElapsedTime(copyStarted).TotalMilliseconds;
+                                stagingReady = true;
                             }
                         }
                     }
@@ -351,20 +407,21 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 }
             }
             else if (result.Code != WaitTimeout) result.CheckError();
-            if (!changed)
+            if (!changed && lastPixels != null && !forceProcessUnchanged)
             {
-                if (lastPixels == null) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
                 ReleaseAcquiredFrame(); RecordStatistics(false);
                 return lastPixels;
             }
+            if (!changed && !stagingReady) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
             if (path is not (DesktopCapturePath.CpuSwscale or DesktopCapturePath.NativeNoScale))
             {
                 var scaleStarted = Stopwatch.GetTimestamp();
                 context!.ClearRenderTargetView(clearView!, new Color4(0, 0, 0, 1));
-                if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader)
+                if (path is DesktopCapturePath.PixelShader or DesktopCapturePath.DirectPixelShader or DesktopCapturePath.PixelShaderGray8 or DesktopCapturePath.PixelShaderRgb332 or DesktopCapturePath.PixelShaderRgb565 or DesktopCapturePath.PixelShaderGray4)
                 {
                     context.OMSetRenderTargets(clearView!);
-                    context.RSSetViewport(contentLeft, contentTop, contentWidth, contentHeight);
+                    context.RSSetViewport(path == DesktopCapturePath.PixelShaderGray4 ? contentLeft / 2 : contentLeft,
+                        contentTop, path == DesktopCapturePath.PixelShaderGray4 ? contentWidth / 2 : contentWidth, contentHeight);
                     context.RSSetState(rasterizer!);
                     context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
                     context.VSSetShader(vertexShader!);
@@ -386,7 +443,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             try
             {
                 var allocationStarted = Stopwatch.GetTimestamp();
-                pixels = new byte[checked(width * height * 4)];
+                // Opt-in only for synchronous consumers that finish reading before the next capture.
+                pixels = reusePixelBuffer && lastPixels != null ? lastPixels : new byte[BytesPerFrame];
                 if (path == DesktopCapturePath.CpuSwscale) MemoryMarshal.Cast<byte, uint>(pixels.AsSpan()).Fill(0xff000000);
                 allocationMs = Stopwatch.GetElapsedTime(allocationStarted).TotalMilliseconds;
                 var rowCopyStarted = Stopwatch.GetTimestamp();
@@ -404,7 +462,8 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
                 else
                 {
                     for (var y = 0; y < height; y++)
-                        new ReadOnlySpan<byte>((void*)(map.DataPointer + (nint)(y * (long)map.RowPitch)), width * 4).CopyTo(pixels.AsSpan(y * width * 4, width * 4));
+                        new ReadOnlySpan<byte>((void*)(map.DataPointer + (nint)(y * (long)map.RowPitch)), rowBytes)
+                            .CopyTo(pixels.AsSpan(y * rowBytes, rowBytes));
                     rowCopyMs = Stopwatch.GetElapsedTime(rowCopyStarted).TotalMilliseconds;
                 }
             }
@@ -416,7 +475,7 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
             }
             lastPixels = pixels;
             ReleaseAcquiredFrame();
-            RecordStatistics(true);
+            RecordStatistics(changed);
             return pixels;
         }
         finally { ReleaseAcquiredFrame(); }
@@ -448,8 +507,66 @@ sealed unsafe class DxgiDesktopCapture : IDisposable
         }
     }
 
+    public MappedBgraFrame? CaptureMapped(bool allowUnchanged)
+    {
+        ObjectDisposedException.ThrowIf(duplication == null, this);
+        if (path != DesktopCapturePath.NativeNoScale) throw new NotSupportedException("Mapped input requires native-size DDA capture.");
+        if (borrowedMapped) throw new InvalidOperationException("Release the borrowed desktop frame before another capture.");
+        var started = Stopwatch.GetTimestamp();
+        var result = duplication.AcquireNextFrame(stagingReady ? 0u : 1000u, out var info, out var resource);
+        var acquired = Stopwatch.GetTimestamp();
+        var changed = result.Success && (!stagingReady || info.LastPresentTime != 0);
+        var copyMs = 0d;
+        try
+        {
+            if (result.Success)
+            {
+                using (resource)
+                {
+                    if (info.LastMouseUpdateTime != 0) separateCursorVisible = info.PointerPosition.Visible;
+                    if (changed)
+                    {
+                        using var texture = resource.QueryInterface<ID3D11Texture2D>();
+                        if (texture.Description.Width != sourceWidth || texture.Description.Height != sourceHeight)
+                            throw new InvalidOperationException("Desktop dimensions changed; recreate duplication.");
+                        var copyStart = Stopwatch.GetTimestamp();
+                        context!.CopyResource(staging!, texture);
+                        copyMs = Stopwatch.GetElapsedTime(copyStart).TotalMilliseconds;
+                        stagingReady = true;
+                        lastPixels = null;
+                    }
+                }
+            }
+            else if (result.Code != WaitTimeout) result.CheckError();
+        }
+        finally { if (result.Success) duplication.ReleaseFrame().CheckError(); }
+        if (!changed && !allowUnchanged) return null;
+        if (!stagingReady) throw new TimeoutException("DXGI returned no initial desktop image within one second.");
+        var mapStart = Stopwatch.GetTimestamp();
+        var mapped = context!.Map(staging!, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        borrowedMapped = true;
+        var mapMs = Stopwatch.GetElapsedTime(mapStart).TotalMilliseconds;
+        Statistics = new("DXGI", sourceWidth, sourceHeight, changed,
+            Stopwatch.GetElapsedTime(started, acquired).TotalMilliseconds, copyMs + mapMs,
+            separateCursorVisible, "Separate hardware cursor excluded; an OS-composited cursor may already be part of the desktop texture.",
+            ReadbackCopySubmitMs: copyMs, MapWaitAndReadbackMs: mapMs,
+            TotalCaptureMs: Stopwatch.GetElapsedTime(started).TotalMilliseconds,
+            CapturePath: path.ToString(), SourcePresentAgeMs: info.LastPresentTime == 0 ? 0 : Stopwatch.GetElapsedTime(info.LastPresentTime).TotalMilliseconds,
+            AccumulatedFrames: info.AccumulatedFrames, OutputWidth: width, OutputHeight: height,
+            DesktopImageInSystemMemory: desktopImageInSystemMemory);
+        return new(mapped.DataPointer, checked((int)mapped.RowPitch), width, height, ReleaseMapped);
+    }
+
+    void ReleaseMapped()
+    {
+        if (!borrowedMapped) return;
+        context!.Unmap(staging!, 0);
+        borrowedMapped = false;
+    }
+
     public void Dispose()
     {
+        ReleaseMapped();
         outputView?.Dispose(); inputView?.Dispose(); clearView?.Dispose(); staging?.Dispose(); scaled?.Dispose(); desktop?.Dispose();
         vertexShader?.Dispose(); pixelShader?.Dispose(); shaderInput?.Dispose(); sampler?.Dispose(); rasterizer?.Dispose();
         if (cpuScaler != null) Ffmpeg.sws_freeContext(cpuScaler);

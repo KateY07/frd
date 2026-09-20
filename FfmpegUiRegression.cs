@@ -280,7 +280,7 @@ static partial class FfmpegUi
                 origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
                 origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
             Control[] expandedControls = [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel,
-                clipboardEnabled, transmissionScale, fullScreen, showWatermark];
+                clipboardEnabled, fullScreen, showWatermark];
             Control[] controls = expanded ? expandedControls : [floatingOrb];
             var visible = controls.All(control => control.IsEffectivelyVisible && control.Bounds.Width > 0 && control.Bounds.Height > 0);
             var rectangles = controls.Select(control =>

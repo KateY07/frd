@@ -9,6 +9,16 @@ namespace Frd;
 public sealed record CodecPacket(byte[] Data, bool KeyFrame, long Pts);
 public sealed record DecodedPixels(byte[] Bgra, int Width, int Height, long Pts);
 
+internal sealed class MappedBgraFrame(nint pixels, int stride, int width, int height, Action release) : IDisposable
+{
+    Action? releaseFrame = release;
+    public nint Pixels { get; } = pixels;
+    public int Stride { get; } = stride;
+    public int Width { get; } = width;
+    public int Height { get; } = height;
+    public void Dispose() => Interlocked.Exchange(ref releaseFrame, null)?.Invoke();
+}
+
 public static unsafe class FfmpegRuntime
 {
     static readonly object Gate = new();
@@ -138,10 +148,15 @@ internal sealed class FfmpegArguments
 
 public sealed unsafe class FfmpegEncoder : IDisposable
 {
+    static readonly av_buffer_create_free ReleaseBorrowedInput = (_, _) => { };
     AVCodecContext* context;
     AVFrame* frame;
+    AVFrame* mappedFrame;
     AVPacket* packet;
     SwsContext* converter;
+    SwsContext* grayConverter;
+    SwsContext* rgb332Converter;
+    SwsContext* rgb565Converter;
     readonly byte*[] inputPlanes = new byte*[4];
     readonly int[] inputStrides = new int[4];
     readonly byte*[] outputPlanes = new byte*[4];
@@ -186,8 +201,8 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             context->gop_size = fps * 2;
             context->max_b_frames = 0;
             context->thread_count = 1;
-            context->color_range = AVColorRange.AVCOL_RANGE_MPEG;
-            context->colorspace = AVColorSpace.AVCOL_SPC_BT709;
+            context->color_range = Name == "libx264rgb" ? AVColorRange.AVCOL_RANGE_JPEG : AVColorRange.AVCOL_RANGE_MPEG;
+            context->colorspace = Name == "libx264rgb" ? AVColorSpace.AVCOL_SPC_RGB : AVColorSpace.AVCOL_SPC_BT709;
             context->color_primaries = AVColorPrimaries.AVCOL_PRI_BT709;
             context->color_trc = AVColorTransferCharacteristic.AVCOL_TRC_BT709;
             var desiredFormat = options.Last("pix_fmt");
@@ -211,8 +226,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             FfmpegRuntime.OpenCodec(context, codec, $"Open encoder {Name}");
             PixelFormat = ffmpeg.av_get_pix_fmt_name(context->pix_fmt);
             frame = ffmpeg.av_frame_alloc();
+            if (Name == "libx264rgb" && context->pix_fmt == AVPixelFormat.AV_PIX_FMT_BGR0)
+                mappedFrame = ffmpeg.av_frame_alloc();
             packet = ffmpeg.av_packet_alloc();
-            if (frame == null || packet == null) throw new OutOfMemoryException("FFmpeg frame or packet allocation failed.");
+            if (frame == null || packet == null || (Name == "libx264rgb" && context->pix_fmt == AVPixelFormat.AV_PIX_FMT_BGR0 && mappedFrame == null))
+                throw new OutOfMemoryException("FFmpeg frame or packet allocation failed.");
             frame->format = (int)context->pix_fmt;
             frame->width = width;
             frame->height = height;
@@ -284,6 +302,70 @@ public sealed unsafe class FfmpegEncoder : IDisposable
             var rows = ffmpeg.sws_scale(converter, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
             if (rows != height) throw new InvalidOperationException($"BGRA conversion returned {rows} rows, expected {height}.");
         }
+        return SubmitFrame(pts, forceKeyframe);
+    }
+
+    internal IReadOnlyList<CodecPacket> EncodeQuantized(byte[] pixels, bool grayscale, long pts, bool forceKeyframe = false)
+        => EncodePacked(pixels, grayscale ? AVPixelFormat.AV_PIX_FMT_GRAY8 : AVPixelFormat.AV_PIX_FMT_RGB8, 1, pts, forceKeyframe);
+
+    internal IReadOnlyList<CodecPacket> EncodeRgb565(byte[] pixels, long pts, bool forceKeyframe = false)
+        => EncodePacked(pixels, AVPixelFormat.AV_PIX_FMT_RGB565LE, 2, pts, forceKeyframe);
+
+    byte[]? gray4Expanded;
+
+    internal IReadOnlyList<CodecPacket> EncodeGray4(byte[] pixels, long pts, bool forceKeyframe = false)
+    {
+        if ((width & 1) != 0 || pixels.Length != checked(width * height / 2))
+            throw new ArgumentException("Packed Gray4 input dimensions do not match the encoder.", nameof(pixels));
+        var expanded = gray4Expanded ??= new byte[checked(width * height)];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var pair = pixels[i];
+            expanded[i * 2] = (byte)((pair >> 4) * 17);
+            expanded[i * 2 + 1] = (byte)((pair & 15) * 17);
+        }
+        return EncodeQuantized(expanded, true, pts, forceKeyframe);
+    }
+
+    IReadOnlyList<CodecPacket> EncodePacked(byte[] pixels, AVPixelFormat sourceFormat, int bytesPerPixel, long pts, bool forceKeyframe)
+    {
+        ObjectDisposedException.ThrowIf(context == null, this);
+        if (flushed) throw new InvalidOperationException("Cannot encode after flushing the session.");
+        if (pixels.Length != checked(width * height * bytesPerPixel)) throw new ArgumentException("Packed input size does not match encoder dimensions.", nameof(pixels));
+        FfmpegRuntime.Check(ffmpeg.av_frame_make_writable(frame), "Make quantized encoder input writable");
+        var chosen = sourceFormat switch
+        {
+            AVPixelFormat.AV_PIX_FMT_GRAY8 => grayConverter,
+            AVPixelFormat.AV_PIX_FMT_RGB8 => rgb332Converter,
+            AVPixelFormat.AV_PIX_FMT_RGB565LE => rgb565Converter,
+            _ => throw new ArgumentOutOfRangeException(nameof(sourceFormat))
+        };
+        var firstUse = chosen == null;
+        chosen = ffmpeg.sws_getCachedContext(chosen, width, height, sourceFormat, width, height, context->pix_fmt,
+            (int)SwsFlags.SWS_FAST_BILINEAR, null, null, null);
+        if (chosen == null) throw new NotSupportedException($"{sourceFormat} to {PixelFormat} conversion is unavailable.");
+        if (firstUse)
+        {
+            var coefficients = *(int_array4*)ffmpeg.sws_getCoefficients(ffmpeg.SWS_CS_ITU709);
+            FfmpegRuntime.Check(ffmpeg.sws_setColorspaceDetails(chosen, coefficients, 1, coefficients, 0, 0, 1 << 16, 1 << 16),
+                "Configure packed BT.709 conversion");
+        }
+        if (sourceFormat == AVPixelFormat.AV_PIX_FMT_GRAY8) grayConverter = chosen;
+        else if (sourceFormat == AVPixelFormat.AV_PIX_FMT_RGB8) rgb332Converter = chosen;
+        else rgb565Converter = chosen;
+        fixed (byte* input = pixels)
+        {
+            inputPlanes[0] = input;
+            inputStrides[0] = width * bytesPerPixel;
+            for (var i = 0; i < 4; i++) { outputPlanes[i] = frame->data[(uint)i]; outputStrides[i] = frame->linesize[(uint)i]; }
+            var rows = ffmpeg.sws_scale(chosen, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
+            if (rows != height) throw new InvalidOperationException($"Quantized conversion returned {rows} rows, expected {height}.");
+        }
+        return SubmitFrame(pts, forceKeyframe);
+    }
+
+    IReadOnlyList<CodecPacket> SubmitFrame(long pts, bool forceKeyframe)
+    {
         frame->pts = pts;
         frame->pict_type = forceKeyframe ? AVPictureType.AV_PICTURE_TYPE_I : AVPictureType.AV_PICTURE_TYPE_NONE;
         List<CodecPacket> result = new();
@@ -292,6 +374,62 @@ public sealed unsafe class FfmpegEncoder : IDisposable
         FfmpegRuntime.Check(status, $"Encode using {Name}");
         Receive(result);
         return result;
+    }
+
+    internal bool SupportsMappedBgra => true;
+
+    internal IReadOnlyList<CodecPacket> EncodeMapped(MappedBgraFrame bgra, long pts, bool forceKeyframe = false)
+    {
+        ObjectDisposedException.ThrowIf(context == null, this);
+        if (flushed) throw new InvalidOperationException("Cannot encode after flushing the session.");
+        if (bgra.Width != width || bgra.Height != height || bgra.Pixels == 0 || bgra.Stride < checked(width * 4))
+            throw new ArgumentException("Mapped BGRA input dimensions or stride do not match the encoder.", nameof(bgra));
+        if (mappedFrame == null)
+        {
+            FfmpegRuntime.Check(ffmpeg.av_frame_make_writable(frame), "Make encoder input writable");
+            inputPlanes[0] = (byte*)bgra.Pixels;
+            inputStrides[0] = bgra.Stride;
+            for (var i = 0; i < 4; i++) { outputPlanes[i] = frame->data[(uint)i]; outputStrides[i] = frame->linesize[(uint)i]; }
+            var rows = ffmpeg.sws_scale(converter, inputPlanes, inputStrides, 0, height, outputPlanes, outputStrides);
+            if (rows != height) throw new InvalidOperationException($"BGRA conversion returned {rows} rows, expected {height}.");
+            return SubmitFrame(pts, forceKeyframe);
+        }
+        ffmpeg.av_frame_unref(mappedFrame);
+        var buffer = ffmpeg.av_buffer_create((byte*)bgra.Pixels, checked((ulong)bgra.Stride * (ulong)height),
+            ReleaseBorrowedInput, null, ffmpeg.AV_BUFFER_FLAG_READONLY);
+        if (buffer == null) throw new OutOfMemoryException("Reference mapped desktop pixels.");
+        mappedFrame->buf[0] = buffer;
+        mappedFrame->data[0] = (byte*)bgra.Pixels;
+        mappedFrame->linesize[0] = bgra.Stride;
+        mappedFrame->format = (int)AVPixelFormat.AV_PIX_FMT_BGR0;
+        mappedFrame->width = width;
+        mappedFrame->height = height;
+        mappedFrame->color_range = context->color_range;
+        mappedFrame->colorspace = context->colorspace;
+        mappedFrame->color_primaries = context->color_primaries;
+        mappedFrame->color_trc = context->color_trc;
+        mappedFrame->pts = pts;
+        mappedFrame->pict_type = forceKeyframe ? AVPictureType.AV_PICTURE_TYPE_I : AVPictureType.AV_PICTURE_TYPE_NONE;
+        try
+        {
+            List<CodecPacket> result = new();
+            var status = ffmpeg.avcodec_send_frame(context, mappedFrame);
+            if (status == ffmpeg.AVERROR(ffmpeg.EAGAIN)) { Receive(result); status = ffmpeg.avcodec_send_frame(context, mappedFrame); }
+            FfmpegRuntime.Check(status, $"Encode mapped desktop using {Name}");
+            Receive(result);
+            if (ffmpeg.av_buffer_get_ref_count(mappedFrame->buf[0]) != 1)
+            {
+                Dispose();
+                throw new InvalidOperationException("libx264rgb retained the mapped desktop input; encoder stopped before unmapping it.");
+            }
+            return result;
+        }
+        catch
+        {
+            if (mappedFrame != null && mappedFrame->buf[0] != null && ffmpeg.av_buffer_get_ref_count(mappedFrame->buf[0]) != 1) Dispose();
+            throw;
+        }
+        finally { if (mappedFrame != null) ffmpeg.av_frame_unref(mappedFrame); }
     }
 
     public IReadOnlyList<CodecPacket> Flush()
@@ -354,7 +492,11 @@ public sealed unsafe class FfmpegEncoder : IDisposable
     public void Dispose()
     {
         if (converter != null) { ffmpeg.sws_freeContext(converter); converter = null; }
+        if (grayConverter != null) { ffmpeg.sws_freeContext(grayConverter); grayConverter = null; }
+        if (rgb332Converter != null) { ffmpeg.sws_freeContext(rgb332Converter); rgb332Converter = null; }
+        if (rgb565Converter != null) { ffmpeg.sws_freeContext(rgb565Converter); rgb565Converter = null; }
         var savedFrame = frame; frame = null; if (savedFrame != null) ffmpeg.av_frame_free(&savedFrame);
+        var savedMapped = mappedFrame; mappedFrame = null; if (savedMapped != null) ffmpeg.av_frame_free(&savedMapped);
         var savedPacket = packet; packet = null; if (savedPacket != null) ffmpeg.av_packet_free(&savedPacket);
         var savedContext = context; context = null; if (savedContext != null) ffmpeg.avcodec_free_context(&savedContext);
     }
