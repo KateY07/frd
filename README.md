@@ -1,4 +1,4 @@
-# FRD · 远程桌面 CLI（v1.pre9）
+# FRD · 远程桌面 CLI（v1.pre10）
 
 FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
@@ -48,7 +48,7 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 - 使用控制台 EXE 入口：在终端直接调用时持续阻塞，直到窗口关闭、资源清理完成并返回退出码；不会启动后台子进程后提前返回。二次开发调用方使用 `WaitForExitAsync()` 等待退出；显式使用 `Start-Process` 等异步启动方式时，等待行为由调用方决定。
 - 被控监听成功的日志包含 `Remote listener ready:`。集成端应持续读取重定向的 stdout/stderr，避免管道填满阻塞子进程。日志用于诊断，不作为稳定 JSON 协议。
 - `--connect` 可附加 `--test-seconds N --report PATH`（1–3600 秒）进行限时演示并输出 JSON 报告；它是开发验证入口，正常会话不必设置。
-- 正常退出优先关闭进程主窗口并等待结束，保证捕获、网络及输入状态得到清理。源码中通过 SYSTEM 辅助进程显示锁屏与 UAC 安全桌面，并在被控端授权键鼠后向该进程转发输入；双机 Demo 的 UAC、锁屏画面及键鼠操作已人工确认。辅助进程尚未纳入便携包，不能将本次开发测试当作 v1.pre9 的无人值守能力。被控端连接时在右下角显示受控提示，可断开连接或撤销剪贴板、键鼠权限；窗口从普通桌面捕获中排除。声音尚未实现。
+- 正常退出优先关闭进程主窗口并等待结束，保证捕获、网络及输入状态得到清理。源码中通过 SYSTEM 辅助进程显示锁屏与 UAC 安全桌面，并在被控端授权键鼠后向该进程转发输入；双机 Demo 的 UAC、锁屏画面及键鼠操作已人工确认。辅助进程尚未纳入便携包，不能将本次开发测试当作 v1.pre10 的无人值守能力。被控端连接时在右下角显示受控提示，可断开连接或撤销剪贴板、键鼠权限；窗口从普通桌面捕获中排除。声音尚未实现。
 - 安全桌面辅助进程目前仅供受信任测试机验证：本地输入密钥可由启动用户读取，测试服务安装在用户目录，尚不满足正式发布所需的特权输入授权及服务文件保护。
 
 ### C# 调用示例
@@ -58,7 +58,7 @@ using System.Diagnostics;
 
 var executable = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-    "Programs", "FRD", "v1.pre9", "FRD.exe");
+    "Programs", "FRD", "v1.pre10", "FRD.exe");
 var info = new ProcessStartInfo(executable)
 {
     WorkingDirectory = Path.GetDirectoryName(executable),
@@ -89,8 +89,8 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - `autoSelectCodec:true` 在启动时对标记 `autoProbe:true` 的有损预设做真实屏幕短测，探测进程最多运行 5 秒；不可用或超时则保留 `initialPreset`。`minimumAutoBitrateKbps` 可让高带宽预设仅在码率足够时参与。双机时被控端测捕获和编码，主控端用样本验证并测解码；结果只是当前画面、当前码率下的启动选择，手动切换始终可用。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
 - 本版依赖 **.NET 10 x64 Runtime**，不再自包含运行时，也不启用 Native AOT；仍直接运行 `FRD.exe`。需在主控与被控机器预先安装相应运行时，SDK 非必需；[微软下载页](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)。Avalonia 与 FFmpeg 原生依赖仍随包提供。原生调试符号另存于本机构建产物，不进入便携包。
-- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre9\`，不同版本分目录保留。
-- 发布脚本的输出目录为 `artifacts/v1.pre9/`，包含便携 ZIP、README 和 SHA-256。Git 只推送版本标签及其引用的源码提交，不更新远端默认分支；安装包保留本机，不上传 GitHub Releases。
+- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v1.pre10\`，不同版本分目录保留。
+- 发布脚本的输出目录为 `artifacts/v1.pre10/`，包含便携 ZIP、README 和 SHA-256。推送 `v*` 标签会由 GitHub Actions 在 Windows runner 上重新构建，并创建带 ZIP 和校验文件的 GitHub Pre-release；标签必须与项目版本一致。
 
 ## 开发与边界
 
@@ -101,6 +101,11 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 v1.pre7 的输入发送改为有界流水：保持事件顺序，后台确认，不再每个事件等待一次 RTT 才发下一个；补充延迟、取消、断线及按键释放回归。已完成成熟方案调查、五组共享瓶颈/全双工短测和两组固有延迟/排队对照；这些网络模型不等同于真实公网或 RDP 对测。**本版仍由滑块手动控制编码码率，未实现自动降码率。** 详见 [输入延迟验证](docs/本机输入延迟验证.md)、[公网拥塞调查](docs/公网拥塞控制调查.md)、[公网回归设计与结果](docs/受限公网回归设计.md)。
 
 后续拥塞控制目标保留，但按用户要求暂缓实现：**有损预设的滑块固定为用户码率上限，内部在上限内自动调节实际编码码率，拥塞时优先延迟、允许降低清晰度，恢复后逐步升码率。** 不自动改变预设。诊断区分链路低负载基线、估计的新增网络排队和本地处理/排队；高 RTT 本身不等于带宽不足。此项不属于本版已实现功能，详见 [目标与验收](docs/目标与验收.md)。
+
+## v1.pre10 更新
+
+- 新增 GitHub Actions 自动发布：推送版本标签后，恢复经过 SHA-256 固定的 FFmpeg 运行库，使用 .NET 10 构建框架依赖的 Windows x64 便携包，校验版本和 ZIP，再上传 Actions artifact 并创建 GitHub Pre-release。
+- 程序功能与 v1.pre9 相同；不移动或覆盖既有标签。
 
 ## v1.pre9 更新
 
@@ -117,4 +122,4 @@ v1.pre7 的输入发送改为有界流水：保持事件顺序，后台确认，
 
 以上控制栏界面继承自已获人工确认的 v1.pre4；本版移除 pre7 的本机专用测试目标和鼠标事件过滤，保留输入流水发送及失败清理。测试目标仅保存在独立测试工程，不进入正式程序或生成的单文件 Demo。未重新执行真实双机或 RDP 对照，自动全局键鼠注入回归继续保持暂停。
 
-进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre9-发布说明.md)、[静态检查](docs/v1.pre9-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v1.pre10-发布说明.md)、[静态检查](docs/v1.pre10-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
