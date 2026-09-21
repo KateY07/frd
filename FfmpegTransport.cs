@@ -489,6 +489,7 @@ public sealed class UdpVideoReceiver : IDisposable
     EndPoint? source;
     IPEndPoint? expectedSource;
     byte[]? registrationNonce;
+    int diagnosticCallbacksDisabled;
     long bufferedBytes, queuedBytes, totalPackets, totalWireBytes, firstReceiveTick, lastReceiveTick, feedbackTick;
     uint firstSequence, lastSequence, highestSequence, batchPackets, batchWireBytes;
     int disposed, currentGeneration = int.MinValue;
@@ -533,9 +534,14 @@ public sealed class UdpVideoReceiver : IDisposable
         var packet = VideoDatagram.Registration(session);
         for (var attempt = 0; attempt < 5; attempt++)
         {
-            socket.SendTo(packet, endpoint);
+            try { socket.SendTo(packet, endpoint); }
+            catch (SocketException error) when (VideoDatagram.Recoverable(error, "Registration send"))
+            {
+                // Recoverable logs the socket error; retain the bounded acknowledgement wait before retrying.
+            }
             try { await registration.Task.WaitAsync(TimeSpan.FromMilliseconds(500), token); return; }
-            catch (TimeoutException) when (attempt < 4) { }
+            catch (TimeoutException)
+            { VideoDatagram.Log($"UDP registration acknowledgement timeout ({attempt + 1}/5)."); }
         }
         throw new IOException($"UDP {endpoint} registration was not acknowledged; verify the UDP --port forwarding rule.");
     }
@@ -574,8 +580,15 @@ public sealed class UdpVideoReceiver : IDisposable
                 }
                 if (FrameDiagnosticProtocol.TryDecode(bytes.AsSpan(0, length), out var diagnostic))
                 {
-                    try { DiagnosticReceived?.Invoke(diagnostic!); }
-                    catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); Failed?.Invoke(error); }
+                    if (Volatile.Read(ref diagnosticCallbacksDisabled) == 0)
+                    {
+                        try { DiagnosticReceived?.Invoke(diagnostic!); }
+                        catch (Exception error)
+                        {
+                            Volatile.Write(ref diagnosticCallbacksDisabled, 1);
+                            VideoDatagram.Log("Diagnostic callback disabled after failure; video and input remain active", error);
+                        }
+                    }
                     continue;
                 }
                 var now = VideoDatagram.Now;

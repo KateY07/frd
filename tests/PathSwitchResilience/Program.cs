@@ -4,6 +4,24 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Frd;
 
+if (args.Contains("--network-stimulus"))
+{
+    NetworkStimulus.Run();
+    return;
+}
+
+if (args.Contains("--udp-resilience-only"))
+{
+    await UdpResilienceRegression.RunAsync();
+    return;
+}
+
+if (args.Contains("--auxiliary-path-only"))
+{
+    await AuxiliaryPathRegression.RunAsync();
+    return;
+}
+
 if (args.Contains("--same-session-only"))
 {
     await SameSessionRegression.RunAsync();

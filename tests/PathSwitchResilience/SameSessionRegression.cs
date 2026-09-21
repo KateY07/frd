@@ -8,6 +8,7 @@ static class SameSessionRegression
 {
     public static async Task RunAsync()
     {
+        using var stimulus = NetworkStimulus.Start();
         FfmpegRuntime.Initialize(Path.GetFullPath("third_party/ffmpeg/runtime"));
         var config = (JsonSerializer.Deserialize<AppConfiguration>(File.ReadAllText("codec-config.json"), AppConfiguration.JsonOptions)
             ?? throw new InvalidDataException("Codec config missing.")) with
@@ -45,6 +46,8 @@ static class SameSessionRegression
             if (Volatile.Read(ref hostFailure) is { } hostError) throw new InvalidOperationException($"Host failed during {pauseMs}ms pause.", hostError);
             if (Volatile.Read(ref clientFailure) is { } clientError) throw new InvalidOperationException($"Client failed during {pauseMs}ms pause.", clientError);
             relay.Resume();
+            var resumedFrames = Interlocked.Read(ref frames);
+            var appliedBefore = host.AppliedUdpInputs;
             if (!(await pendingInput.WaitAsync(TimeSpan.FromSeconds(5))).Accepted)
                 throw new InvalidOperationException($"Input acknowledgement rejected after {pauseMs}ms pause.");
             if (!(await input.SendAsync(new(RemoteInputKind.ReleaseAll))).Accepted)
@@ -54,6 +57,7 @@ static class SameSessionRegression
                 throw new InvalidOperationException($"UDP input command rejected after {pauseMs}ms pause.");
             await UntilAsync(() => relay.InputForwarded > inputBefore, 2);
             await UntilAsync(() => Interlocked.Read(ref statuses) > previousStatuses, 8);
+            await UntilAsync(() => Interlocked.Read(ref frames) >= resumedFrames + 3 && host.AppliedUdpInputs >= appliedBefore + 2, 8);
             if (relay.TcpConnections != connections) throw new InvalidOperationException("A paused connection was replaced.");
             Console.WriteLine($"PASS {pauseMs}ms: same {connections} TCP connections; status/input recovered; decoded frame delta={Interlocked.Read(ref frames) - previousFrames}; dropped UDP={relay.UdpDropped}.");
         }
@@ -62,7 +66,9 @@ static class SameSessionRegression
         var beforeLossStatuses = Interlocked.Read(ref statuses);
         await Task.Delay(2000);
         relay.SetImpairment(0, false);
+        var recoveredFrames = Interlocked.Read(ref frames);
         await UntilAsync(() => Interlocked.Read(ref statuses) > beforeLossStatuses, 3);
+        await UntilAsync(() => Interlocked.Read(ref frames) >= recoveredFrames + 3, 8);
         if (relay.TcpConnections != connections) throw new InvalidOperationException("Loss/reorder replaced a connection.");
         Console.WriteLine($"PASS: UDP loss/reorder left the same session active; decoded frame delta={Interlocked.Read(ref frames) - before}.");
 
@@ -71,30 +77,38 @@ static class SameSessionRegression
         await Task.Delay(1000);
         if (Interlocked.Read(ref statuses) <= beforeStatuses) throw new InvalidOperationException("UDP-only pause also stopped control status.");
         relay.Resume();
+        recoveredFrames = Interlocked.Read(ref frames);
+        await UntilAsync(() => Interlocked.Read(ref frames) >= recoveredFrames + 3, 8);
         if (Volatile.Read(ref clientFailure) != null) throw new InvalidOperationException("UDP-only pause failed the session.");
         Console.WriteLine("PASS: UDP-only pause left TCP status active and did not terminate video session.");
 
         relay.PauseDiagnosticsOnly();
         await Task.Delay(250);
         if (Volatile.Read(ref clientFailure) != null) throw new InvalidOperationException("Diagnostic UDP pause failed the session.");
+        var diagnosticBefore = JsonSerializer.SerializeToElement(session.GetReport()).GetProperty("ReceivedDiagnosticFrames").GetInt64();
         relay.Resume();
+        await UntilAsync(() => JsonSerializer.SerializeToElement(session.GetReport()).GetProperty("ReceivedDiagnosticFrames").GetInt64() > diagnosticBefore, 5);
         Console.WriteLine("PASS: diagnostic UDP pause did not terminate video session.");
 
         relay.PauseFeedbackOnly();
         await Task.Delay(250);
         if (Volatile.Read(ref clientFailure) != null) throw new InvalidOperationException("Feedback UDP pause failed the session.");
+        var feedbackBefore = JsonSerializer.SerializeToElement(session.GetReport()).GetProperty("Network").GetProperty("ReceivedPackets").GetInt64();
         relay.Resume();
+        await UntilAsync(() => JsonSerializer.SerializeToElement(session.GetReport()).GetProperty("Network").GetProperty("ReceivedPackets").GetInt64() > feedbackBefore, 5);
         Console.WriteLine("PASS: feedback UDP pause did not terminate video session.");
 
         before = Interlocked.Read(ref statuses);
         relay.PauseInputTcpOnly();
         var inputBeforeTcpPause = relay.InputForwarded;
+        var appliedBeforeTcpPause = host.AppliedUdpInputs;
         var pendingAuxiliary = input.SendAsync(new(RemoteInputKind.ReleaseAll));
         await Task.Delay(1000);
         if (Interlocked.Read(ref statuses) <= before) throw new InvalidOperationException("Input-only TCP pause stopped the control/status channel.");
         if (!(await pendingAuxiliary.WaitAsync(TimeSpan.FromSeconds(5))).Accepted)
             throw new InvalidOperationException("UDP input was rejected while auxiliary TCP was paused.");
         await UntilAsync(() => relay.InputForwarded > inputBeforeTcpPause, 2);
+        await UntilAsync(() => host.AppliedUdpInputs > appliedBeforeTcpPause, 2);
         relay.Resume();
         if (relay.TcpConnections != connections) throw new InvalidOperationException("Single-channel pause replaced a connection.");
         Console.WriteLine("PASS: fixed-port UDP input continued while the auxiliary TCP channel was paused.");
@@ -103,9 +117,11 @@ static class SameSessionRegression
         await UntilAsync(() => input.Failure != null, 5);
         await Task.Delay(100);
         using var replacementInput = await session.ConnectRemoteInputAsync(CancellationToken.None);
+        var appliedBeforeReplacement = host.AppliedUdpInputs;
         if (!(await replacementInput.SetEnabledAsync(true)).Accepted ||
             !(await replacementInput.SendAsync(new(RemoteInputKind.ReleaseAll))).Accepted)
             throw new InvalidOperationException("New auxiliary input connection did not work after explicit input EOF.");
+        await UntilAsync(() => host.AppliedUdpInputs > appliedBeforeReplacement, 3);
         if (Volatile.Read(ref clientFailure) != null || relay.TcpConnections != connections + 1)
             throw new InvalidOperationException("Explicit input EOF replaced the video/control session.");
         Console.WriteLine("PASS: explicit input-only EOF permits a new auxiliary input channel while video/control remain unchanged.");

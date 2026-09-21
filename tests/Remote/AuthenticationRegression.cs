@@ -34,7 +34,7 @@ static class AuthenticationRegression
             return Process.Start(info) ?? throw new IOException("Cannot start authentication test host.");
         }
         Process Start(params string[] extra) => StartCommand(["--host", "--listen", "127.0.0.1", "--port", port.ToString(), .. extra]);
-        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v1.pre13"), ("--unknown-option", 1, "") })
+        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v2.pre1"), ("--unknown-option", 1, "") })
         {
             using var process = StartCommand(argument);
             var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();

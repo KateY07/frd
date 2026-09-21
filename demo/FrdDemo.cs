@@ -5850,20 +5850,38 @@ sealed class RemoteUdpSession : IAsyncDisposable
     readonly byte[] nonce;
     readonly CancellationTokenSource stop;
     readonly Task worker;
+    readonly Task inputWorker;
+    readonly Action<Exception>? failed;
+    readonly AutoResetEvent inputReady = new(false);
+    readonly LinkedList<RemoteInputEvent> pendingInput = new();
     readonly TaskCompletionSource<IPEndPoint> registered = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly object gate = new();
     IPEndPoint? peer;
     UdpVideoSender? sender;
-    IRemoteInputInjector? injector;
-    Func<bool>? inputEnabled;
+    InputBinding? inputBinding;
     long latestInput;
+    long appliedInputs;
+    int failureReported;
 
-    public RemoteUdpSession(Socket socket, string session, CancellationToken token)
+    sealed class InputBinding(IRemoteInputInjector injector, Func<bool> enabled)
+    {
+        public readonly object Execution = new();
+        public readonly IRemoteInputInjector Injector = injector;
+        public readonly Func<bool> Enabled = enabled;
+        public long Revision;
+    }
+
+    internal long AppliedInputs => Interlocked.Read(ref appliedInputs);
+    internal int PendingInputs { get { lock (gate) return pendingInput.Count; } }
+
+    public RemoteUdpSession(Socket socket, string session, CancellationToken token, Action<Exception>? failed = null)
     {
         this.socket = socket;
         nonce = Convert.FromHexString(session);
+        this.failed = failed;
         stop = CancellationTokenSource.CreateLinkedTokenSource(token);
         worker = Task.Run(Receive);
+        inputWorker = Task.Factory.StartNew(DispatchInput, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     public async Task<IPEndPoint> WaitForRegistrationAsync(CancellationToken token) =>
@@ -5876,41 +5894,120 @@ sealed class RemoteUdpSession : IAsyncDisposable
 
     public void AttachInput(IRemoteInputInjector value, Func<bool> enabled)
     {
-        lock (gate) { injector = value; inputEnabled = enabled; latestInput = 0; }
+        lock (gate)
+        {
+            if (inputBinding != null) throw new InvalidOperationException("Input dispatcher is already attached.");
+            inputBinding = new(value, enabled); pendingInput.Clear(); latestInput = 0;
+        }
     }
 
     public void DetachInput(IRemoteInputInjector value)
     {
-        lock (gate) if (ReferenceEquals(injector, value)) { injector = null; inputEnabled = null; latestInput = 0; }
+        InputBinding? binding;
+        lock (gate)
+        {
+            binding = inputBinding;
+            if (binding == null || !ReferenceEquals(binding.Injector, value)) return;
+            inputBinding = null; pendingInput.Clear(); latestInput = 0;
+        }
+        // Wait only on the lifecycle caller, never on the UDP receiver, before disposing the injector.
+        lock (binding.Execution)
+        {
+            var result = binding.Injector.ReleaseAll();
+            if (!result.Accepted) Console.Error.WriteLine("[Input] Detach release failed: " + result.Message);
+        }
+    }
+
+    public void UpdateInputEnabled(IRemoteInputInjector value, Action update)
+    {
+        InputBinding binding;
+        lock (gate)
+            binding = inputBinding is { } current && ReferenceEquals(current.Injector, value) ? current :
+                throw new InvalidOperationException("Input dispatcher is no longer attached.");
+        lock (binding.Execution)
+        {
+            lock (gate) { pendingInput.Clear(); binding.Revision++; }
+            update();
+        }
+    }
+
+    void DispatchInput()
+    {
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                InputBinding? binding;
+                RemoteInputEvent? input;
+                long revision;
+                lock (gate)
+                {
+                    binding = inputBinding;
+                    revision = binding?.Revision ?? 0;
+                    input = pendingInput.First?.Value;
+                    if (input != null) pendingInput.RemoveFirst();
+                }
+                if (binding == null || input == null) { inputReady.WaitOne(20); continue; }
+                lock (binding.Execution)
+                {
+                    lock (gate)
+                        if (!ReferenceEquals(inputBinding, binding) || revision != binding.Revision || !binding.Enabled() || stop.IsCancellationRequested) continue;
+                    var result = binding.Injector.Inject(input);
+                    if (result.Accepted) Interlocked.Increment(ref appliedInputs);
+                    else Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                }
+            }
+        }
+        catch (Exception error) { Fail(error); }
+    }
+
+    void Fail(Exception error)
+    {
+        if (Interlocked.Exchange(ref failureReported, 1) != 0) return;
+        Console.Error.WriteLine("[UDP session] " + error);
+        registered.TrySetException(error);
+        stop.Cancel(); inputReady.Set();
+        failed?.Invoke(error);
     }
 
     void Receive()
     {
-        var packet = new byte[VideoDatagram.MaxSize];
+        var packet = new byte[65536];
         var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
         try
         {
             while (!stop.IsCancellationRequested)
             {
-                if (!socket.Poll(20_000, SelectMode.SelectRead)) continue;
                 EndPoint source = new IPEndPoint(any, 0);
-                var length = socket.ReceiveFrom(packet, ref source);
+                int length;
+                try
+                {
+                    if (!socket.Poll(20_000, SelectMode.SelectRead)) continue;
+                    length = socket.ReceiveFrom(packet, ref source);
+                }
+                catch (SocketException error) when (!stop.IsCancellationRequested && VideoDatagram.Recoverable(error, "Session receive"))
+                { continue; }
+                if (length > VideoDatagram.MaxSize) continue;
                 var endpoint = (IPEndPoint)source;
                 var bytes = packet.AsSpan(0, length);
                 if (bytes.Length == 24 && BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic && bytes[4] == 3 &&
                     CryptographicOperations.FixedTimeEquals(bytes[8..24], nonce))
                 {
                     endpoint = new(FrdNetwork.Canonical(endpoint.Address), endpoint.Port);
-                    lock (gate) peer = endpoint;
-                    socket.SendTo(VideoDatagram.Registration(nonce, 4), endpoint);
+                    lock (gate)
+                    {
+                        if (peer != null && !FrdNetwork.SameEndpoint(peer, endpoint)) continue;
+                        peer = endpoint;
+                    }
+                    try { socket.SendTo(VideoDatagram.Registration(nonce, 4), endpoint); }
+                    catch (SocketException error) when (!stop.IsCancellationRequested && VideoDatagram.Recoverable(error, "Registration reply"))
+                    { continue; }
                     registered.TrySetResult(endpoint);
                     continue;
                 }
                 UdpVideoSender? activeSender;
-                IRemoteInputInjector? activeInjector;
-                Func<bool>? enabled;
                 IPEndPoint? activePeer;
-                lock (gate) { activeSender = sender; activeInjector = injector; enabled = inputEnabled; activePeer = peer; }
+                lock (gate) { activeSender = sender; activePeer = peer; }
                 if (activePeer == null || !FrdNetwork.SameEndpoint(activePeer, endpoint)) continue;
                 if (bytes.Length == VideoDatagram.FeedbackSize && bytes[4] == 2 &&
                     BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic)
@@ -5918,23 +6015,37 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     activeSender?.ProcessFeedback(bytes, activePeer);
                     continue;
                 }
-                if (activeInjector == null || enabled?.Invoke() != true ||
-                    !UdpInputProtocol.TryRead(bytes, nonce, out var sequence, out var input) || sequence <= latestInput) continue;
-                latestInput = sequence;
-                var result = activeInjector.Inject(input!);
-                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                if (!UdpInputProtocol.TryRead(bytes, nonce, out var sequence, out var input)) continue;
+                lock (gate)
+                {
+                    if (inputBinding == null || !inputBinding.Enabled() || sequence <= latestInput) continue;
+                    latestInput = sequence;
+                    if (input!.Kind == RemoteInputKind.MouseMove && pendingInput.Last?.Value.Kind == RemoteInputKind.MouseMove)
+                        pendingInput.Last.Value = input;
+                    else
+                    {
+                        if (pendingInput.Count >= 128)
+                        {
+                            pendingInput.Clear();
+                            pendingInput.AddLast(new RemoteInputEvent(RemoteInputKind.ReleaseAll));
+                            Console.Error.WriteLine("[Input] UDP input queue saturated; discarded pending input and scheduled key/button release.");
+                        }
+                        pendingInput.AddLast(input);
+                    }
+                }
+                inputReady.Set();
             }
         }
         catch (ObjectDisposedException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote UDP session socket stopped."); }
         catch (SocketException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote UDP session socket stopped."); }
-        catch (Exception error) { registered.TrySetException(error); Console.Error.WriteLine(error); throw; }
+        catch (Exception error) { Fail(error); }
     }
 
     public async ValueTask DisposeAsync()
     {
-        stop.Cancel();
-        await worker;
-        stop.Dispose();
+        stop.Cancel(); inputReady.Set();
+        try { await Task.WhenAll(worker, inputWorker); }
+        finally { inputReady.Dispose(); stop.Dispose(); }
     }
 }
 
@@ -5952,6 +6063,7 @@ sealed class RemoteHost : IAsyncDisposable
     CancellationTokenSource? activeStop;
     DesktopStreamSource? activeCapture;
     RemoteUdpSession? activeUdp;
+    internal long AppliedUdpInputs { get { lock (gate) return activeUdp?.AppliedInputs ?? 0; } }
     string sessionId = "";
     IPAddress? controller;
     bool hasInput, hasClipboard, hasCursor;
@@ -6130,11 +6242,11 @@ sealed class RemoteHost : IAsyncDisposable
                         {
                             await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
                             await RemoteInputServer.ServePeerAsync(injector, client, inputToken,
-                                enabledChanged: value =>
+                                enabledChanged: value => udp.UpdateInputEnabled(injector, () =>
                                 {
                                     Volatile.Write(ref udpEnabled, value ? 1 : 0);
                                     injector.SetEnabled(value);
-                                });
+                                }));
                         }
                         finally
                         {
@@ -6165,7 +6277,8 @@ sealed class RemoteHost : IAsyncDisposable
                 {
                     using var capture = CreateCapture();
                     Volatile.Write(ref activeCapture, capture);
-                    await using var udpSession = new RemoteUdpSession(FindInputSocket(address), id, lifetime.Token);
+                    await using var udpSession = new RemoteUdpSession(FindInputSocket(address), id, lifetime.Token,
+                        error => { SessionTrace.Error("host-udp", error); lifetime.Cancel(); });
                     lock (gate) activeUdp = udpSession;
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
                     using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth,
@@ -7590,6 +7703,7 @@ public sealed class UdpVideoReceiver : IDisposable
     EndPoint? source;
     IPEndPoint? expectedSource;
     byte[]? registrationNonce;
+    int diagnosticCallbacksDisabled;
     long bufferedBytes, queuedBytes, totalPackets, totalWireBytes, firstReceiveTick, lastReceiveTick, feedbackTick;
     uint firstSequence, lastSequence, highestSequence, batchPackets, batchWireBytes;
     int disposed, currentGeneration = int.MinValue;
@@ -7634,9 +7748,14 @@ public sealed class UdpVideoReceiver : IDisposable
         var packet = VideoDatagram.Registration(session);
         for (var attempt = 0; attempt < 5; attempt++)
         {
-            socket.SendTo(packet, endpoint);
+            try { socket.SendTo(packet, endpoint); }
+            catch (SocketException error) when (VideoDatagram.Recoverable(error, "Registration send"))
+            {
+                // Recoverable logs the socket error; retain the bounded acknowledgement wait before retrying.
+            }
             try { await registration.Task.WaitAsync(TimeSpan.FromMilliseconds(500), token); return; }
-            catch (TimeoutException) when (attempt < 4) { }
+            catch (TimeoutException)
+            { VideoDatagram.Log($"UDP registration acknowledgement timeout ({attempt + 1}/5)."); }
         }
         throw new IOException($"UDP {endpoint} registration was not acknowledged; verify the UDP --port forwarding rule.");
     }
@@ -7675,8 +7794,15 @@ public sealed class UdpVideoReceiver : IDisposable
                 }
                 if (FrameDiagnosticProtocol.TryDecode(bytes.AsSpan(0, length), out var diagnostic))
                 {
-                    try { DiagnosticReceived?.Invoke(diagnostic!); }
-                    catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); Failed?.Invoke(error); }
+                    if (Volatile.Read(ref diagnosticCallbacksDisabled) == 0)
+                    {
+                        try { DiagnosticReceived?.Invoke(diagnostic!); }
+                        catch (Exception error)
+                        {
+                            Volatile.Write(ref diagnosticCallbacksDisabled, 1);
+                            VideoDatagram.Log("Diagnostic callback disabled after failure; video and input remain active", error);
+                        }
+                    }
                     continue;
                 }
                 var now = VideoDatagram.Now;
