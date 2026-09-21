@@ -4051,6 +4051,47 @@ static class InputProtocol
     public static void Log(string operation, Exception? error = null) => Console.Error.WriteLine($"[Input] {operation}{(error is null ? "" : $": {error}")}");
 }
 
+static class UdpInputProtocol
+{
+    public const byte Version = 1;
+    public const int PacketSize = 56;
+
+    public static void Write(Span<byte> packet, ReadOnlySpan<byte> session, long sequence, RemoteInputEvent input)
+    {
+        if (packet.Length != PacketSize) throw new ArgumentException($"UDP input packet must be {PacketSize} bytes.", nameof(packet));
+        if (session.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(session));
+        packet.Clear();
+        session.CopyTo(packet);
+        BinaryPrimitives.WriteInt64LittleEndian(packet[16..], sequence);
+        packet[24] = Version;
+        packet[25] = checked((byte)input.Kind);
+        packet[26] = checked((byte)input.Button);
+        packet[27] = input.Extended ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteInt32LittleEndian(packet[28..], input.WheelDelta);
+        BinaryPrimitives.WriteInt32LittleEndian(packet[32..], input.ScanCode);
+        BinaryPrimitives.WriteDoubleLittleEndian(packet[36..], input.X);
+        BinaryPrimitives.WriteDoubleLittleEndian(packet[44..], input.Y);
+    }
+
+    public static bool TryRead(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> session, out long sequence, out RemoteInputEvent? input)
+    {
+        sequence = 0; input = null;
+        if (packet.Length != PacketSize || session.Length != 16 || packet[24] != Version ||
+            !CryptographicOperations.FixedTimeEquals(packet[..16], session)) return false;
+        var kind = (RemoteInputKind)packet[25];
+        var button = (RemoteMouseButton)packet[26];
+        if (!Enum.IsDefined(kind) || !Enum.IsDefined(button) || packet[27] > 1) return false;
+        sequence = BinaryPrimitives.ReadInt64LittleEndian(packet[16..]);
+        if (sequence <= 0) return false;
+        var x = BinaryPrimitives.ReadDoubleLittleEndian(packet[36..]);
+        var y = BinaryPrimitives.ReadDoubleLittleEndian(packet[44..]);
+        if (!double.IsFinite(x) || !double.IsFinite(y)) return false;
+        input = new(kind, x, y, button, BinaryPrimitives.ReadInt32LittleEndian(packet[28..]),
+            BinaryPrimitives.ReadInt32LittleEndian(packet[32..]), packet[27] != 0);
+        return true;
+    }
+}
+
 public sealed class RemoteInputServer : IDisposable
 {
     readonly IRemoteInputInjector injector;
@@ -4154,9 +4195,9 @@ public sealed class RemoteInputClient : IDisposable
     static readonly TimeSpan AcknowledgementWarning = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
-    readonly Socket? mouseSocket;
-    readonly IPEndPoint? mouseEndpoint;
-    readonly byte[]? mouseSession;
+    readonly Socket? inputSocket;
+    readonly IPEndPoint? inputEndpoint;
+    readonly byte[]? inputSession;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
     readonly object pendingGate = new();
@@ -4164,22 +4205,22 @@ public sealed class RemoteInputClient : IDisposable
     readonly Task reader;
     Exception? failure;
     long sequence, repliedSequence;
-    long mouseSequence;
+    long udpSequence;
     long enableRevision;
     int warnedAboutDelay;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
     public Exception? Failure => Volatile.Read(ref failure);
 
-    internal RemoteInputClient(TcpClient connection, IPEndPoint? mouseEndpoint = null, byte[]? mouseSession = null)
+    internal RemoteInputClient(TcpClient connection, IPEndPoint? inputEndpoint = null, byte[]? inputSession = null)
     {
         this.connection = connection;
-        this.mouseEndpoint = mouseEndpoint;
-        this.mouseSession = mouseSession;
-        if (mouseEndpoint != null)
+        this.inputEndpoint = inputEndpoint;
+        this.inputSession = inputSession;
+        if (inputEndpoint != null)
         {
-            if (mouseSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(mouseSession));
-            mouseSocket = new Socket(mouseEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (inputSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(inputSession));
+            inputSocket = new Socket(inputEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
         }
         connection.NoDelay = true;
         stream = connection.GetStream();
@@ -4229,23 +4270,20 @@ public sealed class RemoteInputClient : IDisposable
     public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(input);
-        if (input.Kind == RemoteInputKind.MouseMove && mouseSocket != null && Enabled)
+        if (inputSocket != null && Enabled)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
             token.ThrowIfCancellationRequested();
             try
             {
-                Span<byte> packet = stackalloc byte[40];
-                mouseSession!.CopyTo(packet);
-                BinaryPrimitives.WriteInt64LittleEndian(packet[16..], Interlocked.Increment(ref mouseSequence));
-                BinaryPrimitives.WriteDoubleLittleEndian(packet[24..], input.X);
-                BinaryPrimitives.WriteDoubleLittleEndian(packet[32..], input.Y);
-                mouseSocket.SendTo(packet, SocketFlags.None, mouseEndpoint!);
-                return Task.FromResult(new RemoteInputResult(true, "Mouse position sent over UDP."));
+                Span<byte> packet = stackalloc byte[UdpInputProtocol.PacketSize];
+                UdpInputProtocol.Write(packet, inputSession!, Interlocked.Increment(ref udpSequence), input);
+                inputSocket.SendTo(packet, SocketFlags.None, inputEndpoint!);
+                return Task.FromResult(new RemoteInputResult(true, "Input event sent over UDP."));
             }
             catch (Exception error) when (error is SocketException or ObjectDisposedException)
             {
-                InputProtocol.Log("UDP mouse position failed", error);
+                InputProtocol.Log("UDP input event failed", error);
                 throw;
             }
         }
@@ -4355,7 +4393,7 @@ public sealed class RemoteInputClient : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
         Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
-        mouseSocket?.Dispose();
+        inputSocket?.Dispose();
         // The reader handles shutdown itself; disposal never blocks its own continuation.
         ObserveFault(reader);
     }
@@ -5430,7 +5468,7 @@ sealed record RemoteWelcome(string Session, int SenderPort, int Width, int Heigh
     double MaximumBitrateMbps = 100, CodecProbeSample[]? ProbeSamples = null);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
-    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0, int UdpInputPort = 0,
+    long ReceiveTick = 0, long SendTick = 0, long Frequency = 0,
     int Generation = 0, int Width = 0, int Height = 0);
 
 static class RemoteWire
@@ -5643,8 +5681,7 @@ public sealed partial class DemoSession
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
-            if (reply.UdpInputPort is < 1 or > 65535) throw new InvalidDataException("Remote UDP input port is missing.");
-            return new(client, new(remote.Endpoint.Address, reply.UdpInputPort), Convert.FromHexString(welcome.Session));
+            return new(client, new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session));
         }
         catch { client.Dispose(); throw; }
     }
@@ -5777,6 +5814,8 @@ sealed class RemoteHost : IAsyncDisposable
     readonly CodecProbeSample[] probeSamples;
     readonly string token;
     readonly TcpListener[] listeners;
+    readonly Socket[] inputSockets;
+    readonly int port;
     readonly CancellationTokenSource stop = new();
     readonly ConcurrentDictionary<int, Task> peers = new();
     readonly object gate = new();
@@ -5797,24 +5836,40 @@ sealed class RemoteHost : IAsyncDisposable
     public RemoteHost(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(token);
-        this.config = config; this.token = token; this.probeSamples = probeSamples ?? [];
+        this.config = config; this.token = token; this.port = port; this.probeSamples = probeSamples ?? [];
         listeners = addresses.Select(address =>
         {
             var listener = new TcpListener(address, port);
             if (address.AddressFamily == AddressFamily.InterNetworkV6) listener.Server.DualMode = address.Equals(IPAddress.IPv6Any);
             return listener;
         }).ToArray();
+        inputSockets = addresses.Select(address =>
+        {
+            var socket = new Socket(address.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (address.AddressFamily == AddressFamily.InterNetworkV6) socket.DualMode = address.Equals(IPAddress.IPv6Any);
+            return socket;
+        }).ToArray();
     }
 
     public void Start(nint clipboardOwner = 0)
     {
         this.clipboardOwner = clipboardOwner;
-        try { foreach (var listener in listeners) listener.Start(8); }
-        catch { foreach (var listener in listeners) listener.Stop(); throw; }
+        try
+        {
+            foreach (var listener in listeners) listener.Start(8);
+            for (var i = 0; i < inputSockets.Length; i++)
+                inputSockets[i].Bind(new IPEndPoint(((IPEndPoint)listeners[i].LocalEndpoint).Address, port));
+        }
+        catch
+        {
+            foreach (var listener in listeners) listener.Stop();
+            foreach (var socket in inputSockets) socket.Dispose();
+            throw;
+        }
         acceptTask = Task.WhenAll(listeners.Select(listener => Task.Run(() => AcceptAsync(listener))));
         var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
-        Console.Error.WriteLine($"Remote listener ready: {endpoints}");
-        Status?.Invoke($"被控端正在监听 {endpoints}\n等待主控连接；关闭此窗口停止监听。");
+        Console.Error.WriteLine($"Remote listener ready: TCP+UDP {endpoints}");
+        Status?.Invoke($"被控端正在监听 TCP+UDP {endpoints}\n等待主控连接；关闭此窗口停止监听。");
     }
 
     public void DisconnectActive()
@@ -5932,20 +5987,17 @@ sealed class RemoteHost : IAsyncDisposable
                     }
                     try
                     {
-                        var local = ((IPEndPoint)client.Client.LocalEndPoint!).Address;
-                        using var udp = new Socket(local.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
-                        if (local.Equals(IPAddress.IPv6Any)) udp.DualMode = true;
-                        udp.Bind(new IPEndPoint(local, 0));
+                        var udp = FindInputSocket(address);
                         var ordinary = new Win32InputInjector();
                         ordinary.RegisterControllerWindow(clipboardOwner);
                         using var injector = new SecureDesktopInputRouter(ordinary,
                             () => Volatile.Read(ref activeCapture)?.SecureActive == true);
                         using var udpStop = CancellationTokenSource.CreateLinkedTokenSource(inputToken);
                         var udpEnabled = 0;
-                        var udpWorker = ReceiveMouseAsync(udp, injector, address, hello.Session, () => Volatile.Read(ref udpEnabled) != 0, udpStop.Token);
+                        var udpWorker = ReceiveInputAsync(udp, injector, address, hello.Session, () => Volatile.Read(ref udpEnabled) != 0, udpStop.Token);
                         try
                         {
-                            await RemoteWire.WriteAsync(stream, new RemoteReply(true, UdpInputPort: ((IPEndPoint)udp.LocalEndPoint!).Port), timeout.Token);
+                            await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
                             await RemoteInputServer.ServePeerAsync(injector, client, inputToken,
                                 enabledChanged: value =>
                                 {
@@ -6040,11 +6092,19 @@ sealed class RemoteHost : IAsyncDisposable
         }
     }
 
-    internal static async Task ReceiveMouseAsync(Socket socket, IRemoteInputInjector injector, IPAddress controller, string session,
+    Socket FindInputSocket(IPAddress controller)
+    {
+        controller = FrdNetwork.Canonical(controller);
+        return inputSockets.FirstOrDefault(socket => socket.AddressFamily == controller.AddressFamily ||
+            socket.AddressFamily == AddressFamily.InterNetworkV6 && socket.DualMode && controller.AddressFamily == AddressFamily.InterNetwork)
+            ?? throw new InvalidOperationException($"No UDP input socket can receive {controller.AddressFamily} traffic.");
+    }
+
+    internal static async Task ReceiveInputAsync(Socket socket, IRemoteInputInjector injector, IPAddress controller, string session,
         Func<bool> enabled, CancellationToken token)
     {
         var nonce = Convert.FromHexString(session);
-        var packet = new byte[40];
+        var packet = new byte[UdpInputProtocol.PacketSize];
         long latest = 0;
         var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
         try
@@ -6052,42 +6112,26 @@ sealed class RemoteHost : IAsyncDisposable
             while (!token.IsCancellationRequested)
             {
                 var received = await socket.ReceiveFromAsync(packet, SocketFlags.None, new IPEndPoint(any, 0), token);
-                var newest = latest;
-                double x = 0, y = 0;
-                Consider(received.ReceivedBytes, received.RemoteEndPoint);
-                // Drain already queued positions so input injection follows the newest available coordinate.
-                for (var i = 0; i < 256 && socket.Available > 0; i++)
-                {
-                    EndPoint source = new IPEndPoint(any, 0);
-                    var size = socket.ReceiveFrom(packet, SocketFlags.None, ref source);
-                    Consider(size, source);
-                }
-                if (newest <= latest) continue;
-                latest = newest;
-                var result = injector.Inject(new(RemoteInputKind.MouseMove, x, y));
-                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP mouse position rejected: " + result.Message);
-
-                void Consider(int size, EndPoint source)
-                {
-                    if (size != packet.Length || !enabled() ||
-                        !FrdNetwork.Canonical(((IPEndPoint)source).Address).Equals(controller) ||
-                        !CryptographicOperations.FixedTimeEquals(packet.AsSpan(0, nonce.Length), nonce)) return;
-                    var sequence = BinaryPrimitives.ReadInt64LittleEndian(packet.AsSpan(16));
-                    if (sequence <= newest) return;
-                    newest = sequence;
-                    x = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(24));
-                    y = BinaryPrimitives.ReadDoubleLittleEndian(packet.AsSpan(32));
-                }
+                if (!enabled() || !FrdNetwork.Canonical(((IPEndPoint)received.RemoteEndPoint).Address).Equals(controller) ||
+                    !UdpInputProtocol.TryRead(packet.AsSpan(0, received.ReceivedBytes), nonce, out var sequence, out var input) ||
+                    sequence <= latest) continue;
+                latest = sequence;
+                var result = injector.Inject(input!);
+                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
             }
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP mouse input stopped."); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input stopped."); }
+        catch (ObjectDisposedException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
+        catch (SocketException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
     }
 
     public async ValueTask DisposeAsync()
     {
         stop.Cancel(); foreach (var listener in listeners) listener.Stop();
         if (acceptTask != null) await acceptTask;
-        await Task.WhenAll(peers.Values); stop.Dispose();
+        await Task.WhenAll(peers.Values);
+        foreach (var socket in inputSockets) socket.Dispose();
+        stop.Dispose();
     }
 
     DesktopStreamSource CreateCapture()
@@ -6107,7 +6151,7 @@ sealed class RemoteHost : IAsyncDisposable
 static class RemoteLaunch
 {
     static int hostExitCode;
-    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。TCP 控制与附属连接共用监听端口，视频和诊断走 UDP。";
+    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。被控端在 --port 同时绑定 TCP 和 UDP；键鼠统一走该 UDP 端口，TCP 负责认证、控制、剪贴板和鼠标形状。视频和诊断使用协商的 UDP 端口。";
     public static void Help(bool window)
     {
         Console.WriteLine(Usage);

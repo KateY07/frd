@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace Frd;
@@ -92,6 +93,47 @@ static class InputProtocol
     }
 
     public static void Log(string operation, Exception? error = null) => Console.Error.WriteLine($"[Input] {operation}{(error is null ? "" : $": {error}")}");
+}
+
+static class UdpInputProtocol
+{
+    public const byte Version = 1;
+    public const int PacketSize = 56;
+
+    public static void Write(Span<byte> packet, ReadOnlySpan<byte> session, long sequence, RemoteInputEvent input)
+    {
+        if (packet.Length != PacketSize) throw new ArgumentException($"UDP input packet must be {PacketSize} bytes.", nameof(packet));
+        if (session.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(session));
+        packet.Clear();
+        session.CopyTo(packet);
+        BinaryPrimitives.WriteInt64LittleEndian(packet[16..], sequence);
+        packet[24] = Version;
+        packet[25] = checked((byte)input.Kind);
+        packet[26] = checked((byte)input.Button);
+        packet[27] = input.Extended ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteInt32LittleEndian(packet[28..], input.WheelDelta);
+        BinaryPrimitives.WriteInt32LittleEndian(packet[32..], input.ScanCode);
+        BinaryPrimitives.WriteDoubleLittleEndian(packet[36..], input.X);
+        BinaryPrimitives.WriteDoubleLittleEndian(packet[44..], input.Y);
+    }
+
+    public static bool TryRead(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> session, out long sequence, out RemoteInputEvent? input)
+    {
+        sequence = 0; input = null;
+        if (packet.Length != PacketSize || session.Length != 16 || packet[24] != Version ||
+            !CryptographicOperations.FixedTimeEquals(packet[..16], session)) return false;
+        var kind = (RemoteInputKind)packet[25];
+        var button = (RemoteMouseButton)packet[26];
+        if (!Enum.IsDefined(kind) || !Enum.IsDefined(button) || packet[27] > 1) return false;
+        sequence = BinaryPrimitives.ReadInt64LittleEndian(packet[16..]);
+        if (sequence <= 0) return false;
+        var x = BinaryPrimitives.ReadDoubleLittleEndian(packet[36..]);
+        var y = BinaryPrimitives.ReadDoubleLittleEndian(packet[44..]);
+        if (!double.IsFinite(x) || !double.IsFinite(y)) return false;
+        input = new(kind, x, y, button, BinaryPrimitives.ReadInt32LittleEndian(packet[28..]),
+            BinaryPrimitives.ReadInt32LittleEndian(packet[32..]), packet[27] != 0);
+        return true;
+    }
 }
 
 public sealed class RemoteInputServer : IDisposable
@@ -197,9 +239,9 @@ public sealed class RemoteInputClient : IDisposable
     static readonly TimeSpan AcknowledgementWarning = TimeSpan.FromSeconds(5);
     readonly TcpClient connection;
     readonly NetworkStream stream;
-    readonly Socket? mouseSocket;
-    readonly IPEndPoint? mouseEndpoint;
-    readonly byte[]? mouseSession;
+    readonly Socket? inputSocket;
+    readonly IPEndPoint? inputEndpoint;
+    readonly byte[]? inputSession;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
     readonly object pendingGate = new();
@@ -207,22 +249,22 @@ public sealed class RemoteInputClient : IDisposable
     readonly Task reader;
     Exception? failure;
     long sequence, repliedSequence;
-    long mouseSequence;
+    long udpSequence;
     long enableRevision;
     int warnedAboutDelay;
     int enabled, disposed;
     public bool Enabled => Volatile.Read(ref enabled) != 0;
     public Exception? Failure => Volatile.Read(ref failure);
 
-    internal RemoteInputClient(TcpClient connection, IPEndPoint? mouseEndpoint = null, byte[]? mouseSession = null)
+    internal RemoteInputClient(TcpClient connection, IPEndPoint? inputEndpoint = null, byte[]? inputSession = null)
     {
         this.connection = connection;
-        this.mouseEndpoint = mouseEndpoint;
-        this.mouseSession = mouseSession;
-        if (mouseEndpoint != null)
+        this.inputEndpoint = inputEndpoint;
+        this.inputSession = inputSession;
+        if (inputEndpoint != null)
         {
-            if (mouseSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(mouseSession));
-            mouseSocket = new Socket(mouseEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (inputSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(inputSession));
+            inputSocket = new Socket(inputEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
         }
         connection.NoDelay = true;
         stream = connection.GetStream();
@@ -272,23 +314,20 @@ public sealed class RemoteInputClient : IDisposable
     public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(input);
-        if (input.Kind == RemoteInputKind.MouseMove && mouseSocket != null && Enabled)
+        if (inputSocket != null && Enabled)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
             token.ThrowIfCancellationRequested();
             try
             {
-                Span<byte> packet = stackalloc byte[40];
-                mouseSession!.CopyTo(packet);
-                BinaryPrimitives.WriteInt64LittleEndian(packet[16..], Interlocked.Increment(ref mouseSequence));
-                BinaryPrimitives.WriteDoubleLittleEndian(packet[24..], input.X);
-                BinaryPrimitives.WriteDoubleLittleEndian(packet[32..], input.Y);
-                mouseSocket.SendTo(packet, SocketFlags.None, mouseEndpoint!);
-                return Task.FromResult(new RemoteInputResult(true, "Mouse position sent over UDP."));
+                Span<byte> packet = stackalloc byte[UdpInputProtocol.PacketSize];
+                UdpInputProtocol.Write(packet, inputSession!, Interlocked.Increment(ref udpSequence), input);
+                inputSocket.SendTo(packet, SocketFlags.None, inputEndpoint!);
+                return Task.FromResult(new RemoteInputResult(true, "Input event sent over UDP."));
             }
             catch (Exception error) when (error is SocketException or ObjectDisposedException)
             {
-                InputProtocol.Log("UDP mouse position failed", error);
+                InputProtocol.Log("UDP input event failed", error);
                 throw;
             }
         }
@@ -398,7 +437,7 @@ public sealed class RemoteInputClient : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
         Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
-        mouseSocket?.Dispose();
+        inputSocket?.Dispose();
         // The reader handles shutdown itself; disposal never blocks its own continuation.
         ObserveFault(reader);
     }

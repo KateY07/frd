@@ -229,7 +229,7 @@ static class Program
         udp.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         using var stop = new CancellationTokenSource();
         var enabled = 1;
-        var receive = RemoteHost.ReceiveMouseAsync(udp, injector, IPAddress.Loopback, nonce,
+        var receive = RemoteHost.ReceiveInputAsync(udp, injector, IPAddress.Loopback, nonce,
             () => Volatile.Read(ref enabled) != 0, stop.Token);
         try
         {
@@ -237,73 +237,56 @@ static class Program
             await tcp.ConnectAsync(tcpServer.Endpoint);
             using var input = new RemoteInputClient(tcp, (IPEndPoint)udp.LocalEndPoint!, Convert.FromHexString(nonce));
             if (!(await input.SetEnabledAsync(true)).Accepted) throw new InvalidOperationException("TCP input enable failed.");
-            if (!(await await input.QueueAsync(new(RemoteInputKind.MouseMove, .25, .75))).Accepted)
-                throw new InvalidOperationException("UDP mouse send failed.");
-            await WaitCountAsync(1);
+            RemoteInputEvent[] events =
+            [
+                new(RemoteInputKind.MouseMove, .25, .75),
+                new(RemoteInputKind.MouseDown, .25, .75, RemoteMouseButton.Left),
+                new(RemoteInputKind.MouseUp, .25, .75, RemoteMouseButton.Left),
+                new(RemoteInputKind.Wheel, .25, .75, WheelDelta: 120),
+                new(RemoteInputKind.KeyDown, ScanCode: 30),
+                new(RemoteInputKind.KeyUp, ScanCode: 30),
+                new(RemoteInputKind.ReleaseAll)
+            ];
+            foreach (var inputEvent in events)
+                if (!(await await input.QueueAsync(inputEvent)).Accepted) throw new InvalidOperationException("UDP input send failed: " + inputEvent.Kind);
+            await WaitCountAsync(events.Length);
             using var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            sender.SendTo(MousePacket(nonce, 3, .5, .5), udp.LocalEndPoint!);
-            await WaitCountAsync(2);
-            var wrong = MousePacket(Convert.ToHexString(Guid.NewGuid().ToByteArray()), 100, .9, .9);
+            sender.SendTo(InputPacket(nonce, 9, new(RemoteInputKind.MouseMove, .5, .5)), udp.LocalEndPoint!);
+            await WaitCountAsync(events.Length + 1);
+            var wrong = InputPacket(Convert.ToHexString(Guid.NewGuid().ToByteArray()), 100, new(RemoteInputKind.MouseMove, .9, .9));
             sender.SendTo(wrong, udp.LocalEndPoint!);
-            sender.SendTo(MousePacket(nonce, 1, .8, .8), udp.LocalEndPoint!);
-            sender.SendTo(MousePacket(nonce, 2, .7, .7), udp.LocalEndPoint!);
+            sender.SendTo(InputPacket(nonce, 8, new(RemoteInputKind.MouseMove, .8, .8)), udp.LocalEndPoint!);
             await Task.Delay(200);
             var received = injector.Inputs.ToArray();
-            if (received.Length != 2 || received[0].X != .25 || received[0].Y != .75 ||
-                received[1].X != .5 || received[1].Y != .5)
-                throw new InvalidOperationException("UDP authentication, latest-only ordering or client send failed: " + JsonSerializer.Serialize(received));
-            injector.BlockNext();
-            sender.SendTo(MousePacket(nonce, 4, .6, .6), udp.LocalEndPoint!);
-            await injector.WaitBlockedAsync();
-            try
-            {
-                for (var sequence = 5; sequence <= 104; sequence++)
-                    sender.SendTo(MousePacket(nonce, sequence, .9, .9), udp.LocalEndPoint!);
-            }
-            finally { injector.Unblock(); }
-            await WaitCountAsync(4);
-            await Task.Delay(100);
-            var batched = injector.Inputs.ToArray();
-            if (batched.Length != 4 || batched[2].X != .6 || batched[3].X != .9)
-                throw new InvalidOperationException("Queued UDP positions were not reduced to their latest value: " + JsonSerializer.Serialize(batched));
+            if (received.Length != events.Length + 1 || !received.Take(events.Length).SequenceEqual(events) || received[^1].X != .5)
+                throw new InvalidOperationException("UDP event encoding, authentication or stale ordering failed: " + JsonSerializer.Serialize(received));
             Volatile.Write(ref enabled, 0);
-            sender.SendTo(MousePacket(nonce, 105, .6, .6), udp.LocalEndPoint!);
+            sender.SendTo(InputPacket(nonce, 10, new(RemoteInputKind.KeyDown, ScanCode: 31)), udp.LocalEndPoint!);
             await Task.Delay(50);
-            if (injector.Inputs.Count != 4) throw new InvalidOperationException("Disabled UDP input was injected.");
-            Console.WriteLine("UDP mouse loopback passed: latest-only backlog, authentication, stale/forged/disabled packet rejection.");
+            if (injector.Inputs.Count != events.Length + 1) throw new InvalidOperationException("Disabled UDP input was injected.");
+            Console.WriteLine("UDP input loopback passed: move/click/wheel/key/release, authentication and stale/forged/disabled rejection.");
             async Task WaitCountAsync(int count)
             {
                 for (var attempt = 0; attempt < 100 && injector.Inputs.Count < count; attempt++) await Task.Delay(10);
-                if (injector.Inputs.Count < count) throw new TimeoutException($"Expected {count} UDP mouse moves, got {injector.Inputs.Count}.");
+                if (injector.Inputs.Count < count) throw new TimeoutException($"Expected {count} UDP input events, got {injector.Inputs.Count}.");
             }
         }
         finally { stop.Cancel(); await receive; }
     }
 
-    static byte[] MousePacket(string session, long sequence, double x, double y)
+    static byte[] InputPacket(string session, long sequence, RemoteInputEvent input)
     {
-        var packet = new byte[40];
-        Convert.FromHexString(session).CopyTo(packet, 0);
-        BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(16), sequence);
-        BinaryPrimitives.WriteDoubleLittleEndian(packet.AsSpan(24), x);
-        BinaryPrimitives.WriteDoubleLittleEndian(packet.AsSpan(32), y);
+        var packet = new byte[UdpInputProtocol.PacketSize];
+        UdpInputProtocol.Write(packet, Convert.FromHexString(session), sequence, input);
         return packet;
     }
 
     sealed class RecordingInjector : IRemoteInputInjector
     {
-        readonly ManualResetEventSlim unblock = new(true);
-        TaskCompletionSource blocked = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        int blockNext;
         public ConcurrentQueue<RemoteInputEvent> Inputs { get; } = new();
-        public void BlockNext() { blocked = new(TaskCreationOptions.RunContinuationsAsynchronously); unblock.Reset(); Volatile.Write(ref blockNext, 1); }
-        public Task WaitBlockedAsync() => blocked.Task.WaitAsync(TimeSpan.FromSeconds(3));
-        public void Unblock() => unblock.Set();
         public RemoteInputResult Inject(RemoteInputEvent input)
         {
             Inputs.Enqueue(input);
-            if (Interlocked.Exchange(ref blockNext, 0) == 1)
-            { blocked.TrySetResult(); if (!unblock.Wait(TimeSpan.FromSeconds(3))) throw new TimeoutException("Blocked injector was not released."); }
             return new(true, "recorded");
         }
         public RemoteInputResult ReleaseAll() => new(true, "released");

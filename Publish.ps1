@@ -3,6 +3,12 @@ $project = Join-Path $PSScriptRoot 'FRD.csproj'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $version = ([xml](Get-Content -LiteralPath $project -Raw)).Project.PropertyGroup.InformationalVersion
 if ($version -notmatch '^v\d+\.pre\d+$') { throw 'Invalid release version.' }
+$localReleaseRoot = 'D:\pub\FRD'
+$localArchive = Join-Path $localReleaseRoot "$version.zip"
+$localHash = "$localArchive.sha256"
+if ((Test-Path -LiteralPath $localArchive) -or (Test-Path -LiteralPath $localHash)) {
+    throw "Local release already exists: $localArchive"
+}
 $releaseRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "artifacts/$version"))
 $output = Join-Path $releaseRoot 'win-x64'
 $staging = Join-Path $releaseRoot ('staging-' + [Guid]::NewGuid().ToString('N'))
@@ -50,6 +56,7 @@ if (Test-Path -LiteralPath $output) {
 }
 Move-Item -LiteralPath $staging -Destination $output
 $archivePath = Join-Path $releaseRoot "frd-$version-win-x64.zip"
+if (Test-Path -LiteralPath $archivePath) { throw "Workspace release archive already exists: $archivePath" }
 $zipTool = (Get-Command 7z -ErrorAction SilentlyContinue).Source
 if (-not $zipTool -and (Test-Path -LiteralPath 'C:/Program Files/7-Zip/7z.exe')) { $zipTool = 'C:/Program Files/7-Zip/7z.exe' }
 if (-not $zipTool) { throw '7-Zip is required to package the release.' }
@@ -64,7 +71,10 @@ try {
     }
 }
 finally { $verification.Dispose() }
-Move-Item -LiteralPath $freshZip -Destination $archivePath -Force
+Move-Item -LiteralPath $freshZip -Destination $archivePath
 $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $releaseRoot 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archivePath))`n")
-Write-Output "Published $productVersion`: $archivePath"
+New-Item -ItemType Directory -Force -Path $localReleaseRoot | Out-Null
+Copy-Item -LiteralPath $archivePath -Destination $localArchive -ErrorAction Stop
+[IO.File]::WriteAllText($localHash, "$hash *$version.zip`n")
+Write-Output "Published $productVersion`: $localArchive"

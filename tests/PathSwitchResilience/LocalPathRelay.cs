@@ -21,8 +21,8 @@ sealed class LocalPathRelay : IAsyncDisposable
     TcpClient? inputConnection;
     byte[]? heldVideo;
     bool paused, udpPaused, diagnosticPaused, feedbackPaused, reorder;
-    int nextPeer, clientVideoPort, clientDiagnosticPort, hostSenderPort, hostInputPort, dropEvery;
-    long videoForwarded, udpDropped, tcpForwarded, udpSeen;
+    int nextPeer, clientVideoPort, clientDiagnosticPort, hostSenderPort, dropEvery;
+    long videoForwarded, inputForwarded, udpDropped, tcpForwarded, udpSeen;
 
     public LocalPathRelay(int hostPort)
     {
@@ -30,7 +30,7 @@ sealed class LocalPathRelay : IAsyncDisposable
         listener.Start();
         video.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         diagnostic.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-        input.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        input.Bind(new IPEndPoint(IPAddress.Loopback, Port));
         resumed.TrySetResult();
         inputResumed.TrySetResult();
         accepting = AcceptAsync();
@@ -43,6 +43,7 @@ sealed class LocalPathRelay : IAsyncDisposable
     public int VideoPort => ((IPEndPoint)video.LocalEndPoint!).Port;
     public int DiagnosticPort => ((IPEndPoint)diagnostic.LocalEndPoint!).Port;
     public long VideoForwarded => Interlocked.Read(ref videoForwarded);
+    public long InputForwarded => Interlocked.Read(ref inputForwarded);
     public long UdpDropped => Interlocked.Read(ref udpDropped);
     public long TcpForwarded => Interlocked.Read(ref tcpForwarded);
     public int TcpConnections => Volatile.Read(ref nextPeer);
@@ -155,11 +156,6 @@ sealed class LocalPathRelay : IAsyncDisposable
                 Volatile.Write(ref hostSenderPort, welcome.SenderPort);
                 reply = reply with { Welcome = welcome with { SenderPort = VideoPort } };
             }
-            if (request.Kind == "input" && reply.UdpInputPort > 0)
-            {
-                Volatile.Write(ref hostInputPort, reply.UdpInputPort);
-                reply = reply with { UdpInputPort = ((IPEndPoint)input.LocalEndPoint!).Port };
-            }
             await RemoteWire.WriteAsync(client, reply, stop.Token);
             var toHost = PumpAsync(client, host, request.Kind == "input");
             var toClient = PumpAsync(host, client, request.Kind == "input");
@@ -260,11 +256,11 @@ sealed class LocalPathRelay : IAsyncDisposable
                 var received = await input.ReceiveFromAsync(buffer, SocketFlags.None,
                     new IPEndPoint(IPAddress.Any, 0), stop.Token);
                 var source = (IPEndPoint)received.RemoteEndPoint;
-                var port = Volatile.Read(ref hostInputPort);
-                if (!source.Address.Equals(IPAddress.Loopback) || port == 0) continue;
+                if (!source.Address.Equals(IPAddress.Loopback)) continue;
                 lock (gate) if (paused || udpPaused) { Interlocked.Increment(ref udpDropped); continue; }
                 input.SendTo(buffer.AsSpan(0, received.ReceivedBytes).ToArray(),
-                    new IPEndPoint(IPAddress.Loopback, port));
+                    new IPEndPoint(IPAddress.Loopback, hostPort));
+                Interlocked.Increment(ref inputForwarded);
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("[relay input] stopped."); }

@@ -49,6 +49,10 @@ static class SameSessionRegression
                 throw new InvalidOperationException($"Input acknowledgement rejected after {pauseMs}ms pause.");
             if (!(await input.SendAsync(new(RemoteInputKind.ReleaseAll))).Accepted)
                 throw new InvalidOperationException($"Safe input command rejected after {pauseMs}ms pause.");
+            var inputBefore = relay.InputForwarded;
+            if (!(await input.SendAsync(new(RemoteInputKind.KeyUp, ScanCode: 30))).Accepted)
+                throw new InvalidOperationException($"UDP input command rejected after {pauseMs}ms pause.");
+            await UntilAsync(() => relay.InputForwarded > inputBefore, 2);
             await UntilAsync(() => Interlocked.Read(ref statuses) > previousStatuses, 8);
             if (relay.TcpConnections != connections) throw new InvalidOperationException("A paused connection was replaced.");
             Console.WriteLine($"PASS {pauseMs}ms: same {connections} TCP connections; status/input recovered; decoded frame delta={Interlocked.Read(ref frames) - previousFrames}; dropped UDP={relay.UdpDropped}.");
@@ -84,14 +88,16 @@ static class SameSessionRegression
 
         before = Interlocked.Read(ref statuses);
         relay.PauseInputTcpOnly();
+        var inputBeforeTcpPause = relay.InputForwarded;
         var pendingAuxiliary = input.SendAsync(new(RemoteInputKind.ReleaseAll));
         await Task.Delay(1000);
         if (Interlocked.Read(ref statuses) <= before) throw new InvalidOperationException("Input-only TCP pause stopped the control/status channel.");
-        relay.Resume();
         if (!(await pendingAuxiliary.WaitAsync(TimeSpan.FromSeconds(5))).Accepted)
-            throw new InvalidOperationException("Input did not recover after auxiliary TCP pause.");
+            throw new InvalidOperationException("UDP input was rejected while auxiliary TCP was paused.");
+        await UntilAsync(() => relay.InputForwarded > inputBeforeTcpPause, 2);
+        relay.Resume();
         if (relay.TcpConnections != connections) throw new InvalidOperationException("Single-channel pause replaced a connection.");
-        Console.WriteLine("PASS: input TCP-only pause left control/status active; input recovered on original channel.");
+        Console.WriteLine("PASS: fixed-port UDP input continued while the auxiliary TCP channel was paused.");
 
         relay.CloseInput();
         await UntilAsync(() => input.Failure != null, 5);
