@@ -229,13 +229,16 @@ static class Program
         udp.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         using var stop = new CancellationTokenSource();
         var enabled = 1;
-        var receive = RemoteHost.ReceiveInputAsync(udp, injector, IPAddress.Loopback, nonce,
-            () => Volatile.Read(ref enabled) != 0, stop.Token);
+        await using var udpSession = new RemoteUdpSession(udp, nonce, stop.Token);
+        udpSession.AttachInput(injector, () => Volatile.Read(ref enabled) != 0);
+        using var datagrams = new UdpVideoReceiver();
+        await datagrams.RegisterRemoteAsync((IPEndPoint)udp.LocalEndPoint!, Convert.FromHexString(nonce), stop.Token);
         try
         {
             using var tcp = new TcpClient();
             await tcp.ConnectAsync(tcpServer.Endpoint);
-            using var input = new RemoteInputClient(tcp, (IPEndPoint)udp.LocalEndPoint!, Convert.FromHexString(nonce));
+            using var input = new RemoteInputClient(tcp, (IPEndPoint)udp.LocalEndPoint!, Convert.FromHexString(nonce),
+                (packet, endpoint) => datagrams.SendInput(packet, endpoint));
             if (!(await input.SetEnabledAsync(true)).Accepted) throw new InvalidOperationException("TCP input enable failed.");
             RemoteInputEvent[] events =
             [
@@ -250,28 +253,27 @@ static class Program
             foreach (var inputEvent in events)
                 if (!(await await input.QueueAsync(inputEvent)).Accepted) throw new InvalidOperationException("UDP input send failed: " + inputEvent.Kind);
             await WaitCountAsync(events.Length);
-            using var sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            sender.SendTo(InputPacket(nonce, 9, new(RemoteInputKind.MouseMove, .5, .5)), udp.LocalEndPoint!);
+            datagrams.SendInput(InputPacket(nonce, 9, new(RemoteInputKind.MouseMove, .5, .5)), (IPEndPoint)udp.LocalEndPoint!);
             await WaitCountAsync(events.Length + 1);
             var wrong = InputPacket(Convert.ToHexString(Guid.NewGuid().ToByteArray()), 100, new(RemoteInputKind.MouseMove, .9, .9));
-            sender.SendTo(wrong, udp.LocalEndPoint!);
-            sender.SendTo(InputPacket(nonce, 8, new(RemoteInputKind.MouseMove, .8, .8)), udp.LocalEndPoint!);
+            datagrams.SendInput(wrong, (IPEndPoint)udp.LocalEndPoint!);
+            datagrams.SendInput(InputPacket(nonce, 8, new(RemoteInputKind.MouseMove, .8, .8)), (IPEndPoint)udp.LocalEndPoint!);
             await Task.Delay(200);
             var received = injector.Inputs.ToArray();
             if (received.Length != events.Length + 1 || !received.Take(events.Length).SequenceEqual(events) || received[^1].X != .5)
                 throw new InvalidOperationException("UDP event encoding, authentication or stale ordering failed: " + JsonSerializer.Serialize(received));
             Volatile.Write(ref enabled, 0);
-            sender.SendTo(InputPacket(nonce, 10, new(RemoteInputKind.KeyDown, ScanCode: 31)), udp.LocalEndPoint!);
+            datagrams.SendInput(InputPacket(nonce, 10, new(RemoteInputKind.KeyDown, ScanCode: 31)), (IPEndPoint)udp.LocalEndPoint!);
             await Task.Delay(50);
             if (injector.Inputs.Count != events.Length + 1) throw new InvalidOperationException("Disabled UDP input was injected.");
             Console.WriteLine("UDP input loopback passed: move/click/wheel/key/release, authentication and stale/forged/disabled rejection.");
             async Task WaitCountAsync(int count)
             {
                 for (var attempt = 0; attempt < 100 && injector.Inputs.Count < count; attempt++) await Task.Delay(10);
-                if (injector.Inputs.Count < count) throw new TimeoutException($"Expected {count} UDP input events, got {injector.Inputs.Count}.");
+                if (injector.Inputs.Count < count) throw new TimeoutException($"Expected {count} UDP input events, got {injector.Inputs.Count}: {JsonSerializer.Serialize(injector.Inputs.ToArray())}");
             }
         }
-        finally { stop.Cancel(); await receive; }
+        finally { stop.Cancel(); }
     }
 
     static byte[] InputPacket(string session, long sequence, RemoteInputEvent input)

@@ -240,6 +240,8 @@ public sealed class RemoteInputClient : IDisposable
     readonly TcpClient connection;
     readonly NetworkStream stream;
     readonly Socket? inputSocket;
+    readonly Action<byte[], IPEndPoint>? sendDatagram;
+    readonly bool ownsInputSocket;
     readonly IPEndPoint? inputEndpoint;
     readonly byte[]? inputSession;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
@@ -265,7 +267,21 @@ public sealed class RemoteInputClient : IDisposable
         {
             if (inputSession?.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(inputSession));
             inputSocket = new Socket(inputEndpoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+            ownsInputSocket = true;
         }
+        connection.NoDelay = true;
+        stream = connection.GetStream();
+        reader = Task.Run(ReadRepliesAsync);
+    }
+
+    internal RemoteInputClient(TcpClient connection, IPEndPoint inputEndpoint, byte[] inputSession,
+        Action<byte[], IPEndPoint> sendDatagram)
+    {
+        if (inputSession.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(inputSession));
+        this.connection = connection;
+        this.inputEndpoint = inputEndpoint;
+        this.inputSession = inputSession;
+        this.sendDatagram = sendDatagram;
         connection.NoDelay = true;
         stream = connection.GetStream();
         reader = Task.Run(ReadRepliesAsync);
@@ -314,15 +330,27 @@ public sealed class RemoteInputClient : IDisposable
     public async Task<Task<RemoteInputResult>> QueueAsync(RemoteInputEvent input, CancellationToken token = default)
     {
         ArgumentNullException.ThrowIfNull(input);
-        if (inputSocket != null && Enabled)
+        if ((inputSocket != null || sendDatagram != null) && Enabled)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
             token.ThrowIfCancellationRequested();
             try
             {
-                Span<byte> packet = stackalloc byte[UdpInputProtocol.PacketSize];
-                UdpInputProtocol.Write(packet, inputSession!, Interlocked.Increment(ref udpSequence), input);
-                inputSocket.SendTo(packet, SocketFlags.None, inputEndpoint!);
+                var datagramSequence = Interlocked.Increment(ref udpSequence);
+                if (Environment.GetEnvironmentVariable("FRD_TRACE_INPUT") == "1")
+                    InputProtocol.Log($"UDP send sequence {datagramSequence}: {input.Kind}");
+                if (sendDatagram != null)
+                {
+                    var packet = new byte[UdpInputProtocol.PacketSize];
+                    UdpInputProtocol.Write(packet, inputSession!, datagramSequence, input);
+                    sendDatagram(packet, inputEndpoint!);
+                }
+                else
+                {
+                    Span<byte> packet = stackalloc byte[UdpInputProtocol.PacketSize];
+                    UdpInputProtocol.Write(packet, inputSession!, datagramSequence, input);
+                    inputSocket!.SendTo(packet, SocketFlags.None, inputEndpoint!);
+                }
                 return Task.FromResult(new RemoteInputResult(true, "Input event sent over UDP."));
             }
             catch (Exception error) when (error is SocketException or ObjectDisposedException)
@@ -437,7 +465,7 @@ public sealed class RemoteInputClient : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         // Connection closure makes the controlled endpoint release every key/button even on abrupt disconnect.
         Fail(new ObjectDisposedException(nameof(RemoteInputClient)), disposing: true);
-        inputSocket?.Dispose();
+        if (ownsInputSocket) inputSocket?.Dispose();
         // The reader handles shutdown itself; disposal never blocks its own continuation.
         ObserveFault(reader);
     }

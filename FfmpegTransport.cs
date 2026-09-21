@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
@@ -38,9 +39,19 @@ static class VideoDatagram
     public static void Log(string message, Exception? error = null) =>
         Console.Error.WriteLine($"[UDP] {message}{(error is null ? "" : $": {error}")}");
 
+    public static byte[] Registration(ReadOnlySpan<byte> session, byte kind = 3)
+    {
+        if (session.Length != 16) throw new ArgumentException("UDP session must be 16 bytes.", nameof(session));
+        var registration = new byte[24];
+        BinaryPrimitives.WriteUInt32LittleEndian(registration, Magic);
+        registration[4] = kind;
+        session.CopyTo(registration.AsSpan(8));
+        return registration;
+    }
+
     public static void OpenReturnPath(Socket socket, IPEndPoint peer)
     {
-        // The receiving socket initiates its UDP flow so stateful firewalls can admit replies.
+        // Standalone transport tests use an unauthenticated registration; remote sessions use Registration(session).
         Span<byte> registration = stackalloc byte[8];
         registration.Clear();
         BinaryPrimitives.WriteUInt32LittleEndian(registration, Magic);
@@ -62,11 +73,13 @@ static class VideoDatagram
 public sealed class UdpVideoSender : IDisposable
 {
     readonly Socket socket;
+    readonly bool ownsSocket;
     readonly int wireOverhead;
     readonly SafeWaitHandle pacingTimer = CreatePacingTimer();
     readonly IPEndPoint destination;
     readonly CancellationTokenSource shutdown = new();
-    readonly Thread feedbackThread, delayedThread;
+    readonly Thread? feedbackThread;
+    readonly Thread delayedThread;
     readonly object sendGate = new(), statsGate = new(), delayGate = new();
     readonly PriorityQueue<(byte[] Data, IPEndPoint Destination), long> delayed = new();
     readonly AutoResetEvent delayedChanged = new(false);
@@ -102,18 +115,31 @@ public sealed class UdpVideoSender : IDisposable
     }
 
     public UdpVideoSender(IPEndPoint destination, NetworkSimulation? simulation = null)
+        : this(CreateSocket(destination), destination, simulation, true, true) { }
+
+    internal UdpVideoSender(Socket socket, IPEndPoint destination, NetworkSimulation? simulation = null)
+        : this(socket, destination, simulation, false, false) { }
+
+    UdpVideoSender(Socket socket, IPEndPoint destination, NetworkSimulation? simulation, bool ownsSocket, bool receiveFeedback)
     {
         this.destination = new(FrdNetwork.Canonical(destination.Address), destination.Port);
         wireOverhead = FrdNetwork.UdpOverhead(this.destination.Address);
-        socket = new(this.destination.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        this.socket = socket;
+        this.ownsSocket = ownsSocket;
         this.simulation = ValidateSimulation(simulation ?? new());
         socket.SendBufferSize = 1024 * 1024;
         socket.ReceiveBufferSize = 1024 * 1024;
-        socket.Bind(new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0));
-        feedbackThread = new(ReceiveFeedback) { IsBackground = true, Name = "FRD UDP feedback" };
+        feedbackThread = receiveFeedback ? new(ReceiveFeedback) { IsBackground = true, Name = "FRD UDP feedback" } : null;
         delayedThread = new(DeliverDelayed) { IsBackground = true, Name = "FRD simulated packet delay" };
-        feedbackThread.Start();
+        feedbackThread?.Start();
         delayedThread.Start();
+    }
+
+    static Socket CreateSocket(IPEndPoint destination)
+    {
+        var socket = new Socket(destination.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+        socket.Bind(new IPEndPoint(FrdNetwork.Any(socket.AddressFamily), 0));
+        return socket;
     }
 
     public int ActualPort => ((IPEndPoint)socket.LocalEndPoint!).Port;
@@ -192,8 +218,10 @@ public sealed class UdpVideoSender : IDisposable
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref disposed) != 0, this);
         diagnosticDestination = new(FrdNetwork.Canonical(diagnosticDestination.Address), diagnosticDestination.Port);
-        if (packet.Length is <= 0 or > VideoDatagram.MaxSize || diagnosticDestination.AddressFamily != socket.AddressFamily || diagnosticDestination.Equals(destination))
-            throw new ArgumentException("Diagnostics require a separate destination in the same address family and at most 1172 UDP payload bytes.");
+        var compatibleFamily = diagnosticDestination.AddressFamily == socket.AddressFamily ||
+            socket.AddressFamily == AddressFamily.InterNetworkV6 && socket.DualMode && diagnosticDestination.AddressFamily == AddressFamily.InterNetwork;
+        if (packet.Length is <= 0 or > VideoDatagram.MaxSize || !compatibleFamily)
+            throw new ArgumentException("Diagnostics require a destination in the same address family and at most 1172 UDP payload bytes.");
         lock (sendGate)
         {
             token.ThrowIfCancellationRequested();
@@ -359,6 +387,52 @@ public sealed class UdpVideoSender : IDisposable
         catch (Exception error) { VideoDatagram.Log("Feedback listener failed", error); Failed?.Invoke(error); }
     }
 
+    internal void ProcessFeedback(ReadOnlySpan<byte> bytes, IPEndPoint peer)
+    {
+        if (!destination.Equals(peer) || bytes.Length != VideoDatagram.FeedbackSize || bytes[4] != 2 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(bytes) != VideoDatagram.Magic) return;
+        var firstSeq = BinaryPrimitives.ReadUInt32LittleEndian(bytes[8..]);
+        var lastSeq = BinaryPrimitives.ReadUInt32LittleEndian(bytes[12..]);
+        var packetCount = BinaryPrimitives.ReadUInt32LittleEndian(bytes[16..]);
+        var wireBytes = BinaryPrimitives.ReadUInt32LittleEndian(bytes[20..]);
+        var firstReceive = BinaryPrimitives.ReadInt64LittleEndian(bytes[24..]);
+        var lastReceive = BinaryPrimitives.ReadInt64LittleEndian(bytes[32..]);
+        var frequency = BinaryPrimitives.ReadInt64LittleEndian(bytes[40..]);
+        var totalPackets = BinaryPrimitives.ReadInt64LittleEndian(bytes[48..]);
+        var totalWireBytes = BinaryPrimitives.ReadInt64LittleEndian(bytes[56..]);
+        var highestSeq = BinaryPrimitives.ReadUInt32LittleEndian(bytes[64..]);
+        if (packetCount == 0 || wireBytes == 0 || frequency <= 0 || lastReceive < firstReceive || totalPackets < 0) return;
+        var now = VideoDatagram.Now;
+        lock (statsGate)
+        {
+            if (totalPackets <= receivedPackets || totalPackets > sentPackets || totalWireBytes < receivedWireBytes) return;
+            var first = stamps[firstSeq % stamps.Length];
+            var last = stamps[lastSeq % stamps.Length];
+            if (first.Sequence != firstSeq || last.Sequence != lastSeq) return;
+            rates.Enqueue((now, 0, totalWireBytes - receivedWireBytes));
+            receivedPackets = totalPackets;
+            receivedWireBytes = totalWireBytes;
+            var receiverDelta = lastReceive - lastReceiverTick;
+            var senderDelta = last.Tick - lastSenderTick;
+            if (lastReceiverTick != 0 && receiverDelta > 0 && senderDelta > 0)
+            {
+                var receiveSeconds = (double)receiverDelta / frequency;
+                var trend = (receiveSeconds - VideoDatagram.Seconds(senderDelta)) * 1000;
+                delayTrend = .8 * delayTrend + .2 * Math.Clamp(trend, -1000, 1000);
+                var sampleSeconds = Math.Max(receiveSeconds, VideoDatagram.Seconds(senderDelta));
+                var delivered = (totalWireBytes - previousReceiverTotal) * 8 / sampleSeconds / 1_000_000;
+                if (rateLimited) delivered = Math.Min(delivered, Volatile.Read(ref limitKbps) / 1000d);
+                deliveryEstimate = deliveryEstimate == 0 ? delivered : .8 * deliveryEstimate + .2 * delivered;
+            }
+            lastReceiverTick = lastReceive;
+            lastSenderTick = last.Tick;
+            previousReceiverTotal = totalWireBytes;
+            lastFeedbackTick = now;
+            lossRate = highestSeq == 0 ? 0 : Math.Clamp(1 - (double)totalPackets / highestSeq, 0, 1);
+            TrimRates(now);
+        }
+    }
+
     void TrimRates(long now)
     {
         while (rates.TryPeek(out var entry) && VideoDatagram.Seconds(now - entry.Time) > 1) rates.Dequeue();
@@ -393,8 +467,8 @@ public sealed class UdpVideoSender : IDisposable
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         shutdown.Cancel();
         delayedChanged.Set();
-        socket.Dispose();
-        feedbackThread.Join(2000);
+        if (ownsSocket) socket.Dispose();
+        feedbackThread?.Join(2000);
         delayedThread.Join(2000);
         delayedChanged.Dispose();
         pacingTimer.Dispose();
@@ -414,9 +488,11 @@ public sealed class UdpVideoReceiver : IDisposable
     readonly bool[] seenValid = new bool[65536];
     EndPoint? source;
     IPEndPoint? expectedSource;
+    byte[]? registrationNonce;
     long bufferedBytes, queuedBytes, totalPackets, totalWireBytes, firstReceiveTick, lastReceiveTick, feedbackTick;
     uint firstSequence, lastSequence, highestSequence, batchPackets, batchWireBytes;
     int disposed, currentGeneration = int.MinValue;
+    readonly TaskCompletionSource registration = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     sealed class Assembly(int total, bool keyFrame)
     {
@@ -441,12 +517,30 @@ public sealed class UdpVideoReceiver : IDisposable
 
     public int Port => ((IPEndPoint)socket.LocalEndPoint!).Port;
     public event Action<ReceivedVideo>? VideoReceived;
+    public event Action<FrameDiagnostic>? DiagnosticReceived;
     public event Action<Exception>? Failed;
     public void SetExpectedSource(IPEndPoint endpoint)
     {
         Volatile.Write(ref expectedSource, endpoint);
         VideoDatagram.OpenReturnPath(socket, endpoint);
     }
+
+    internal async Task RegisterRemoteAsync(IPEndPoint endpoint, byte[] session, CancellationToken token)
+    {
+        if (session.Length != 16) throw new ArgumentException("UDP session must be 16 bytes.", nameof(session));
+        Volatile.Write(ref expectedSource, endpoint);
+        Volatile.Write(ref registrationNonce, session.ToArray());
+        var packet = VideoDatagram.Registration(session);
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            socket.SendTo(packet, endpoint);
+            try { await registration.Task.WaitAsync(TimeSpan.FromMilliseconds(500), token); return; }
+            catch (TimeoutException) when (attempt < 4) { }
+        }
+        throw new IOException($"UDP {endpoint} registration was not acknowledged; verify the UDP --port forwarding rule.");
+    }
+
+    internal void SendInput(ReadOnlySpan<byte> packet, IPEndPoint endpoint) => socket.SendTo(packet, SocketFlags.None, endpoint);
 
     void Receive()
     {
@@ -470,6 +564,18 @@ public sealed class UdpVideoReceiver : IDisposable
                 }
                 catch (SocketException error) when (!shutdown.IsCancellationRequested && VideoDatagram.Recoverable(error, "Video receive"))
                 {
+                    continue;
+                }
+                if (length == 24 && bytes[4] == 4 && BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic &&
+                    Volatile.Read(ref registrationNonce) is { } nonce && CryptographicOperations.FixedTimeEquals(bytes.AsSpan(8, 16), nonce))
+                {
+                    registration.TrySetResult();
+                    continue;
+                }
+                if (FrameDiagnosticProtocol.TryDecode(bytes.AsSpan(0, length), out var diagnostic))
+                {
+                    try { DiagnosticReceived?.Invoke(diagnostic!); }
+                    catch (Exception error) { VideoDatagram.Log("Diagnostic callback failed", error); Failed?.Invoke(error); }
                     continue;
                 }
                 var now = VideoDatagram.Now;

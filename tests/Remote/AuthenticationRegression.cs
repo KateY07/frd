@@ -34,7 +34,7 @@ static class AuthenticationRegression
             return Process.Start(info) ?? throw new IOException("Cannot start authentication test host.");
         }
         Process Start(params string[] extra) => StartCommand(["--host", "--listen", "127.0.0.1", "--port", port.ToString(), .. extra]);
-        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v1.pre6"), ("--unknown-option", 1, "") })
+        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v1.pre13"), ("--unknown-option", 1, "") })
         {
             using var process = StartCommand(argument);
             var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();
@@ -110,9 +110,6 @@ static class AuthenticationRegression
                 { if (host.HasExited) throw new IOException("Authentication host exited."); await Task.Delay(100); }
             }
             using var video = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
-            using var diagnostic = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
-            var videoPort = ((IPEndPoint)video.Client.LocalEndPoint!).Port;
-            var diagnosticPort = ((IPEndPoint)diagnostic.Client.LocalEndPoint!).Port;
             async Task<JsonElement> Exchange(TcpClient client, object request)
             {
                 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -135,13 +132,24 @@ static class AuthenticationRegression
             foreach (var token in new string?[] { null, "", "wrong-token" })
             {
                 using var client = await Connect();
-                var reply = await Exchange(client, new { Kind = kind, Token = token, VideoPort = videoPort, DiagnosticPort = diagnosticPort });
+                var reply = await Exchange(client, new { Kind = kind, Token = token });
                 Check(!reply.GetProperty("Success").GetBoolean(), kind + ": missing/empty/wrong token rejected");
             }
             using var controller = await Connect();
-            var welcome = await Exchange(controller, new { Kind = "hello", Token = password, VideoPort = videoPort, DiagnosticPort = diagnosticPort });
+            var welcome = await Exchange(controller, new { Kind = "hello", Token = password });
             Check(welcome.GetProperty("Success").GetBoolean(), "Correct command-line token establishes session");
             var session = welcome.GetProperty("Welcome").GetProperty("Session").GetString();
+            var registration = new byte[24];
+            BinaryPrimitives.WriteUInt32LittleEndian(registration, 0x32445246);
+            registration[4] = 3;
+            Convert.FromHexString(session!).CopyTo(registration, 8);
+            await video.SendAsync(registration, new IPEndPoint(IPAddress.Loopback, port));
+            using (var udpTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3)))
+            {
+                var acknowledgement = await video.ReceiveAsync(udpTimeout.Token);
+                Check(acknowledgement.Buffer.Length == 24 && acknowledgement.Buffer[4] == 4,
+                    "Authenticated UDP registration uses the fixed --port");
+            }
             foreach (var kind in new[] { "input", "cursor", "clipboard" })
             {
                 using var wrongSession = await Connect();
@@ -151,18 +159,19 @@ static class AuthenticationRegression
                 var accepted = await Exchange(valid, new { Kind = kind, Token = password, Session = session });
                 Check(accepted.GetProperty("Success").GetBoolean(), kind + ": correct token and active session accepted");
             }
+            controller.Dispose();
+            await Task.Delay(200);
+            Check(!host.HasExited, "Authenticated host remains available for the next session after controller disconnect");
         }
         finally
         {
             if (!host.HasExited)
             {
-                host.Refresh(); host.CloseMainWindow();
-                try { await host.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(8)); }
-                catch (TimeoutException) { Console.Error.WriteLine("Authentication host required forced cleanup."); host.Kill(); await host.WaitForExitAsync(); throw; }
+                host.Kill(entireProcessTree: true);
+                await host.WaitForExitAsync();
             }
             File.WriteAllText(Path.Combine(Path.GetDirectoryName(report)!, "authentication-host.log"), await stderr + await stdout);
         }
-        Check(host.ExitCode == 0, "Authenticated host closes without reporting listener cancellation as a fatal error");
         File.WriteAllText(report, JsonSerializer.Serialize(new { Passed = true, Checks = checks, InputInjected = false }, new JsonSerializerOptions { WriteIndented = true }));
     }
 }

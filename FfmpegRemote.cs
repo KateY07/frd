@@ -16,9 +16,8 @@ using Avalonia.Themes.Simple;
 namespace Frd;
 
 public sealed record RemoteOptions(string Host, int Port, string Token);
-sealed record RemoteRequest(string Kind, string Token = "", int VideoPort = 0, int DiagnosticPort = 0,
-    string Session = "", ControlCommand? Command = null);
-sealed record RemoteWelcome(string Session, int SenderPort, int Width, int Height, int SourceWidth, int SourceHeight,
+sealed record RemoteRequest(string Kind, string Token = "", string Session = "", ControlCommand? Command = null);
+sealed record RemoteWelcome(string Session, int Width, int Height, int SourceWidth, int SourceHeight,
     int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1,
     double MaximumBitrateMbps = 100, CodecProbeSample[]? ProbeSamples = null);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
@@ -127,7 +126,6 @@ public sealed partial class DemoSession
     public double RemoteStatusWaitSeconds => remoteOptions == null || Volatile.Read(ref lastRemoteStatusTick) == 0
         ? 0 : Math.Max(0, (Stopwatch.GetTimestamp() - Volatile.Read(ref lastRemoteStatusTick)) / (double)Stopwatch.Frequency);
     public AppConfiguration Configuration => config;
-    internal int SenderPort => sender?.ActualPort ?? throw new InvalidOperationException("Sender not started.");
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
     public int RemoteSourceHeight => welcome?.SourceHeight ?? config.Height;
     string RemoteTimingDescription => packetDiagnosticsEnabled
@@ -143,19 +141,17 @@ public sealed partial class DemoSession
     async Task StartRemoteAsync()
     {
         receiver = new(dualStack: true); receiver.VideoReceived += ReceiveVideo;
+        receiver.DiagnosticReceived += ReceiveDiagnostic;
         receiver.Failed += error => ReportError("UDP 接收", error);
-        diagnosticsReceiver = new(remote: true); diagnosticsReceiver.Received += ReceiveDiagnostic;
-        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
-        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token, receiver.Port, diagnosticsReceiver.Port),
+        var reply = await remote.ExchangeAsync(new("hello", remoteOptions!.Token),
             stop.Token, TimeSpan.FromSeconds(15));
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
         Volatile.Write(ref lastRemoteStatusTick, Stopwatch.GetTimestamp());
         config = config with { Width = welcome.Width, Height = welcome.Height, FramesPerSecond = welcome.FramesPerSecond,
             InitialPreset = welcome.InitialPreset, InitialBitrateKbps = welcome.InitialBitrateKbps, Presets = welcome.Presets, TransmissionScale = welcome.TransmissionScale, MaximumBitrateMbps = welcome.MaximumBitrateMbps };
         config = await Task.Run(() => AutoCodecProbe.SelectReceiver(config, welcome.ProbeSamples), stop.Token);
-        receiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
-        diagnosticsReceiver.SetExpectedSource(new(remote.Endpoint.Address, welcome.SenderPort));
+        await receiver.RegisterRemoteAsync(new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session), stop.Token);
         for (var i = 0; i < 4; i++) await remote.ExchangeAsync(new("status"), stop.Token);
         await SetPacketDiagnosticsAsync(true);
         var applied = await ApplyAsync(config.InitialPreset, config.InitialBitrateKbps);
@@ -236,7 +232,8 @@ public sealed partial class DemoSession
             await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
-            return new(client, new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session));
+            return new(client, new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session),
+                (packet, endpoint) => receiver!.SendInput(packet, endpoint));
         }
         catch { client.Dispose(); throw; }
     }
@@ -264,6 +261,19 @@ public sealed partial class DemoSession
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
         };
+        encodeTask = Task.Run(EncodeLoop);
+    }
+
+    internal void StartSender(Socket socket, IPEndPoint destination, RemoteUdpSession udpSession)
+    {
+        diagnosticDestination = destination;
+        sender = new(socket, destination, config.Simulation); sender.SetEncoderBitrateKbps(config.InitialBitrateKbps);
+        sender.Failed += error => ReportError("UDP 发送/反馈", error);
+        sender.FrameSending += (generation, id, timing) =>
+        {
+            if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
+        };
+        udpSession.AttachSender(sender);
         encodeTask = Task.Run(EncodeLoop);
     }
 
@@ -363,6 +373,100 @@ public sealed partial class DemoSession
     }
 }
 
+sealed class RemoteUdpSession : IAsyncDisposable
+{
+    readonly Socket socket;
+    readonly byte[] nonce;
+    readonly CancellationTokenSource stop;
+    readonly Task worker;
+    readonly TaskCompletionSource<IPEndPoint> registered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly object gate = new();
+    IPEndPoint? peer;
+    UdpVideoSender? sender;
+    IRemoteInputInjector? injector;
+    Func<bool>? inputEnabled;
+    long latestInput;
+
+    public RemoteUdpSession(Socket socket, string session, CancellationToken token)
+    {
+        this.socket = socket;
+        nonce = Convert.FromHexString(session);
+        stop = CancellationTokenSource.CreateLinkedTokenSource(token);
+        worker = Task.Run(Receive);
+    }
+
+    public async Task<IPEndPoint> WaitForRegistrationAsync(CancellationToken token) =>
+        await registered.Task.WaitAsync(TimeSpan.FromSeconds(5), token);
+
+    public void AttachSender(UdpVideoSender value)
+    {
+        lock (gate) sender = value;
+    }
+
+    public void AttachInput(IRemoteInputInjector value, Func<bool> enabled)
+    {
+        lock (gate) { injector = value; inputEnabled = enabled; latestInput = 0; }
+    }
+
+    public void DetachInput(IRemoteInputInjector value)
+    {
+        lock (gate) if (ReferenceEquals(injector, value)) { injector = null; inputEnabled = null; latestInput = 0; }
+    }
+
+    void Receive()
+    {
+        var packet = new byte[VideoDatagram.MaxSize];
+        var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
+        try
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                if (!socket.Poll(20_000, SelectMode.SelectRead)) continue;
+                EndPoint source = new IPEndPoint(any, 0);
+                var length = socket.ReceiveFrom(packet, ref source);
+                var endpoint = (IPEndPoint)source;
+                var bytes = packet.AsSpan(0, length);
+                if (bytes.Length == 24 && BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic && bytes[4] == 3 &&
+                    CryptographicOperations.FixedTimeEquals(bytes[8..24], nonce))
+                {
+                    endpoint = new(FrdNetwork.Canonical(endpoint.Address), endpoint.Port);
+                    lock (gate) peer = endpoint;
+                    socket.SendTo(VideoDatagram.Registration(nonce, 4), endpoint);
+                    registered.TrySetResult(endpoint);
+                    continue;
+                }
+                UdpVideoSender? activeSender;
+                IRemoteInputInjector? activeInjector;
+                Func<bool>? enabled;
+                IPEndPoint? activePeer;
+                lock (gate) { activeSender = sender; activeInjector = injector; enabled = inputEnabled; activePeer = peer; }
+                if (activePeer == null || !FrdNetwork.SameEndpoint(activePeer, endpoint)) continue;
+                if (bytes.Length == VideoDatagram.FeedbackSize && bytes[4] == 2 &&
+                    BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic)
+                {
+                    activeSender?.ProcessFeedback(bytes, activePeer);
+                    continue;
+                }
+                if (activeInjector == null || enabled?.Invoke() != true ||
+                    !UdpInputProtocol.TryRead(bytes, nonce, out var sequence, out var input) || sequence <= latestInput) continue;
+                latestInput = sequence;
+                var result = activeInjector.Inject(input!);
+                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+            }
+        }
+        catch (ObjectDisposedException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote UDP session socket stopped."); }
+        catch (SocketException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Remote UDP session socket stopped."); }
+        catch (Exception error) { registered.TrySetException(error); Console.Error.WriteLine(error); throw; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        stop.Cancel();
+        await worker;
+        stop.Dispose();
+    }
+}
+
 sealed class RemoteHost : IAsyncDisposable
 {
     readonly AppConfiguration config;
@@ -376,6 +480,7 @@ sealed class RemoteHost : IAsyncDisposable
     readonly object gate = new();
     CancellationTokenSource? activeStop;
     DesktopStreamSource? activeCapture;
+    RemoteUdpSession? activeUdp;
     string sessionId = "";
     IPAddress? controller;
     bool hasInput, hasClipboard, hasCursor;
@@ -542,14 +647,14 @@ sealed class RemoteHost : IAsyncDisposable
                     }
                     try
                     {
-                        var udp = FindInputSocket(address);
                         var ordinary = new Win32InputInjector();
                         ordinary.RegisterControllerWindow(clipboardOwner);
                         using var injector = new SecureDesktopInputRouter(ordinary,
                             () => Volatile.Read(ref activeCapture)?.SecureActive == true);
-                        using var udpStop = CancellationTokenSource.CreateLinkedTokenSource(inputToken);
                         var udpEnabled = 0;
-                        var udpWorker = ReceiveInputAsync(udp, injector, address, hello.Session, () => Volatile.Read(ref udpEnabled) != 0, udpStop.Token);
+                        RemoteUdpSession udp;
+                        lock (gate) udp = activeUdp ?? throw new InvalidDataException("UDP session is not registered.");
+                        udp.AttachInput(injector, () => Volatile.Read(ref udpEnabled) != 0);
                         try
                         {
                             await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
@@ -562,8 +667,7 @@ sealed class RemoteHost : IAsyncDisposable
                         }
                         finally
                         {
-                            udpStop.Cancel();
-                            await udpWorker;
+                            udp.DetachInput(injector);
                         }
                     }
                     finally
@@ -574,7 +678,7 @@ sealed class RemoteHost : IAsyncDisposable
                     }
                     return;
                 }
-                if (hello.Kind != "hello" || hello.VideoPort is < 1 or > 65535 || hello.DiagnosticPort is < 1 or > 65535 || hello.VideoPort == hello.DiagnosticPort)
+                if (hello.Kind != "hello")
                     throw new InvalidDataException("Invalid connection handshake.");
                 CancellationTokenSource lifetime;
                 string id;
@@ -590,16 +694,19 @@ sealed class RemoteHost : IAsyncDisposable
                 {
                     using var capture = CreateCapture();
                     Volatile.Write(ref activeCapture, capture);
+                    await using var udpSession = new RemoteUdpSession(FindInputSocket(address), id, lifetime.Token);
+                    lock (gate) activeUdp = udpSession;
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
                     using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth,
                         capture.SourceHeight, capture.CaptureMapped, capture.SetPixelMode, () => (capture.Width, capture.Height));
                     session.Failed += error => { lifetime.Cancel(); Failed?.Invoke(error); };
-                    session.StartSender(new(address, hello.VideoPort), new(address, hello.DiagnosticPort));
-                    var welcome = new RemoteWelcome(id, session.SenderPort, capture.Width, capture.Height,
+                    var welcome = new RemoteWelcome(id, capture.Width, capture.Height,
                         capture.SourceWidth, capture.SourceHeight,
                         config.FramesPerSecond, config.InitialPreset, config.InitialBitrateKbps, config.Presets, config.TransmissionScale,
                         config.MaximumBitrateMbps, probeSamples.Where(sample => sample.Width == capture.Width && sample.Height == capture.Height).ToArray());
                     await SendAsync(new(true, Welcome: welcome), received);
+                    var udpPeer = await udpSession.WaitForRegistrationAsync(lifetime.Token);
+                    session.StartSender(FindInputSocket(address), udpPeer, udpSession);
                     Status?.Invoke($"主控已连接：{address}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。");
                     while (!lifetime.IsCancellationRequested)
                     {
@@ -630,7 +737,7 @@ sealed class RemoteHost : IAsyncDisposable
                     lifetime.Cancel();
                     Volatile.Write(ref activeCapture, null);
                     lifetime.Dispose();
-                    lock (gate) { activeStop = null; controller = null; sessionId = ""; }
+                    lock (gate) { activeStop = null; activeUdp = null; controller = null; sessionId = ""; }
                     ControllerChanged?.Invoke(null);
                     Status?.Invoke("主控已断开；已停止捕获发送并释放输入。等待重新连接。");
                 }
@@ -658,26 +765,34 @@ sealed class RemoteHost : IAsyncDisposable
     internal static async Task ReceiveInputAsync(Socket socket, IRemoteInputInjector injector, IPAddress controller, string session,
         Func<bool> enabled, CancellationToken token)
     {
+        if (socket.ReceiveBufferSize < 1024 * 1024) socket.ReceiveBufferSize = 1024 * 1024;
         var nonce = Convert.FromHexString(session);
         var packet = new byte[UdpInputProtocol.PacketSize];
         long latest = 0;
         var any = socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any;
-        try
+        await Task.Run(() =>
         {
-            while (!token.IsCancellationRequested)
+            try
             {
-                var received = await socket.ReceiveFromAsync(packet, SocketFlags.None, new IPEndPoint(any, 0), token);
-                if (!enabled() || !FrdNetwork.Canonical(((IPEndPoint)received.RemoteEndPoint).Address).Equals(controller) ||
-                    !UdpInputProtocol.TryRead(packet.AsSpan(0, received.ReceivedBytes), nonce, out var sequence, out var input) ||
-                    sequence <= latest) continue;
-                latest = sequence;
-                var result = injector.Inject(input!);
-                if (!result.Accepted) Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                while (!token.IsCancellationRequested)
+                {
+                    if (!socket.Poll(20_000, SelectMode.SelectRead)) continue;
+                    EndPoint source = new IPEndPoint(any, 0);
+                    var length = socket.ReceiveFrom(packet, ref source);
+                    var valid = UdpInputProtocol.TryRead(packet.AsSpan(0, length), nonce, out var sequence, out var input);
+                    if (Environment.GetEnvironmentVariable("FRD_TRACE_INPUT") == "1")
+                        InputProtocol.Log($"UDP receive {length} bytes sequence {sequence}; valid={valid}; enabled={enabled()}");
+                    if (!enabled() || !FrdNetwork.Canonical(((IPEndPoint)source).Address).Equals(controller) || !valid ||
+                        sequence <= latest) continue;
+                    latest = sequence;
+                    var result = injector.Inject(input!);
+                    if (!result.Accepted) Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                }
             }
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input stopped."); }
-        catch (ObjectDisposedException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
-        catch (SocketException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
+            catch (ObjectDisposedException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
+            catch (SocketException) when (token.IsCancellationRequested) { Console.Error.WriteLine("UDP input socket stopped."); }
+            finally { if (token.IsCancellationRequested) Console.Error.WriteLine("UDP input stopped."); }
+        }, CancellationToken.None);
     }
 
     public async ValueTask DisposeAsync()
@@ -706,7 +821,7 @@ sealed class RemoteHost : IAsyncDisposable
 static class RemoteLaunch
 {
     static int hostExitCode;
-    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。被控端在 --port 同时绑定 TCP 和 UDP；键鼠统一走该 UDP 端口，TCP 负责认证、控制、剪贴板和鼠标形状。视频和诊断使用协商的 UDP 端口。";
+    public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。远程模式只使用 --port：被控端在该端口同时绑定 TCP/UDP；主控的全部 TCP 连接和 UDP 数据报均以该端口为目标。视频、反馈、诊断和键鼠复用同一个 UDP socket。";
     public static void Help(bool window)
     {
         Console.WriteLine(Usage);
