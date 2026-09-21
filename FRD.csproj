@@ -9,8 +9,8 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>1.0.0-pre10</Version>
-    <InformationalVersion>v1.pre10</InformationalVersion>
+    <Version>1.0.0-pre11</Version>
+    <InformationalVersion>v1.pre11</InformationalVersion>
     <SelfContained>false</SelfContained>
     <PublishAot>false</PublishAot>
   </PropertyGroup>
