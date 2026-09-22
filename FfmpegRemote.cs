@@ -16,14 +16,14 @@ using Avalonia.Themes.Simple;
 namespace Frd;
 
 public sealed record RemoteOptions(string Host, int Port, string Token);
-sealed record RemoteRequest(string Kind, string Token = "", string Session = "", ControlCommand? Command = null);
+sealed record RemoteRequest(string Kind, string Token = "", string Session = "", ControlCommand? Command = null, int InputProtocol = 0);
 sealed record RemoteWelcome(string Session, int Width, int Height, int SourceWidth, int SourceHeight,
     int FramesPerSecond, string InitialPreset, int InitialBitrateKbps, Dictionary<string, CodecPreset> Presets, double TransmissionScale = 1,
     double MaximumBitrateMbps = 100, CodecProbeSample[]? ProbeSamples = null);
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
     long ReceiveTick = 0, long SendTick = 0, long Frequency = 0,
-    int Generation = 0, int Width = 0, int Height = 0);
+    int Generation = 0, int Width = 0, int Height = 0, string InputSession = "");
 
 static class RemoteWire
 {
@@ -229,10 +229,12 @@ public sealed partial class DemoSession
         var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
         try
         {
-            await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session), token);
+            await RemoteWire.WriteAsync(client.GetStream(), new RemoteRequest("input", remoteOptions.Token, Session: welcome.Session, InputProtocol: 2), token);
             var reply = await RemoteWire.ReadAsync<RemoteReply>(client.GetStream(), token);
             if (!reply.Success) throw new IOException(reply.Message);
-            return new(client, new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session),
+            if (reply.InputSession is not { Length: 32 } || reply.InputSession.Any(c => !Uri.IsHexDigit(c)))
+                throw new IOException("Remote host does not support isolated UDP input sessions; update both endpoints.");
+            return new(client, new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(reply.InputSession),
                 (packet, endpoint) => receiver!.SendInput(packet, endpoint));
         }
         catch { client.Dispose(); throw; }
@@ -382,7 +384,9 @@ sealed class RemoteUdpSession : IAsyncDisposable
     readonly Task inputWorker;
     readonly Action<Exception>? failed;
     readonly AutoResetEvent inputReady = new(false);
-    readonly LinkedList<RemoteInputEvent> pendingInput = new();
+    readonly LinkedList<QueuedInput> pendingInput = new();
+    internal const int MaximumInputAgeMs = 250;
+    readonly record struct QueuedInput(RemoteInputEvent Event, long Received);
     readonly TaskCompletionSource<IPEndPoint> registered = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly object gate = new();
     IPEndPoint? peer;
@@ -392,11 +396,15 @@ sealed class RemoteUdpSession : IAsyncDisposable
     long appliedInputs;
     int failureReported;
 
-    sealed class InputBinding(IRemoteInputInjector injector, Func<bool> enabled)
+    sealed class InputBinding(IRemoteInputInjector injector, Func<bool> enabled, Action<Exception>? failed)
     {
         public readonly object Execution = new();
         public readonly IRemoteInputInjector Injector = injector;
         public readonly Func<bool> Enabled = enabled;
+        public readonly byte[] Nonce = RandomNumberGenerator.GetBytes(16);
+        public readonly Action<Exception>? Failed = failed;
+        public bool Active = enabled();
+        public Exception? Fault;
         public long Revision;
     }
 
@@ -421,12 +429,13 @@ sealed class RemoteUdpSession : IAsyncDisposable
         lock (gate) sender = value;
     }
 
-    public void AttachInput(IRemoteInputInjector value, Func<bool> enabled)
+    public byte[] AttachInput(IRemoteInputInjector value, Func<bool> enabled, Action<Exception>? failed = null)
     {
         lock (gate)
         {
             if (inputBinding != null) throw new InvalidOperationException("Input dispatcher is already attached.");
-            inputBinding = new(value, enabled); pendingInput.Clear(); latestInput = 0;
+            inputBinding = new(value, enabled, failed); pendingInput.Clear(); latestInput = 0;
+            return inputBinding.Nonce.ToArray();
         }
     }
 
@@ -442,12 +451,16 @@ sealed class RemoteUdpSession : IAsyncDisposable
         // Wait only on the lifecycle caller, never on the UDP receiver, before disposing the injector.
         lock (binding.Execution)
         {
-            var result = binding.Injector.ReleaseAll();
-            if (!result.Accepted) Console.Error.WriteLine("[Input] Detach release failed: " + result.Message);
+            try
+            {
+                var result = binding.Injector.ReleaseAll();
+                if (!result.Accepted) Console.Error.WriteLine("[Input] Detach release failed: " + result.Message);
+            }
+            catch (Exception error) { Console.Error.WriteLine("[Input] Detach release threw: " + error); }
         }
     }
 
-    public void UpdateInputEnabled(IRemoteInputInjector value, Action update)
+    public void UpdateInputEnabled(IRemoteInputInjector value, bool enabled, Action update)
     {
         InputBinding binding;
         lock (gate)
@@ -455,7 +468,13 @@ sealed class RemoteUdpSession : IAsyncDisposable
                 throw new InvalidOperationException("Input dispatcher is no longer attached.");
         lock (binding.Execution)
         {
-            lock (gate) { pendingInput.Clear(); binding.Revision++; }
+            lock (gate)
+            {
+                if (!ReferenceEquals(inputBinding, binding)) throw new InvalidOperationException("Input dispatcher was detached.");
+                if (enabled && binding.Fault != null) throw new IOException("Input channel failed; reconnect input before enabling.", binding.Fault);
+                if (binding.Active == enabled && binding.Enabled() == enabled) return;
+                pendingInput.Clear(); binding.Revision++; binding.Active = enabled;
+            }
             update();
         }
     }
@@ -467,7 +486,7 @@ sealed class RemoteUdpSession : IAsyncDisposable
             while (!stop.IsCancellationRequested)
             {
                 InputBinding? binding;
-                RemoteInputEvent? input;
+                QueuedInput? input;
                 long revision;
                 lock (gate)
                 {
@@ -477,17 +496,52 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     if (input != null) pendingInput.RemoveFirst();
                 }
                 if (binding == null || input == null) { inputReady.WaitOne(20); continue; }
-                lock (binding.Execution)
+                try
                 {
-                    lock (gate)
-                        if (!ReferenceEquals(inputBinding, binding) || revision != binding.Revision || !binding.Enabled() || stop.IsCancellationRequested) continue;
-                    var result = binding.Injector.Inject(input);
-                    if (result.Accepted) Interlocked.Increment(ref appliedInputs);
-                    else Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                    lock (binding.Execution)
+                    {
+                        lock (gate)
+                            if (!ReferenceEquals(inputBinding, binding) || revision != binding.Revision || binding.Fault != null ||
+                                !binding.Active || !binding.Enabled() || stop.IsCancellationRequested) continue;
+                        if (Stopwatch.GetElapsedTime(input.Value.Received).TotalMilliseconds > MaximumInputAgeMs)
+                        {
+                            lock (gate) pendingInput.Clear();
+                            Console.Error.WriteLine("[Input] Local backlog exceeded 250 ms; discarded pending events and releasing held input. Channel remains active.");
+                            var released = binding.Injector.ReleaseAll();
+                            if (!released.Accepted) Console.Error.WriteLine("[Input] Backlog release rejected: " + released.Message);
+                            continue;
+                        }
+                        var result = binding.Injector.Inject(input.Value.Event);
+                        if (result.Accepted) Interlocked.Increment(ref appliedInputs);
+                        else Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                    }
                 }
+                catch (Exception error) { FailInput(binding, error); }
             }
         }
         catch (Exception error) { Fail(error); }
+    }
+
+    void FailInput(InputBinding binding, Exception error)
+    {
+        lock (gate)
+        {
+            if (!ReferenceEquals(inputBinding, binding) || binding.Fault != null) return;
+            binding.Fault = error; binding.Active = false; binding.Revision++; pendingInput.Clear();
+        }
+        Console.Error.WriteLine("[Input] Channel stopped; video and UDP feedback remain active: " + error);
+        lock (binding.Execution)
+        {
+            lock (gate) if (!ReferenceEquals(inputBinding, binding)) return;
+            try
+            {
+                var released = binding.Injector.ReleaseAll();
+                if (!released.Accepted) Console.Error.WriteLine("[Input] Failure release rejected: " + released.Message);
+            }
+            catch (Exception releaseError) { Console.Error.WriteLine("[Input] Failure release threw: " + releaseError); }
+        }
+        try { binding.Failed?.Invoke(error); }
+        catch (Exception callbackError) { Console.Error.WriteLine("[Input] Failure notification failed: " + callbackError); }
     }
 
     void Fail(Exception error)
@@ -544,22 +598,23 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     activeSender?.ProcessFeedback(bytes, activePeer);
                     continue;
                 }
-                if (!UdpInputProtocol.TryRead(bytes, nonce, out var sequence, out var input)) continue;
                 lock (gate)
                 {
-                    if (inputBinding == null || !inputBinding.Enabled() || sequence <= latestInput) continue;
+                    if (inputBinding == null || inputBinding.Fault != null || !inputBinding.Active || !inputBinding.Enabled() ||
+                        !UdpInputProtocol.TryRead(bytes, inputBinding.Nonce, out var sequence, out var input) || sequence <= latestInput) continue;
                     latestInput = sequence;
-                    if (input!.Kind == RemoteInputKind.MouseMove && pendingInput.Last?.Value.Kind == RemoteInputKind.MouseMove)
-                        pendingInput.Last.Value = input;
+                    var queued = new QueuedInput(input!, Stopwatch.GetTimestamp());
+                    if (input!.Kind == RemoteInputKind.MouseMove && pendingInput.Last?.Value.Event.Kind == RemoteInputKind.MouseMove)
+                        pendingInput.Last.Value = queued;
                     else
                     {
                         if (pendingInput.Count >= 128)
                         {
                             pendingInput.Clear();
-                            pendingInput.AddLast(new RemoteInputEvent(RemoteInputKind.ReleaseAll));
+                            pendingInput.AddLast(new QueuedInput(new(RemoteInputKind.ReleaseAll), Stopwatch.GetTimestamp()));
                             Console.Error.WriteLine("[Input] UDP input queue saturated; discarded pending input and scheduled key/button release.");
                         }
-                        pendingInput.AddLast(input);
+                        pendingInput.AddLast(queued);
                     }
                 }
                 inputReady.Set();
@@ -661,6 +716,16 @@ sealed class RemoteHost : IAsyncDisposable
         Console.Error.WriteLine($"[host permission] Clipboard {(allowed ? "allowed" : "revoked")}.");
     }
 
+    internal void ReleasePermissionChannel(string session, CancellationTokenSource channel, bool input)
+    {
+        lock (gate)
+        {
+            if (sessionId != session) return;
+            if (input && ReferenceEquals(inputPermissionStop, channel)) { hasInput = false; inputPermissionStop = null; }
+            if (!input && ReferenceEquals(clipboardPermissionStop, channel)) { hasClipboard = false; clipboardPermissionStop = null; }
+        }
+    }
+
     async Task AcceptAsync(TcpListener listener)
     {
         try
@@ -740,19 +805,24 @@ sealed class RemoteHost : IAsyncDisposable
                     finally
                     {
                         SessionTrace.Event("host-clipboard-tcp", "closed");
-                        lock (gate) { if (sessionId == hello.Session) hasClipboard = false; clipboardPermissionStop = null; }
+                        ReleasePermissionChannel(hello.Session, clipboardChannel, false);
                         clipboardChannel.Dispose();
                     }
                     return;
                 }
                 if (hello.Kind == "input")
                 {
+                    if (hello.InputProtocol != 2) throw new InvalidDataException("UDP input protocol 2 is required; update both endpoints.");
                     CancellationToken inputToken;
                     CancellationTokenSource inputChannel;
+                    RemoteUdpSession udp;
+                    DesktopStreamSource inputCapture;
                     lock (gate)
                     {
                         if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasInput || !inputAllowed)
                             throw new InvalidDataException("Input channel does not belong to the active controller.");
+                        udp = activeUdp ?? throw new InvalidDataException("UDP session is not registered.");
+                        inputCapture = activeCapture ?? throw new InvalidDataException("Capture session is unavailable.");
                         hasInput = true;
                         inputPermissionStop = inputChannel = CancellationTokenSource.CreateLinkedTokenSource(activeStop.Token);
                         inputToken = inputChannel.Token;
@@ -762,20 +832,19 @@ sealed class RemoteHost : IAsyncDisposable
                         var ordinary = new Win32InputInjector();
                         ordinary.RegisterControllerWindow(clipboardOwner);
                         using var injector = new SecureDesktopInputRouter(ordinary,
-                            () => Volatile.Read(ref activeCapture)?.SecureActive == true);
+                            () => inputCapture.SecureActive);
                         var udpEnabled = 0;
-                        RemoteUdpSession udp;
-                        lock (gate) udp = activeUdp ?? throw new InvalidDataException("UDP session is not registered.");
-                        udp.AttachInput(injector, () => Volatile.Read(ref udpEnabled) != 0);
+                        var inputNonce = udp.AttachInput(injector, () => Volatile.Read(ref udpEnabled) != 0,
+                            error => { SessionTrace.Error("host-input", error); inputChannel.Cancel(); });
                         try
                         {
-                            await RemoteWire.WriteAsync(stream, new RemoteReply(true), timeout.Token);
+                            await RemoteWire.WriteAsync(stream, new RemoteReply(true, InputSession: Convert.ToHexString(inputNonce)), timeout.Token);
                             await RemoteInputServer.ServePeerAsync(injector, client, inputToken,
-                                enabledChanged: value => udp.UpdateInputEnabled(injector, () =>
+                                enabledChanged: value => udp.UpdateInputEnabled(injector, value, () =>
                                 {
                                     Volatile.Write(ref udpEnabled, value ? 1 : 0);
                                     injector.SetEnabled(value);
-                                }));
+                                }), allowTcpEvents: false);
                         }
                         finally
                         {
@@ -785,7 +854,7 @@ sealed class RemoteHost : IAsyncDisposable
                     finally
                     {
                         SessionTrace.Event("host-input-tcp", "closed");
-                        lock (gate) { if (sessionId == hello.Session) hasInput = false; inputPermissionStop = null; }
+                        ReleasePermissionChannel(hello.Session, inputChannel, true);
                         inputChannel.Dispose();
                     }
                     return;

@@ -178,7 +178,7 @@ public sealed class RemoteInputServer : IDisposable
     }
 
     internal static async Task ServePeerAsync(IRemoteInputInjector injector, TcpClient peer, CancellationToken token, Action<Exception>? failure = null,
-        Action<bool>? enabledChanged = null)
+        Action<bool>? enabledChanged = null, bool allowTcpEvents = true)
     {
         peer.NoDelay = true;
         var stream = peer.GetStream();
@@ -195,12 +195,17 @@ public sealed class RemoteInputServer : IDisposable
                 if (request.Enable is { } enable)
                 {
                     if (request.Input is not null) throw new InvalidDataException("Input enable and event are mutually exclusive.");
-                    result = enable ? new(true, "Input forwarding enabled.") : injector.ReleaseAll();
-                    enabled = enable;
-                    enabledChanged?.Invoke(enabled);
+                    if (enabled != enable)
+                    {
+                        enabledChanged?.Invoke(enable);
+                        result = !enable && enabledChanged == null ? injector.ReleaseAll() : new(true, "Input forwarding state changed.");
+                        enabled = enable;
+                    }
+                    else result = new(true, "Input forwarding state unchanged.");
                 }
                 else if (request.Input is null) result = new(false, "No input event supplied.");
                 else if (!enabled) result = new(false, "Input forwarding is disabled.");
+                else if (!allowTcpEvents) result = new(false, "Remote input events require UDP; TCP only controls input lifecycle.");
                 else result = injector.Inject(request.Input);
                 await InputProtocol.WriteAsync(stream, new InputReply(request.Sequence, result.Accepted, result.Message), token).ConfigureAwait(false);
             }
@@ -210,9 +215,14 @@ public sealed class RemoteInputServer : IDisposable
         catch (Exception error) { if (failure != null) failure(error); else InputProtocol.Log("Input peer failed", error); }
         finally
         {
-            enabledChanged?.Invoke(false);
-            var released = injector.ReleaseAll();
-            if (!released.Accepted) InputProtocol.Log(released.Message);
+            try { enabledChanged?.Invoke(false); }
+            catch (Exception error) { InputProtocol.Log("Input disable during cleanup failed", error); }
+            try
+            {
+                var released = injector.ReleaseAll();
+                if (!released.Accepted) InputProtocol.Log(released.Message);
+            }
+            catch (Exception error) { InputProtocol.Log("Input release during cleanup failed", error); }
         }
     }
 

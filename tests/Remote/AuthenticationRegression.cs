@@ -34,7 +34,7 @@ static class AuthenticationRegression
             return Process.Start(info) ?? throw new IOException("Cannot start authentication test host.");
         }
         Process Start(params string[] extra) => StartCommand(["--host", "--listen", "127.0.0.1", "--port", port.ToString(), .. extra]);
-        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v2.pre1"), ("--unknown-option", 1, "") })
+        foreach (var (argument, expectedExit, expectedOutput) in new[] { ("--help", 0, "FRD CLI"), ("--version", 0, "v2.pre2"), ("--unknown-option", 1, "") })
         {
             using var process = StartCommand(argument);
             var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();
@@ -150,14 +150,25 @@ static class AuthenticationRegression
                 Check(acknowledgement.Buffer.Length == 24 && acknowledgement.Buffer[4] == 4,
                     "Authenticated UDP registration uses the fixed --port");
             }
+            using (var legacy = await Connect())
+            {
+                var rejected = await Exchange(legacy, new { Kind = "input", Token = password, Session = session });
+                Check(!rejected.GetProperty("Success").GetBoolean(), "Legacy input handshake explicitly rejected");
+            }
             foreach (var kind in new[] { "input", "cursor", "clipboard" })
             {
                 using var wrongSession = await Connect();
-                var denied = await Exchange(wrongSession, new { Kind = kind, Token = password, Session = "wrong-session" });
+                var denied = await Exchange(wrongSession, new { Kind = kind, Token = password, Session = "wrong-session", InputProtocol = 2 });
                 Check(!denied.GetProperty("Success").GetBoolean(), kind + ": correct token with wrong session rejected");
                 using var valid = await Connect();
-                var accepted = await Exchange(valid, new { Kind = kind, Token = password, Session = session });
+                var accepted = await Exchange(valid, new { Kind = kind, Token = password, Session = session, InputProtocol = 2 });
                 Check(accepted.GetProperty("Success").GetBoolean(), kind + ": correct token and active session accepted");
+                if (kind == "input")
+                {
+                    var inputSession = accepted.GetProperty("InputSession").GetString();
+                    Check(inputSession is { Length: 32 } && inputSession.All(Uri.IsHexDigit) && inputSession != session,
+                        "Input channel receives its own valid nonce, separate from desktop session");
+                }
             }
             controller.Dispose();
             await Task.Delay(200);

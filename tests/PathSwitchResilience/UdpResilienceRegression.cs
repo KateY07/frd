@@ -26,7 +26,7 @@ static class UdpResilienceRegression
         host.AttachSender(sender);
         var injector = new BlockingInjector();
         var enabled = true;
-        host.AttachInput(injector, () => Volatile.Read(ref enabled));
+        var inputNonce = host.AttachInput(injector, () => Volatile.Read(ref enabled));
         long sequence = 0, videos = 0;
         receiver.VideoReceived += _ => Interlocked.Increment(ref videos);
         Exception? receiverFailure = null;
@@ -34,7 +34,7 @@ static class UdpResilienceRegression
         void Send(RemoteInputEvent input)
         {
             var packet = new byte[UdpInputProtocol.PacketSize];
-            UdpInputProtocol.Write(packet, nonce, ++sequence, input);
+            UdpInputProtocol.Write(packet, inputNonce, ++sequence, input);
             receiver.SendInput(packet, endpoint);
         }
         try
@@ -84,13 +84,13 @@ static class UdpResilienceRegression
                 throw new InvalidOperationException("Overflow did not release held keys before newer events.");
             Console.WriteLine("PASS: overload queue bounded; pending backlog replaced with release before new input.");
 
-            host.UpdateInputEnabled(injector, () => Volatile.Write(ref enabled, false));
+            host.UpdateInputEnabled(injector, false, () => Volatile.Write(ref enabled, false));
             var beforeDisable = injector.Events.Count;
             Send(new(RemoteInputKind.KeyDown, ScanCode: 32));
             await Task.Delay(60);
             if (injector.Events.Count != beforeDisable || host.PendingInputs != 0)
                 throw new InvalidOperationException("Disabled input was queued or applied.");
-            host.UpdateInputEnabled(injector, () => Volatile.Write(ref enabled, true));
+            host.UpdateInputEnabled(injector, true, () => Volatile.Write(ref enabled, true));
             Send(new(RemoteInputKind.KeyUp, ScanCode: 32));
             await UntilAsync(() => injector.Events.Count == beforeDisable + 1);
             if (injector.Events.Last().Kind != RemoteInputKind.KeyUp) throw new InvalidOperationException("Re-enable replayed stale input.");

@@ -4,6 +4,12 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Frd;
 
+if (args.Contains("--input-lifecycle-only"))
+{
+    await InputLifecycleRegression.RunAsync();
+    return;
+}
+
 if (args.Contains("--network-stimulus"))
 {
     NetworkStimulus.Run();

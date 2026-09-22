@@ -21,7 +21,7 @@ $startupError = Join-Path $staging 'startup-error.txt'
 if (Test-Path -LiteralPath $startupError) { Remove-Item -LiteralPath $startupError }
 $documents = @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
     'docs/本机输入延迟验证.md', 'docs/公网拥塞控制调查.md', 'docs/受限公网回归设计.md',
-    "docs/$version-发布说明.md", "docs/$version-静态检查.md")
+    "docs/$version-发布说明.md", "docs/$version-静态检查.md", 'docs/输入生命周期修复.md')
 foreach ($document in $documents) {
     $destination = Join-Path $staging $document
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
