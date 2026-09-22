@@ -27,6 +27,8 @@ public sealed class ConfirmedVideoView : NativeControlHost
     nint sourceWindow;
     bool stopped, inputEnabled;
     int sourceWidth = 1280, sourceHeight = 720;
+    long deferredPresentations;
+    public long DeferredPresentations => Interlocked.Read(ref deferredPresentations);
 
     public event Action<long, long>? Presented;
     public event Action<Exception>? Failed;
@@ -178,7 +180,7 @@ public sealed class ConfirmedVideoView : NativeControlHost
                                 context.UpdateSubresource(backBuffer, 0, null, (nint)source, (uint)(width * 4), 0);
                         var presentResult = swap!.Present(0, PresentFlags.None);
                         presentResult.CheckError();
-                        if (presentResult.Code != 0) continue;
+                        if (presentResult.Code != 0) { Interlocked.Increment(ref deferredPresentations); continue; }
                         // The event confirms GPU commands after Present; it does not measure physical scan-out.
                         context.End(completion);
                         context.Flush();

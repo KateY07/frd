@@ -1,6 +1,8 @@
-# FRD · 远程桌面 CLI（v2.pre2）
+# FRD · 远程桌面 CLI（v2.pre3）
 
-v2.pre2 修复：输入异常不再终止视频；旧通道清理、迟到输入包及重复启用不会影响新通道；远程输入事件只走 UDP。输入握手升级为协议 2，主被控需一起更新，端口与数据报尺寸不变。详见 [输入生命周期修复与回归](docs/输入生命周期修复.md)。
+默认采用 **h264（限码率质量优先）、2.5 Mbps**，默认不自动切换编码预设。本版将反馈统计移出 UDP 收包线程；完整可观测性审计尚未完成。
+
+继承 v2.pre2 修复：输入异常不再终止视频；旧通道清理、迟到输入包及重复启用不会影响新通道；远程输入事件只走 UDP。输入握手升级为协议 2，主被控需一起更新，端口与数据报尺寸不变。详见 [输入生命周期修复与回归](docs/输入生命周期修复.md)。
 
 FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
@@ -63,7 +65,7 @@ using System.Diagnostics;
 
 var executable = Path.Combine(
     Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-    "Programs", "FRD", "v2.pre2", "FRD.exe");
+    "Programs", "FRD", "v2.pre3", "FRD.exe");
 var info = new ProcessStartInfo(executable)
 {
     WorkingDirectory = Path.GetDirectoryName(executable),
@@ -94,8 +96,8 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - `autoSelectCodec:true` 在启动时对标记 `autoProbe:true` 的有损预设做真实屏幕短测，探测进程最多运行 5 秒；不可用或超时则保留 `initialPreset`。`minimumAutoBitrateKbps` 可让高带宽预设仅在码率足够时参与。双机时被控端测捕获和编码，主控端用样本验证并测解码；结果只是当前画面、当前码率下的启动选择，手动切换始终可用。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
 - 本版依赖 **.NET 10 x64 Runtime**，不再自包含运行时，也不启用 Native AOT；仍直接运行 `FRD.exe`。需在主控与被控机器预先安装相应运行时，SDK 非必需；[微软下载页](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)。Avalonia 与 FFmpeg 原生依赖仍随包提供。原生调试符号另存于本机构建产物，不进入便携包。
-- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v2.pre2\`，不同版本分目录保留。
-- 本机发布包为 `D:\pub\FRD\v2.pre2.zip` 与同名 SHA-256 文件；工作区也保留 `artifacts/v2.pre2/` 构建副本。推送 `v*` 标签会由 GitHub Actions 在 Windows runner 上重新构建，并创建带 ZIP 和校验文件的 GitHub Pre-release；标签必须与项目版本一致。
+- 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v2.pre3\`，不同版本分目录保留。
+- 本机发布包为 `D:\pub\FRD\v2.pre3.zip` 与同名 SHA-256 文件；工作区也保留 `artifacts/v2.pre3/` 构建副本。推送 `v*` 标签会由 GitHub Actions 在 Windows runner 上重新构建，并创建带 ZIP 和校验文件的 GitHub Pre-release；标签必须与项目版本一致。
 
 ## 开发与边界
 
@@ -151,4 +153,4 @@ v1.pre7 的输入发送改为有界流水：保持事件顺序，后台确认，
 
 以上控制栏界面继承自已获人工确认的 v1.pre4；本版移除 pre7 的本机专用测试目标和鼠标事件过滤，保留输入流水发送及失败清理。测试目标仅保存在独立测试工程，不进入正式程序或生成的单文件 Demo。未重新执行真实双机或 RDP 对照，自动全局键鼠注入回归继续保持暂停。
 
-进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v2.pre2-发布说明.md)、[静态检查](docs/v2.pre2-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v2.pre3-发布说明.md)、[静态检查](docs/v2.pre3-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。

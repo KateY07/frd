@@ -4,8 +4,8 @@
   "height": 720,
   "framesPerSecond": 30,
   "initialPreset": "h264",
-  "autoSelectCodec": true,
-  "initialBitrateKbps": 1000,
+  "autoSelectCodec": false,
+  "initialBitrateKbps": 2500,
   "maximumBitrateMbps": 100,
   "libraryDirectory": "ffmpeg",
   "simulation": {

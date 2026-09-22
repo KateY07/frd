@@ -29,8 +29,8 @@ public sealed record AppConfiguration
     public double TransmissionScale { get; init; } = 1;
     public int FramesPerSecond { get; init; } = 30;
     public string InitialPreset { get; init; } = "h264";
-    public bool AutoSelectCodec { get; init; } = true;
-    public int InitialBitrateKbps { get; init; } = 1000;
+    public bool AutoSelectCodec { get; init; }
+    public int InitialBitrateKbps { get; init; } = 2500;
     public double MaximumBitrateMbps { get; init; } = 100;
     [System.Text.Json.Serialization.JsonIgnore]
     public int MaximumBitrateKbps => checked((int)Math.Round(MaximumBitrateMbps * 1000));

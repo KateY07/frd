@@ -8,7 +8,7 @@ using Frd;
 namespace Frd.InputVisualLatency;
 
 sealed record TargetState(string Machine, int Process, long Window, string Instance, int Left, int Top, int Width, int Height,
-    int SourceLeft, int SourceTop, int SourceWidth, int SourceHeight, long Frequency, bool Closed = false);
+    int SourceLeft, int SourceTop, int SourceWidth, int SourceHeight, long Frequency, bool Closed = false, bool Mouse = false, bool Motion = false);
 
 static class Target
 {
@@ -21,9 +21,14 @@ static class Target
     static TargetState state = null!;
     static long deadline;
     static int id;
+    static bool mouse, motion;
+    static int phase;
+    static Point originalCursor;
 
-    public static void Run(string path)
+    public static void Run(string path, bool actualMouse = false, bool animated = false)
     {
+        mouse = actualMouse; motion = animated;
+        if (mouse && !GetCursorPos(out originalCursor)) throw new Win32Exception(Marshal.GetLastWin32Error());
         statePath = path;
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var monitor = Win32InputInjector.ReadPrimaryMonitor();
@@ -33,7 +38,7 @@ static class Target
         if (RegisterClassEx(ref cls) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
         var title = "FRD Visual Latency " + Guid.NewGuid().ToString("N");
         window = CreateWindowEx(0x08000000 | 0x00000080 | 8, ClassName, title, 0x80000000, monitor.Left + 24, monitor.Top + 24,
-            528, 208, 0, 0, cls.Instance, 0);
+            motion ? monitor.Width - 48 : 528, motion ? monitor.Height - 48 : 208, 0, 0, cls.Instance, 0);
         if (window == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
         try
         {
@@ -41,11 +46,11 @@ static class Target
             GetClientRect(window, out var rect); var origin = new Point();
             if (!ClientToScreen(window, ref origin)) throw new Win32Exception(Marshal.GetLastWin32Error());
             state = new(Environment.MachineName, Environment.ProcessId, window, title, origin.X, origin.Y, rect.Right, rect.Bottom,
-                monitor.Left, monitor.Top, monitor.Width, monitor.Height, Stopwatch.Frequency);
+                monitor.Left, monitor.Top, monitor.Width, monitor.Height, Stopwatch.Frequency, Mouse: mouse, Motion: motion);
             Paint();
             File.WriteAllText(path, JsonSerializer.Serialize(state, AppConfiguration.JsonOptions));
             deadline = Environment.TickCount64 + 600000;
-            if (SetTimer(window, 1, 200, 0) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (SetTimer(window, 1, motion ? 33u : 200u, 0) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
             int result;
             while ((result = GetMessage(out var message, 0, 0, 0)) > 0) { TranslateMessage(ref message); DispatchMessage(ref message); }
             if (result < 0) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -55,6 +60,7 @@ static class Target
             if (IsWindow(window)) DestroyWindow(window);
             if (state != null) File.WriteAllText(path, JsonSerializer.Serialize(state with { Closed = true }, AppConfiguration.JsonOptions));
             DeleteObject(dark); DeleteObject(light); DeleteObject(background);
+            if (mouse && !SetCursorPos(originalCursor.X, originalCursor.Y)) Console.Error.WriteLine("Could not restore cursor: " + Marshal.GetLastWin32Error());
         }
     }
 
@@ -98,8 +104,26 @@ static class Target
                 if (wParam > 255) return 0;
                 id = (int)wParam; Paint(); return (nint)Stopwatch.GetTimestamp();
             }
+            if (message == 0x0200 && mouse && state != null)
+            {
+                var x = (short)((long)lParam & 65535); var y = (short)(((long)lParam >> 16) & 65535);
+                if (y is >= 188 and <= 192 && x >= 32 && x <= 400 && GetCursorPos(out var cursor) &&
+                    Math.Abs(cursor.X - state.Left - x) <= 1 && Math.Abs(cursor.Y - state.Top - y) <= 1)
+                {
+                    var candidate = (int)Math.Round((x - 16) / 16d);
+                    if (candidate is >= 1 and <= 24 && candidate != id)
+                    {
+                        var arrived = Stopwatch.GetTimestamp();
+                        id = candidate; Paint(false, true);
+                        var painted = Stopwatch.GetTimestamp();
+                        File.AppendAllText(statePath + ".events.jsonl", JsonSerializer.Serialize(new { Id = id, Arrived = arrived, Painted = painted }) + Environment.NewLine);
+                    }
+                }
+                return 0;
+            }
             if (message == 0x000f) { Paint(); ValidateRect(hwnd, 0); return 0; }
             if (message == 0x0113 && (Environment.TickCount64 >= deadline || File.Exists(statePath + ".stop"))) { DestroyWindow(hwnd); return 0; }
+            if (message == 0x0113 && motion) { phase++; Paint(true, false); return 0; }
             if (message == 0x0010) { DestroyWindow(hwnd); return 0; }
             if (message == 0x0002) { PostQuitMessage(0); return 0; }
             if (message == 0x0021) return 3;
@@ -108,23 +132,39 @@ static class Target
         return DefWindowProc(hwnd, message, wParam, lParam);
     }
 
-    static void Paint()
+    static void Paint(bool paintBackground = true, bool paintMarker = true)
     {
         if (window == 0) return;
         var dc = GetDC(window);
         if (dc == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
         try
         {
-            GetClientRect(window, out var rect); FillRect(dc, ref rect, background);
-            for (var cell = 0; cell < Marker.Cells; cell++)
+            GetClientRect(window, out var rect);
+            if (paintBackground)
             {
-                var bright = cell == 0 || cell >= 2 && (id & (1 << (cell - 2))) != 0;
-                var block = new Rect { Left = Marker.Left + cell * Marker.Cell, Top = Marker.Top, Right = Marker.Left + (cell + 1) * Marker.Cell, Bottom = Marker.Top + Marker.Height };
-                if (FillRect(dc, ref block, bright ? light : dark) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                var region = rect;
+                if (!paintMarker) region.Top = 224;
+                FillRect(dc, ref region, background);
             }
-            SetTextColor(dc, 0xffffff); SetBkMode(dc, 1);
-            var caption = $"FRD marker {id} - no keyboard/mouse injection";
-            if (!TextOut(dc, 16, 16, caption, caption.Length)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (motion && paintBackground)
+                for (var y = 224; y < rect.Bottom; y += 32)
+                    for (var x = 0; x < rect.Right; x += 32)
+                    {
+                        var tile = new Rect { Left = x, Top = y, Right = x + 32, Bottom = y + 32 };
+                        FillRect(dc, ref tile, ((x / 32 * 17 + y / 32 * 31 + phase * 13) % 7) < 3 ? light : dark);
+                    }
+            if (paintMarker)
+            {
+                for (var cell = 0; cell < Marker.Cells; cell++)
+                {
+                    var bright = cell == 0 || cell >= 2 && (id & (1 << (cell - 2))) != 0;
+                    var block = new Rect { Left = Marker.Left + cell * Marker.Cell, Top = Marker.Top, Right = Marker.Left + (cell + 1) * Marker.Cell, Bottom = Marker.Top + Marker.Height };
+                    if (FillRect(dc, ref block, bright ? light : dark) == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                SetTextColor(dc, 0xffffff); SetBkMode(dc, 1);
+                var caption = mouse ? $"FRD actual mouse marker {id}" : $"FRD marker {id} - no keyboard/mouse injection";
+                if (!TextOut(dc, 16, 16, caption, caption.Length)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
             if (!GdiFlush()) throw new Win32Exception(Marshal.GetLastWin32Error());
         }
         finally { ReleaseDC(window, dc); }
@@ -140,6 +180,8 @@ static class Target
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern nint GetModuleHandle(string? name);
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateWindowEx(uint ex, string cls, string title, uint style, int x, int y, int width, int height, nint parent, nint menu, nint instance, nint param);
     [DllImport("user32.dll")] static extern bool ShowWindow(nint hwnd, int command);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll", SetLastError = true)] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern bool DestroyWindow(nint hwnd);
     [DllImport("user32.dll")] static extern bool IsWindow(nint hwnd);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(nint hwnd);

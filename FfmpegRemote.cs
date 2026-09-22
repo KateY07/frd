@@ -382,11 +382,16 @@ sealed class RemoteUdpSession : IAsyncDisposable
     readonly CancellationTokenSource stop;
     readonly Task worker;
     readonly Task inputWorker;
+    readonly Task feedbackWorker;
+    readonly AutoResetEvent feedbackReady = new(false);
+    byte[]? pendingFeedback;
     readonly Action<Exception>? failed;
     readonly AutoResetEvent inputReady = new(false);
     readonly LinkedList<QueuedInput> pendingInput = new();
     internal const int MaximumInputAgeMs = 250;
-    readonly record struct QueuedInput(RemoteInputEvent Event, long Received);
+    readonly record struct QueuedInput(RemoteInputEvent Event, long Received, long Sequence = 0);
+    internal readonly record struct InputTiming(long Sequence, long Received, long Executing, long Completed);
+    internal event Action<InputTiming>? InputMeasured;
     readonly TaskCompletionSource<IPEndPoint> registered = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly object gate = new();
     IPEndPoint? peer;
@@ -417,8 +422,9 @@ sealed class RemoteUdpSession : IAsyncDisposable
         nonce = Convert.FromHexString(session);
         this.failed = failed;
         stop = CancellationTokenSource.CreateLinkedTokenSource(token);
-        worker = Task.Run(Receive);
+        worker = Task.Factory.StartNew(Receive, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         inputWorker = Task.Factory.StartNew(DispatchInput, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        feedbackWorker = Task.Factory.StartNew(DispatchFeedback, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
     }
 
     public async Task<IPEndPoint> WaitForRegistrationAsync(CancellationToken token) =>
@@ -511,9 +517,17 @@ sealed class RemoteUdpSession : IAsyncDisposable
                             if (!released.Accepted) Console.Error.WriteLine("[Input] Backlog release rejected: " + released.Message);
                             continue;
                         }
+                        var executing = Stopwatch.GetTimestamp();
                         var result = binding.Injector.Inject(input.Value.Event);
+                        var completed = Stopwatch.GetTimestamp();
                         if (result.Accepted) Interlocked.Increment(ref appliedInputs);
                         else Console.Error.WriteLine("[Input] UDP event rejected: " + result.Message);
+                        try { InputMeasured?.Invoke(new(input.Value.Sequence, input.Value.Received, executing, completed)); }
+                        catch (Exception diagnosticError)
+                        {
+                            InputMeasured = null;
+                            Console.Error.WriteLine("[Input] Timing observer disabled after failure: " + diagnosticError);
+                        }
                     }
                 }
                 catch (Exception error) { FailInput(binding, error); }
@@ -544,12 +558,27 @@ sealed class RemoteUdpSession : IAsyncDisposable
         catch (Exception callbackError) { Console.Error.WriteLine("[Input] Failure notification failed: " + callbackError); }
     }
 
+    void DispatchFeedback()
+    {
+        while (!stop.IsCancellationRequested)
+        {
+            var packet = Interlocked.Exchange(ref pendingFeedback, null);
+            if (packet == null) { feedbackReady.WaitOne(20); continue; }
+            UdpVideoSender? activeSender;
+            IPEndPoint? activePeer;
+            lock (gate) { activeSender = sender; activePeer = peer; }
+            if (activeSender == null || activePeer == null) continue;
+            try { activeSender.ProcessFeedback(packet, activePeer); }
+            catch (Exception error) { Console.Error.WriteLine("[UDP] Feedback processing failed; input receiver remains active: " + error); }
+        }
+    }
+
     void Fail(Exception error)
     {
         if (Interlocked.Exchange(ref failureReported, 1) != 0) return;
         Console.Error.WriteLine("[UDP session] " + error);
         registered.TrySetException(error);
-        stop.Cancel(); inputReady.Set();
+        stop.Cancel(); inputReady.Set(); feedbackReady.Set();
         failed?.Invoke(error);
     }
 
@@ -570,6 +599,7 @@ sealed class RemoteUdpSession : IAsyncDisposable
                 }
                 catch (SocketException error) when (!stop.IsCancellationRequested && VideoDatagram.Recoverable(error, "Session receive"))
                 { continue; }
+                var received = Stopwatch.GetTimestamp();
                 if (length > VideoDatagram.MaxSize) continue;
                 var endpoint = (IPEndPoint)source;
                 var bytes = packet.AsSpan(0, length);
@@ -588,14 +618,15 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     registered.TrySetResult(endpoint);
                     continue;
                 }
-                UdpVideoSender? activeSender;
                 IPEndPoint? activePeer;
-                lock (gate) { activeSender = sender; activePeer = peer; }
+                lock (gate) activePeer = peer;
                 if (activePeer == null || !FrdNetwork.SameEndpoint(activePeer, endpoint)) continue;
                 if (bytes.Length == VideoDatagram.FeedbackSize && bytes[4] == 2 &&
                     BinaryPrimitives.ReadUInt32LittleEndian(bytes) == VideoDatagram.Magic)
                 {
-                    activeSender?.ProcessFeedback(bytes, activePeer);
+                    // Feedback carries cumulative counters; keep only the latest while statistics are busy.
+                    Interlocked.Exchange(ref pendingFeedback, bytes.ToArray());
+                    feedbackReady.Set();
                     continue;
                 }
                 lock (gate)
@@ -603,7 +634,7 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     if (inputBinding == null || inputBinding.Fault != null || !inputBinding.Active || !inputBinding.Enabled() ||
                         !UdpInputProtocol.TryRead(bytes, inputBinding.Nonce, out var sequence, out var input) || sequence <= latestInput) continue;
                     latestInput = sequence;
-                    var queued = new QueuedInput(input!, Stopwatch.GetTimestamp());
+                    var queued = new QueuedInput(input!, received, sequence);
                     if (input!.Kind == RemoteInputKind.MouseMove && pendingInput.Last?.Value.Event.Kind == RemoteInputKind.MouseMove)
                         pendingInput.Last.Value = queued;
                     else
@@ -627,9 +658,9 @@ sealed class RemoteUdpSession : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        stop.Cancel(); inputReady.Set();
-        try { await Task.WhenAll(worker, inputWorker); }
-        finally { inputReady.Dispose(); stop.Dispose(); }
+        stop.Cancel(); inputReady.Set(); feedbackReady.Set();
+        try { await Task.WhenAll(worker, inputWorker, feedbackWorker); }
+        finally { inputReady.Dispose(); feedbackReady.Dispose(); stop.Dispose(); }
     }
 }
 

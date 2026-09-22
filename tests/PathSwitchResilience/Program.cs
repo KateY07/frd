@@ -4,6 +4,12 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using Frd;
 
+if (args is ["--input-load", var report])
+{
+    await InputLoadRegression.RunAsync(report);
+    return;
+}
+
 if (args.Contains("--input-lifecycle-only"))
 {
     await InputLifecycleRegression.RunAsync();
