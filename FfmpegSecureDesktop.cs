@@ -83,11 +83,11 @@ sealed class SecureDesktopFrames : IDisposable
     long version, consumed;
     bool active, disposed;
 
-    public static SecureDesktopFrames? TryStart()
+    public static SecureDesktopFrames? TryStart(bool quiet = false)
     {
         if (!File.Exists(SecureDesktopUdp.KeyPath))
         {
-            Console.Error.WriteLine("[secure capture] UDP helper key is absent; secure desktop capture is unavailable.");
+            if (!quiet) Console.Error.WriteLine("[secure capture] UDP helper key is absent; secure desktop capture is unavailable.");
             return null;
         }
         return new(ReadKeyForHost());

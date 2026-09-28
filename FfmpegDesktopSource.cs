@@ -44,13 +44,13 @@ public static class TransmissionGeometry
 sealed class DesktopStreamSource : IDisposable
 {
     readonly object gate = new();
-    readonly SecureDesktopFrames? secure;
+    SecureDesktopFrames? secure;
     DesktopCapture? capture;
     DxgiDesktopCapture? packedCapture;
     CapturePixelMode pixelMode;
     bool disposed;
     bool secureWasActive;
-    long secureFailureStarted;
+    long secureFailureStarted, nextSecureAttachTick;
     int width, height, sourceWidth, sourceHeight;
     public int SourceWidth { get { lock (gate) return sourceWidth; } }
     public int SourceHeight { get { lock (gate) return sourceHeight; } }
@@ -74,6 +74,7 @@ sealed class DesktopStreamSource : IDisposable
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
+            TryAttachSecureDesktop();
             if (secure is { } source)
             {
                 var frame = source.Take();
@@ -100,6 +101,7 @@ sealed class DesktopStreamSource : IDisposable
         lock (gate)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
+            TryAttachSecureDesktop();
             if (secure is { } source)
             {
                 var shared = source.TakeSharedMapped(allowUnchanged);
@@ -132,6 +134,14 @@ sealed class DesktopStreamSource : IDisposable
             }
             catch (Exception error) when (WaitForSecureTransition(error)) { return null; }
         }
+    }
+
+    void TryAttachSecureDesktop()
+    {
+        if (secure != null || nextSecureAttachTick > Stopwatch.GetTimestamp()) return;
+        nextSecureAttachTick = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
+        secure = SecureDesktopFrames.TryStart(quiet: true);
+        if (secure != null) Console.Error.WriteLine("[secure capture] Attached helper frame source without restarting the session.");
     }
 
     byte[] NativeSecure(byte[] pixels, int frameWidth, int frameHeight)

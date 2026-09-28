@@ -1106,12 +1106,13 @@ static class RemoteLaunch
         readonly RemoteHost server;
         readonly TextBlock status = new() { Text = "FRD · 等待主控", FontSize = 12,
             VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+        readonly Button secureHelper = new() { Content = "安装安全桌面辅助服务", FontSize = 10, Padding = new Thickness(4, 0), IsVisible = false };
         readonly StackPanel permissions = new() { Orientation = Avalonia.Layout.Orientation.Horizontal,
             Spacing = 6, IsVisible = false };
         bool closing, finished;
         public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
         {
-            Title = $"FRD 被控端 · TCP {port}"; Width = 290; Height = 50;
+            Title = $"FRD 被控端 · TCP {port}"; Width = 310; Height = 76;
             CanResize = false; ShowInTaskbar = false; Topmost = true;
             WindowDecorations = Avalonia.Controls.WindowDecorations.None;
             Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#B825303C"));
@@ -1126,7 +1127,7 @@ static class RemoteLaunch
             permissions.Children.Add(disconnect); permissions.Children.Add(clipboard);
             permissions.Children.Add(input); permissions.Children.Add(sound);
             var content = new StackPanel { Spacing = 1, Margin = new Thickness(6, 3) };
-            content.Children.Add(status); content.Children.Add(permissions);
+            content.Children.Add(status); content.Children.Add(secureHelper); content.Children.Add(permissions);
             var surface = new Border { Child = content };
             surface.PointerPressed += (_, e) =>
             {
@@ -1137,6 +1138,23 @@ static class RemoteLaunch
             disconnect.Click += (_, _) => server.DisconnectActive();
             clipboard.IsCheckedChanged += (_, _) => server.SetClipboardAllowed(clipboard.IsChecked == true);
             input.IsCheckedChanged += (_, _) => server.SetInputAllowed(input.IsChecked == true);
+            secureHelper.Click += async (_, _) =>
+            {
+                secureHelper.IsEnabled = false;
+                secureHelper.Content = "等待管理员确认…";
+                try
+                {
+                    await SecureDesktopService.InstallViaUacAsync();
+                    RefreshSecureHelper();
+                }
+                catch (Exception error)
+                {
+                    Console.Error.WriteLine("[secure helper] Installation failed: " + error);
+                    secureHelper.Content = "安装失败，点击重试";
+                    secureHelper.IsEnabled = true;
+                    ToolTip.SetTip(secureHelper, error.Message);
+                }
+            };
             server.ControllerChanged += address => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
                 status.Text = address == null ? "FRD · 等待主控" : $"正在被 {address} 控制";
@@ -1156,6 +1174,7 @@ static class RemoteLaunch
                         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),
                             "被控端提示窗口无法排除出屏幕捕获");
                     server.Start(handle);
+                    RefreshSecureHelper();
                 }
                 catch (Exception error)
                 {
@@ -1171,6 +1190,16 @@ static class RemoteLaunch
                 catch (Exception error) { Console.Error.WriteLine(error); hostExitCode = 1; }
                 finally { finished = true; Avalonia.Threading.Dispatcher.UIThread.Post(Close); }
             };
+        }
+
+        void RefreshSecureHelper()
+        {
+            var helper = SecureDesktopService.Status();
+            secureHelper.IsVisible = !helper.Running;
+            secureHelper.IsEnabled = !helper.Running;
+            secureHelper.Content = helper.Installed ? "启动/修复安全桌面辅助服务" : "安装安全桌面辅助服务";
+            ToolTip.SetTip(secureHelper, helper.Message);
+            Height = helper.Running ? 50 : 76;
         }
 
         [DllImport("user32.dll", SetLastError = true)]

@@ -657,6 +657,9 @@ static class Program
                     .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
                 return 0;
             }
+            if (args is ["--install-secure-helper"]) return SecureDesktopService.Install();
+            if (args is ["--secure-service"]) return SecureDesktopService.RunService();
+            if (args is ["--secure-worker"]) { SecureDesktopService.RunWorker(); return 0; }
             if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
                 return AutoCodecProbe.RunWorker(args);
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
