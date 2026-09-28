@@ -60,6 +60,6 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           .\.github\scripts\Publish-Release.ps1 -Tag $env:RELEASE_TAG `
-            -NotesPath "docs/$env:RELEASE_TAG-发布说明.md" `
+            -NotesPath "docs/release-notes.md" `
             -Assets "artifacts/$env:RELEASE_TAG/frd-$env:RELEASE_TAG-win-x64.zip", `
                     "artifacts/$env:RELEASE_TAG/SHA256SUMS.txt"
