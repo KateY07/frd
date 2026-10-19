@@ -5,6 +5,7 @@ using System.Text.Json;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
+using Avalonia.Controls.Primitives;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Platform;
@@ -71,16 +72,16 @@ static partial class FfmpegUi
         readonly Grid details = new() { RowDefinitions = new("Auto,Auto,Auto,Auto") };
         readonly DiagnosticWatermark watermark = new();
         readonly TextBlock controlTitle = new() { Text = "FRD 控制", VerticalAlignment = VerticalAlignment.Center };
-        readonly CheckBox inputEnabled = new() { Name = "InputForwarding", Content = "键鼠转发 · Ctrl+Alt 退出", IsEnabled = false, Margin = new Thickness(12, 0) };
-        readonly CheckBox packetDiagnostics = new() { Name = "PacketDiagnostics", Content = "诊断包", IsEnabled = false, Margin = new Thickness(8, 0) };
-        readonly CheckBox clipboardEnabled = new() { Name = "ClipboardSync", Content = "剪贴板同步（文本、文件、目录）", IsEnabled = false };
+        readonly ToggleButton inputEnabled = Glass.Chip(new ToggleButton { IsEnabled = false }, "键鼠", "InputForwarding", "mouse");
+        readonly ToggleButton packetDiagnostics = Glass.Chip(new ToggleButton { IsEnabled = false }, "诊断包", "PacketDiagnostics", "pulse");
+        readonly ToggleButton clipboardEnabled = Glass.Chip(new ToggleButton { IsEnabled = false }, "剪贴板", "ClipboardSync", "clipboard");
         readonly TextBlock clipboardMessage = new() { Text = "关闭；开启后同步两端新复制的内容", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(10, 0) };
-        readonly Button collapse = new() { Name = "CollapseDiagnostics", Content = "收起 ▴", MinWidth = 72 };
+        readonly Button collapse = Glass.Chip(new Button(), "收起", "CollapseDiagnostics", "chevrons", false);
         readonly Window overlay = new()
         {
             Title = "FRD 控制栏", WindowDecorations = Avalonia.Controls.WindowDecorations.None, CanResize = false,
             ShowInTaskbar = false, ShowActivated = false, SizeToContent = SizeToContent.Height,
-            Background = Brushes.Transparent, TransparencyLevelHint = [WindowTransparencyLevel.Transparent]
+            Background = Brushes.Transparent, TransparencyLevelHint = Glass.Levels
         };
         readonly ConfirmedVideoView preview = new() { Name = "ReceivedVideo" };
         readonly DispatcherTimer refresh = new() { Interval = TimeSpan.FromMilliseconds(100) };
@@ -165,7 +166,6 @@ static partial class FfmpegUi
             debounce.Tick += (_, _) => ApplySelection();
             autoClose.Tick += (_, _) => { scheduledClose = true; autoClose.Stop(); Close(); };
             reconnect.Click += (_, _) => { restartRequested = true; Close(); };
-            collapse.Click += (_, _) => ToggleDetails();
             inputEnabled.IsCheckedChanged += (_, _) => ChangeInputToggle();
             clipboardEnabled.IsCheckedChanged += async (_, _) =>
             {
@@ -180,7 +180,7 @@ static partial class FfmpegUi
             packetDiagnostics.IsCheckedChanged += (_, _) => ChangeDiagnostics();
             AddHandler(Avalonia.Input.InputElement.KeyDownEvent, HandleLocalKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
             overlay.AddHandler(Avalonia.Input.InputElement.KeyDownEvent, HandleLocalKeyDown, Avalonia.Interactivity.RoutingStrategies.Tunnel);
-            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "控制栏"); PositionOverlay(); };
+            overlay.Opened += (_, _) => { ExcludeFromCapture(overlay, "控制栏"); PositionOverlay(); Console.Error.WriteLine($"[glass] overlay transparency: {overlay.ActualTransparencyLevel}"); };
             watermark.Opened += (_, _) => { ExcludeFromCapture(watermark, "诊断水印"); PositionOverlay(); };
             overlay.SizeChanged += (_, _) => PositionOverlay();
             watermark.SizeChanged += (_, _) => PositionOverlay();
@@ -225,7 +225,7 @@ static partial class FfmpegUi
         {
             ExcludeFromCapture(this, "预览窗口");
             chromeOpened = true; SyncChromeVisibility();
-            refresh.Start();
+            refresh.Start(); Touch(); idleTimer.Start();
             try
             {
                 if (remoteOptions == null)
@@ -495,7 +495,11 @@ static partial class FfmpegUi
         void UpdateFpsButtons()
         {
             foreach (var button in fpsButtons)
-                button.Opacity = (int)button.Tag! == selectedFps ? 1 : .55;
+            {
+                var selected = (int)button.Tag! == selectedFps;
+                button.Background = selected ? Glass.Brush(palette.Checked) : Brushes.Transparent;
+                if (selected) button.Foreground = Glass.Brush(palette.CheckedText); else button.ClearValue(TemplatedControl.ForegroundProperty);
+            }
         }
 
         async Task StopInputAsync()
@@ -601,7 +605,7 @@ static partial class FfmpegUi
             catch (Exception ex) { ReportError(ex); }
             finally
             {
-                refresh.Stop();
+                refresh.Stop(); idleTimer.Stop();
                 preview.Stop();
                 try { session?.Dispose(); } catch (Exception ex) { ReportError(ex); }
                 captureBackend = capture?.Backend; captureStatistics = capture?.Statistics;
@@ -622,7 +626,7 @@ static partial class FfmpegUi
             preview.SetInputEnabled(false);
             presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false;
             foreach (var button in fpsButtons) button.IsEnabled = false;
-            reconnect.IsVisible = true;
+            reconnect.IsVisible = true; SetMore(true);
             operation.Text = $"原连接已中断：{ex.Message}；点击“重新建立会话”将创建新连接。";
             SessionTrace.Event("window", "disconnected-awaiting-user");
         }

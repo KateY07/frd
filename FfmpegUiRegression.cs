@@ -19,6 +19,7 @@ static partial class FfmpegUi
             var originalSize = new Size(Width, Height);
             var originalPosition = Position;
             var originalExpanded = details.IsVisible;
+            var originalMore = moreButton.IsChecked == true;
             var originalOrbFraction = orbFraction;
             var originalPanelFraction = panelFraction;
             var originalWatermark = showWatermark.IsChecked;
@@ -127,6 +128,7 @@ static partial class FfmpegUi
                 if (WindowState == WindowState.FullScreen) ToggleFullScreen();
                 WindowState = WindowState.Normal;
                 if (!details.IsVisible) ToggleDetails();
+                SetMore(true);
                 showWatermark.IsChecked = true;
                 foreach (var size in new[] { new Size(1280, 860), new Size(780, 520), new Size(980, 600), new Size(680, 460) })
                 {
@@ -241,6 +243,7 @@ static partial class FfmpegUi
                     orbFraction = originalOrbFraction;
                     panelFraction = originalPanelFraction;
                     if (details.IsVisible != originalExpanded) ToggleDetails();
+                    if ((moreButton.IsChecked == true) != originalMore) SetMore(originalMore);
                     showWatermark.IsChecked = originalWatermark;
                     WindowState = originalState;
                     PositionOverlay();
@@ -280,7 +283,9 @@ static partial class FfmpegUi
                 origin.X + width <= outerOrigin.X + ClientSize.Width * RenderScaling + 1 &&
                 origin.Y + height <= outerOrigin.Y + ClientSize.Height * RenderScaling + 1;
             Control[] expandedControls = [controlTitle, inputEnabled, packetDiagnostics, collapse, presets, bitrate, bitrateLabel,
-                clipboardEnabled, fullScreen, showWatermark];
+                clipboardEnabled, fullScreen, showWatermark, moreButton, disconnectButton];
+            Control[] moreControls = [controlTitle, packetDiagnostics, presets, bitrate, bitrateLabel, showWatermark];
+            if (expanded && moreButton.IsChecked != true) expandedControls = expandedControls.Except(moreControls).ToArray();
             Control[] controls = expanded ? expandedControls : [floatingOrb];
             var visible = controls.All(control => control.IsEffectivelyVisible && control.Bounds.Width > 0 && control.Bounds.Height > 0);
             var rectangles = controls.Select(control =>

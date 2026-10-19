@@ -1104,36 +1104,43 @@ static class RemoteLaunch
     sealed class HostWindow : Window
     {
         readonly RemoteHost server;
-        readonly TextBlock status = new() { Text = "FRD · 等待主控", FontSize = 12,
-            VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
-        readonly Button secureHelper = new() { Content = "安装安全桌面辅助服务", FontSize = 10, Padding = new Thickness(4, 0), IsVisible = false };
+        readonly Avalonia.Controls.Shapes.Ellipse dot = new() { Width = 8, Height = 8, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
+        readonly TextBlock status = new() { Text = "等待主控", FontSize = 13, VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center,
+            TextTrimming = Avalonia.Media.TextTrimming.CharacterEllipsis };
+        readonly TextBlock detail = new() { FontSize = 11, TextTrimming = Avalonia.Media.TextTrimming.CharacterEllipsis };
+        readonly Button secureHelper = Glass.Chip(new Button { IsVisible = false, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Left }, "安装安全桌面辅助服务");
         readonly StackPanel permissions = new() { Orientation = Avalonia.Layout.Orientation.Horizontal,
-            Spacing = 6, IsVisible = false };
-        bool closing, finished;
+            Spacing = 2, IsVisible = false, Margin = new Thickness(0, 8, 0, 0) };
+        readonly Border card = new() { CornerRadius = new CornerRadius(14), BorderThickness = new Thickness(1), Padding = new Thickness(12, 10) };
+        Glass.Palette palette = Glass.For(true);
+        bool closing, finished, moved, controlled;
         public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
         {
-            Title = $"FRD 被控端 · TCP {port}"; Width = 310; Height = 76;
+            Title = $"FRD 被控端 · TCP {port}"; Width = 300; SizeToContent = SizeToContent.Height;
             CanResize = false; ShowInTaskbar = false; Topmost = true;
             WindowDecorations = Avalonia.Controls.WindowDecorations.None;
-            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#B825303C"));
-            Foreground = Avalonia.Media.Brushes.White;
-            var disconnect = new Button { Content = "断开", FontSize = 10, Padding = new Thickness(4, 0) };
-            var clipboard = new CheckBox { Content = "剪贴板", FontSize = 10, IsChecked = true,
-                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
-            var input = new CheckBox { Content = "键鼠", FontSize = 10, IsChecked = true,
-                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
-            var sound = new CheckBox { Content = "声音", FontSize = 10, IsChecked = false, IsEnabled = false,
-                VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center };
-            permissions.Children.Add(disconnect); permissions.Children.Add(clipboard);
-            permissions.Children.Add(input); permissions.Children.Add(sound);
-            var content = new StackPanel { Spacing = 1, Margin = new Thickness(6, 3) };
-            content.Children.Add(status); content.Children.Add(secureHelper); content.Children.Add(permissions);
-            var surface = new Border { Child = content };
-            surface.PointerPressed += (_, e) =>
+            Background = Avalonia.Media.Brushes.Transparent; TransparencyLevelHint = Glass.Levels;
+            var disconnect = Glass.Chip(new Button(), "断开", null, "power");
+            disconnect.Classes.Add("danger");
+            var clipboard = Glass.Chip(new Avalonia.Controls.Primitives.ToggleButton { IsChecked = true }, "剪贴板", null, "clipboard");
+            var input = Glass.Chip(new Avalonia.Controls.Primitives.ToggleButton { IsChecked = true }, "键鼠", null, "mouse");
+            permissions.Children.Add(input); permissions.Children.Add(clipboard); permissions.Children.Add(disconnect);
+            detail.Text = $"{string.Join("、", addresses.Select(a => a.ToString()))}:{port}";
+            var header = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8 };
+            header.Children.Add(dot); header.Children.Add(status);
+            var content = new StackPanel();
+            content.Children.Add(header); content.Children.Add(detail); content.Children.Add(permissions); content.Children.Add(secureHelper);
+            detail.Margin = new Thickness(16, 2, 0, 0); secureHelper.Margin = new Thickness(0, 6, 0, 0);
+            card.Child = content;
+            card.PointerPressed += (_, e) =>
             {
-                if (e.Source is Border or StackPanel or TextBlock) BeginMoveDrag(e);
+                if (e.Source is Visual v && Avalonia.VisualTree.VisualExtensions.GetSelfAndVisualAncestors(v).Any(c => c is Button)) return;
+                moved = true; BeginMoveDrag(e);
             };
-            Content = surface;
+            Content = card;
+            ApplyColors();
+            PropertyChanged += (_, args) => { if (args.Property == ActualThemeVariantProperty) ApplyColors(); };
+            SizeChanged += (_, _) => { Glass.ClipRounded(this, 14); if (!moved) Dock(); };
             server = new(config, addresses, port, token, probeSamples);
             disconnect.Click += (_, _) => server.DisconnectActive();
             clipboard.IsCheckedChanged += (_, _) => server.SetClipboardAllowed(clipboard.IsChecked == true);
@@ -1157,8 +1164,9 @@ static class RemoteLaunch
             };
             server.ControllerChanged += address => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
             {
-                status.Text = address == null ? "FRD · 等待主控" : $"正在被 {address} 控制";
-                permissions.IsVisible = address != null;
+                controlled = address != null;
+                status.Text = address == null ? "等待主控" : $"正在被 {address} 控制";
+                permissions.IsVisible = controlled; UpdateDot();
             });
             server.Status += text => Avalonia.Threading.Dispatcher.UIThread.Post(() => ToolTip.SetTip(status, text));
             server.Failed += error => Avalonia.Threading.Dispatcher.UIThread.Post(() =>
@@ -1167,8 +1175,7 @@ static class RemoteLaunch
             {
                 try
                 {
-                    var screen = Screens.Primary?.WorkingArea;
-                    if (screen is { } area) Position = new(area.Right - (int)Width - 8, area.Bottom - (int)Height - 8);
+                    Dock();
                     var handle = TryGetPlatformHandle()?.Handle ?? 0;
                     if (handle == 0 || !SetWindowDisplayAffinity(handle, 0x11))
                         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),
@@ -1199,7 +1206,27 @@ static class RemoteLaunch
             secureHelper.IsEnabled = !helper.Running;
             secureHelper.Content = helper.Installed ? "启动/修复安全桌面辅助服务" : "安装安全桌面辅助服务";
             ToolTip.SetTip(secureHelper, helper.Message);
-            Height = helper.Running ? 50 : 76;
+        }
+
+        void Dock()
+        {
+            var screen = Screens.Primary?.WorkingArea;
+            if (screen is not { } area || Bounds.Height <= 0) return;
+            var scale = RenderScaling;
+            Position = new(area.Right - (int)(Bounds.Width * scale) - 12, area.Bottom - (int)(Bounds.Height * scale) - 12);
+        }
+
+        void UpdateDot() => dot.Fill = Glass.Brush(controlled ? palette.Good : palette.Warn);
+
+        void ApplyColors()
+        {
+            palette = Glass.For(true);
+            RequestedThemeVariant = Avalonia.Styling.ThemeVariant.Dark;
+            Foreground = Glass.Brush(palette.Text);
+            Styles.Clear(); Styles.AddRange(Glass.BuildStyles(palette));
+            card.Background = Glass.Brush(palette.Tint); card.BorderBrush = Glass.Brush(palette.Border);
+            detail.Foreground = Glass.Brush(palette.Subtle);
+            UpdateDot();
         }
 
         [DllImport("user32.dll", SetLastError = true)]

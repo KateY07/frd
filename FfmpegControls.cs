@@ -2,6 +2,8 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Data;
 using Avalonia.Input;
+using System.Diagnostics;
+using Avalonia.Controls.Primitives;
 using Avalonia.Interactivity;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -15,21 +17,27 @@ static partial class FfmpegUi
 {
     sealed partial class DesktopWindow
     {
-        const double OrbSize = 50, ChromeMargin = 12;
-        readonly Button fullScreen = new() { Name = "FullScreen", Content = "全屏", Padding = new Thickness(10, 4) };
-        readonly Button reconnect = new() { Name = "Reconnect", Content = "重新建立会话", IsVisible = false,
-            Padding = new Thickness(8, 2), Margin = new Thickness(8, 0, 0, 0) };
-        readonly CheckBox showWatermark = new() { Name = "ShowWatermark", Content = "诊断水印", IsChecked = true };
+        const double OrbSize = 50, ChromeMargin = 12, PanelRadius = 16, PanelMaxWidth = 460;
+        readonly Button fullScreen = Glass.Chip(new Button(), "全屏", "FullScreen", "expand", false);
+        readonly Button reconnect = Glass.Chip(new Button { IsVisible = false }, "重新建立会话", "Reconnect");
+        readonly Button disconnectButton = Glass.Chip(new Button(), "断开", "Disconnect", "power", false);
+        readonly ToggleButton moreButton = Glass.Chip(new ToggleButton(), "更多", "MoreSettings", "sliders", false);
+        readonly ToggleButton showWatermark = Glass.Chip(new ToggleButton { IsChecked = true }, "诊断水印", "ShowWatermark", "activity");
         readonly Button floatingOrb = new()
         {
             Name = "FloatingOrb", Content = "FRD", Width = OrbSize, Height = OrbSize,
             CornerRadius = new CornerRadius(OrbSize / 2), Padding = new Thickness(0), FontSize = 12,
-            Background = new SolidColorBrush(Color.Parse("#BE263445")), Foreground = Brushes.White,
-            BorderBrush = new SolidColorBrush(Color.Parse("#99CAD7E6")), BorderThickness = new Thickness(1),
-            IsVisible = false, Cursor = new Cursor(StandardCursorType.Hand)
+            BorderThickness = new Thickness(1), IsVisible = false, Cursor = new Cursor(StandardCursorType.Hand)
         };
-        readonly Border controlPanel = new() { CornerRadius = new CornerRadius(6), BorderThickness = new Thickness(1), Padding = new Thickness(12, 10) };
+        readonly Border controlPanel = new() { CornerRadius = new CornerRadius(PanelRadius), BorderThickness = new Thickness(1), Padding = new Thickness(8) };
         readonly Grid chromeRoot = new();
+        readonly Avalonia.Controls.Shapes.Ellipse statusDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
+        readonly TextBlock statusName = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 130,
+            TextTrimming = TextTrimming.CharacterEllipsis };
+        readonly StackPanel moreSection = new() { IsVisible = false, Margin = new Thickness(6, 0, 6, 4) };
+        readonly Avalonia.Controls.Shapes.Ellipse orbDot = new() { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 6, 0), IsHitTestVisible = false };
+        Glass.Palette palette = Glass.For(true);
         Point orbFraction = new(1, 0), panelFraction = new(.5, 0), orbDragOrigin;
         PixelPoint orbPointerOrigin, restorePosition;
         Size restoreSize;
@@ -40,54 +48,76 @@ static partial class FfmpegUi
         void BuildControls()
         {
             overlay.FontSize = 12;
-            presets.MinHeight = 28;
-            presets.Height = double.NaN;
-            presets.MinWidth = 130;
+            presets.MinHeight = 28; presets.Height = double.NaN; presets.MinWidth = 130;
             bitrate.VerticalAlignment = VerticalAlignment.Center;
-            controlTitle.Text = "编码预设"; controlTitle.FontSize = 11; controlTitle.Opacity = .75;
-            inputEnabled.Content = "键鼠"; inputEnabled.Margin = new Thickness(0);
-            clipboardEnabled.Content = "剪贴板"; packetDiagnostics.Margin = new Thickness(0);
-            collapse.Content = "收起"; collapse.MinWidth = 48; collapse.Padding = new Thickness(8, 4);
-            fullScreen.Height = collapse.Height = 28;
-            ToolTip.SetTip(fullScreen, "Ctrl+Alt+F11 切换全屏；Ctrl+Alt 退出键鼠控制");
-            ToolTip.SetTip(collapse, "收起为可拖动的悬浮球");
+            controlTitle.Text = "编码预设"; controlTitle.FontSize = 11;
+            bitrateLabel.FontSize = 11;
+            statusName.Text = remoteOptions?.Host ?? "本机演示";
+            ToolTip.SetTip(fullScreen, "Ctrl+Alt+F11 切换全屏");
+            ToolTip.SetTip(collapse, "收起为悬浮球（空闲 10 秒自动收起）");
+            ToolTip.SetTip(moreButton, "编码预设、码率、帧率与诊断");
+            ToolTip.SetTip(disconnectButton, "断开并关闭窗口");
             ToolTip.SetTip(floatingOrb, "点击展开控制栏；拖动移动，方向键微调");
-            ToolTip.SetTip(showWatermark, "只隐藏显示，不改变诊断包或统计");
+            ToolTip.SetTip(showWatermark, "在画面左下角显示延迟与流量；只隐藏显示，不改变诊断包或统计");
             ToolTip.SetTip(packetDiagnostics, "主控切换独立诊断包；关闭后跨机延迟不可测");
             ToolTip.SetTip(clipboardEnabled, clipboardMessage);
+            disconnectButton.Classes.Add("danger");
+            floatingOrb.Classes.Add("chip");
+            Glass.SetIcon(floatingOrb, "menu", null, 24); floatingOrb.Width = OrbSize; floatingOrb.Padding = new Thickness(0);
+            var orbIcon = (Control)floatingOrb.Content!; floatingOrb.Content = null;
+            floatingOrb.Content = new Grid { Width = OrbSize - 2, Height = OrbSize - 2, Children = { orbIcon, orbDot } };
 
-            var controls = new Grid { ColumnDefinitions = new("*,10,1.3*,10,Auto,6,Auto"), RowDefinitions = new("Auto,5,Auto") };
-            controls.Children.Add(controlTitle);
-            Grid.SetColumn(bitrateLabel, 2); controls.Children.Add(bitrateLabel);
-            Grid.SetRow(presets, 2); controls.Children.Add(presets);
-            Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 2); controls.Children.Add(bitrate);
-            Grid.SetColumn(fullScreen, 4); Grid.SetRow(fullScreen, 2); controls.Children.Add(fullScreen);
-            Grid.SetColumn(collapse, 6); Grid.SetRow(collapse, 2); controls.Children.Add(collapse);
-            Add(details, controls, 0);
-            presetMenu.CornerRadius = new CornerRadius(4);
-            presetMenu.Margin = new Thickness(0, 5, 0, 0);
-            Add(details, presetMenu, 1);
-            var options = new WrapPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 4) };
-            foreach (var check in new[] { inputEnabled, clipboardEnabled, showWatermark, packetDiagnostics })
-            {
-                check.FontSize = 12; check.MinHeight = 24; check.Margin = new Thickness(0, 0, 16, 0);
-                options.Children.Add(check);
-            }
-            options.Children.Add(new TextBlock { Text = "FPS", VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 5, 0), Opacity = .75 });
+            details.RowDefinitions = new("Auto,Auto");
+            var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+            foreach (var chip in new Button[] { inputEnabled, clipboardEnabled, fullScreen, moreButton, disconnectButton, collapse })
+                actions.Children.Add(chip);
+            var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Margin = new Thickness(8, 0, 12, 0),
+                VerticalAlignment = VerticalAlignment.Center };
+            status.Children.Add(statusDot); status.Children.Add(statusName);
+            var bar = new Grid { ColumnDefinitions = new("*,Auto") };
+            bar.Children.Add(status);
+            Grid.SetColumn(actions, 1); bar.Children.Add(actions);
+            Add(details, bar, 0);
+
+            moreSection.Children.Add(Glass.Divider(palette));
+            var encoder = new Grid { ColumnDefinitions = new("*,12,*"), RowDefinitions = new("Auto,4,Auto") };
+            encoder.Children.Add(controlTitle);
+            Grid.SetColumn(bitrateLabel, 2); encoder.Children.Add(bitrateLabel);
+            Grid.SetRow(presets, 2); encoder.Children.Add(presets);
+            Grid.SetColumn(bitrate, 2); Grid.SetRow(bitrate, 2); encoder.Children.Add(bitrate);
+            moreSection.Children.Add(encoder);
+            presetMenu.CornerRadius = new CornerRadius(8); presetMenu.Margin = new Thickness(0, 6, 0, 0);
+            moreSection.Children.Add(presetMenu);
+            var frames = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Margin = new Thickness(0, 10, 0, 0) };
+            frames.Children.Add(new TextBlock { Text = "帧率", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0), Opacity = .75 });
             foreach (var button in fpsButtons)
             {
-                button.Margin = new Thickness(0, 0, 3, 0);
-                options.Children.Add(button);
+                Glass.Chip(button, button.Content?.ToString() ?? "", button.Name);
+                button.Padding = new Thickness(0); button.MinWidth = 36; button.Width = 36;
+                frames.Children.Add(button);
             }
-            Add(details, options, 2);
+            moreSection.Children.Add(frames);
+            var options = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 10, 0, 0) };
+            options.Children.Add(packetDiagnostics); options.Children.Add(showWatermark);
+            moreSection.Children.Add(options);
             operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
             operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
             operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
-            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto") };
+            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+            operation.VerticalAlignment = VerticalAlignment.Center;
             connectionRow.Children.Add(operation);
             Grid.SetColumn(reconnect, 1); connectionRow.Children.Add(reconnect);
-            Add(details, connectionRow, 3);
+            moreSection.Children.Add(connectionRow);
+            Add(details, moreSection, 1);
+            operation.PropertyChanged += (_, args) => { if (args.Property == TextBlock.TextProperty) UpdateStatusDot(); };
+            moreButton.IsCheckedChanged += (_, _) => { moreSection.IsVisible = moreButton.IsChecked == true; PositionOverlay(); };
+            disconnectButton.Click += (_, _) => Close();
+            collapse.Click += (_, _) => AnimateChrome(true);
+            chromeRoot.AddHandler(PointerMovedEvent, (_, _) => Touch(), RoutingStrategies.Tunnel);
+            chromeRoot.AddHandler(PointerPressedEvent, (_, _) => Touch(), RoutingStrategies.Tunnel);
+            chromeRoot.AddHandler(KeyDownEvent, (_, _) => Touch(), RoutingStrategies.Tunnel);
+            idleTimer.Tick += (_, _) => CheckIdle();
+
             controlPanel.Child = details;
             chromeRoot.Children.Add(controlPanel); chromeRoot.Children.Add(floatingOrb);
             overlay.Content = chromeRoot;
@@ -98,7 +128,7 @@ static partial class FfmpegUi
             watermark.Content = new Border
             {
                 Background = new SolidColorBrush(Color.Parse("#8017202B")),
-                CornerRadius = new CornerRadius(4), Padding = new Thickness(10, 7), Child = diagnosticBody,
+                CornerRadius = new CornerRadius(8), Padding = new Thickness(10, 7), Child = diagnosticBody,
                 IsHitTestVisible = false, ClipToBounds = true
             };
             summary.FontSize = 12; diagnosticBody.Children.Add(summary);
@@ -122,7 +152,7 @@ static partial class FfmpegUi
             Deactivated += (_, _) => fullScreenKeyHeld = false;
             overlay.Deactivated += (_, _) => fullScreenKeyHeld = false;
             showWatermark.IsCheckedChanged += (_, _) => SyncChromeVisibility();
-            floatingOrb.Click += (_, _) => ToggleDetails();
+            floatingOrb.Click += (_, _) => AnimateChrome(false);
             ToolTip.SetTip(presets, "单击展开控制栏内的预设列表；也可用键盘选择");
             presets.AddHandler(PointerReleasedEvent, (_, args) =>
             {
@@ -144,22 +174,108 @@ static partial class FfmpegUi
             };
         }
 
+        static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(10);
+        const int AnimationMs = 240;
+        readonly DispatcherTimer idleTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+        long lastActivity = Environment.TickCount64;
+        bool animating;
+
+        void Touch() => lastActivity = Environment.TickCount64;
+
+        void CheckIdle()
+        {
+            if (stopping || animating || !details.IsVisible || orbPointer != null || chromeRoot.IsPointerOver) return;
+            if (autoCloseSeconds > 0 || InteractionScriptPath != null) return;
+            if (Environment.TickCount64 - lastActivity >= IdleDelay.TotalMilliseconds) AnimateChrome(true);
+        }
+
+        static double Ease(double t) => 1 - Math.Pow(1 - t, 3);
+
+        /// <summary>Animates the overlay window between the bar and the orb; the plain ToggleDetails stays instant.</summary>
+        async void AnimateChrome(bool toOrb)
+        {
+            if (animating || stopping || details.IsVisible == !toOrb) return;
+            animating = true;
+            try
+            {
+                Touch();
+                var panelWidth = Math.Max(280, Math.Min(PanelMaxWidth, ClientSize.Width - ChromeMargin * 2));
+                double panelHeight;
+                Rect from, to;
+                if (toOrb)
+                {
+                    panelHeight = overlay.ClientSize.Height;
+                    from = new Rect(PanelPosition(), new Size(panelWidth, panelHeight));
+                    to = new Rect(OrbPosition(), new Size(OrbSize, OrbSize));
+                }
+                else
+                {
+                    var orbRect = new Rect(OrbPosition(), new Size(OrbSize, OrbSize));
+                    details.IsVisible = true; controlPanel.IsVisible = true; floatingOrb.IsVisible = false;
+                    controlPanel.Width = panelWidth; controlPanel.Measure(new Size(panelWidth, double.PositiveInfinity));
+                    panelHeight = controlPanel.DesiredSize.Height;
+                    from = orbRect;
+                    var topLeft = new Point(ChromeMargin + panelFraction.X * Math.Max(0, ClientSize.Width - panelWidth - ChromeMargin * 2),
+                        ChromeMargin + panelFraction.Y * Math.Max(0, ClientSize.Height - panelHeight - ChromeMargin * 2));
+                    to = new Rect(topLeft, new Size(panelWidth, panelHeight));
+                }
+                controlPanel.Width = panelWidth; controlPanel.HorizontalAlignment = HorizontalAlignment.Right;
+                controlPanel.VerticalAlignment = VerticalAlignment.Top;
+                floatingOrb.HorizontalAlignment = HorizontalAlignment.Left; floatingOrb.VerticalAlignment = VerticalAlignment.Top;
+                floatingOrb.IsVisible = true; floatingOrb.Opacity = toOrb ? 0 : 1;
+                overlay.SizeToContent = SizeToContent.Manual;
+                var clock = Stopwatch.StartNew();
+                while (!stopping)
+                {
+                    var t = Math.Min(1, clock.ElapsedMilliseconds / (double)AnimationMs);
+                    var e = Ease(t);
+                    double Lerp(double a, double b) => a + (b - a) * e;
+                    var frame = new Rect(Lerp(from.X, to.X), Lerp(from.Y, to.Y), Lerp(from.Width, to.Width), Lerp(from.Height, to.Height));
+                    overlay.Width = Math.Max(1, frame.Width); overlay.Height = Math.Max(1, frame.Height);
+                    overlay.Position = this.PointToScreen(frame.TopLeft);
+                    var radius = toOrb ? Lerp(PanelRadius, OrbSize / 2) : Lerp(OrbSize / 2, PanelRadius);
+                    Glass.ClipRounded(overlay, radius);
+                    controlPanel.Opacity = toOrb ? 1 - e : e;
+                    floatingOrb.Opacity = toOrb ? e : 1 - e;
+                    if (t >= 1) break;
+                    await Task.Delay(12);
+                }
+            }
+            finally
+            {
+                controlPanel.ClearValue(WidthProperty); controlPanel.ClearValue(OpacityProperty);
+                controlPanel.HorizontalAlignment = HorizontalAlignment.Stretch; controlPanel.VerticalAlignment = VerticalAlignment.Stretch;
+                floatingOrb.ClearValue(OpacityProperty); floatingOrb.ClearValue(HorizontalAlignmentProperty); floatingOrb.ClearValue(VerticalAlignmentProperty);
+                floatingOrb.IsVisible = toOrb;
+                overlay.SizeToContent = SizeToContent.Height;
+                animating = false;
+                if (!stopping)
+                {
+                    if (details.IsVisible == toOrb) ToggleDetails();
+                    else PositionOverlay();
+                    Touch();
+                }
+            }
+        }
+
+        void SetMore(bool open) { moreButton.IsChecked = open; moreSection.IsVisible = open; PositionOverlay(); }
+
+        void UpdateStatusDot()
+        {
+            var text = operation.Text ?? "";
+            var color = text.Contains("中断") || text.StartsWith("错误") || text.Contains("失败") ? palette.Bad
+                : text.StartsWith("已连接") || text.StartsWith("已应用") || text.Contains("已启用") || text.Contains("已开启") ? palette.Good : palette.Warn;
+            if (text.StartsWith("正在", StringComparison.Ordinal) && statusDot.Fill != null) return;
+            statusDot.Fill = orbDot.Fill = Glass.Brush(color);
+        }
+
         void RebuildPresetMenu()
         {
             var choices = new StackPanel { Spacing = 2, Margin = new Thickness(4) };
             foreach (var item in presets.Items.OfType<ComboBoxItem>())
             {
-                var choice = new Button
-                {
-                    Content = item.Content, Tag = item.Tag, IsEnabled = item.IsEnabled,
-                    HorizontalContentAlignment = HorizontalAlignment.Left,
-                    HorizontalAlignment = HorizontalAlignment.Stretch,
-                    MinHeight = 27, Padding = new Thickness(8, 3),
-                    Background = Brushes.Transparent, BorderBrush = Brushes.Transparent, BorderThickness = new Thickness(0)
-                };
-                choice.PointerEntered += (_, _) => choice.Background = new SolidColorBrush(Color.Parse(
-                    ActualThemeVariant == ThemeVariant.Dark ? "#334D5A69" : "#E8EDF3"));
-                choice.PointerExited += (_, _) => choice.Background = Brushes.Transparent;
+                var choice = Glass.Chip(new Button { Tag = item.Tag, IsEnabled = item.IsEnabled }, item.Content?.ToString() ?? "");
+                choice.HorizontalContentAlignment = HorizontalAlignment.Left; choice.HorizontalAlignment = HorizontalAlignment.Stretch;
                 choice.Click += (_, _) =>
                 {
                     presets.SelectedItem = item;
@@ -168,19 +284,29 @@ static partial class FfmpegUi
                 };
                 choices.Children.Add(choice);
             }
-            presetMenu.Child = new ScrollViewer { Content = choices, MaxHeight = 220, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
+            presetMenu.Child = new ScrollViewer { Content = choices, MaxHeight = 200, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled };
         }
 
         void ApplyChromeColors()
         {
-            var dark = ActualThemeVariant == ThemeVariant.Dark;
-            overlay.RequestedThemeVariant = ActualThemeVariant;
-            overlay.Foreground = new SolidColorBrush(Color.Parse(dark ? "#EDF0F3" : "#20252B"));
-            controlPanel.Background = new SolidColorBrush(Color.Parse(dark ? "#222529" : "#FAFAFA"));
-            controlPanel.BorderBrush = new SolidColorBrush(Color.Parse(dark ? "#484E56" : "#D7DCE1"));
-            presetMenu.Background = controlPanel.Background;
-            presetMenu.BorderBrush = controlPanel.BorderBrush;
-            presetMenu.BorderThickness = new Thickness(1);
+            palette = Glass.For(true);
+            overlay.RequestedThemeVariant = ThemeVariant.Dark;
+            overlay.Foreground = Glass.Brush(palette.Text);
+            overlay.Styles.Clear(); overlay.Styles.AddRange(Glass.BuildStyles(palette));
+            controlPanel.Background = Glass.Brush(palette.Tint);
+            controlPanel.BorderBrush = Glass.Brush(palette.Border);
+            floatingOrb.Background = Glass.Brush(palette.Tint);
+            floatingOrb.BorderBrush = Glass.Brush(palette.Border);
+            floatingOrb.Foreground = Glass.Brush(palette.Text);
+            floatingOrb.BorderBrush = Glass.Brush(palette.Border);
+            presets.Background = Glass.Brush(palette.Hover); presets.BorderThickness = new Thickness(0); presets.CornerRadius = new CornerRadius(8);
+            presetMenu.Background = Glass.Brush(palette.Hover);
+            presetMenu.BorderBrush = Brushes.Transparent;
+            statusName.Foreground = Glass.Brush(palette.Subtle);
+            controlTitle.Foreground = bitrateLabel.Foreground = Glass.Brush(palette.Subtle);
+            foreach (var divider in moreSection.Children.OfType<Border>().Where(child => child.Height == 1)) divider.Background = Glass.Brush(palette.Line);
+            statusDot.Fill = null; UpdateStatusDot();
+            UpdateFpsButtons();
         }
 
         void HandleLocalKeyDown(object? sender, KeyEventArgs args)
@@ -211,11 +337,11 @@ static partial class FfmpegUi
             if (WindowState != WindowState.FullScreen)
             {
                 restoreState = WindowState; restoreSize = new(Width, Height); restorePosition = Position;
-                WindowState = WindowState.FullScreen; fullScreen.Content = "退出全屏";
+                WindowState = WindowState.FullScreen; Glass.SetIcon(fullScreen, "shrink"); ToolTip.SetTip(fullScreen, "退出全屏（Ctrl+Alt+F11）");
             }
             else
             {
-                WindowState = restoreState; fullScreen.Content = "全屏";
+                WindowState = restoreState; Glass.SetIcon(fullScreen, "expand"); ToolTip.SetTip(fullScreen, "全屏（Ctrl+Alt+F11）");
                 if (restoreState == WindowState.Normal)
                     Dispatcher.UIThread.Post(() =>
                     {
@@ -284,7 +410,7 @@ static partial class FfmpegUi
             if (orbPointer != args.Pointer || args.InitialPressMouseButton != MouseButton.Left) return;
             var moved = orbDragged; orbPointer = null; args.Pointer.Capture(null);
             args.Handled = true;
-            if (!moved && !dragExpanded) ToggleDetails();
+            if (!moved && !dragExpanded) AnimateChrome(false);
         }
 
         void SyncChromeVisibility()
@@ -299,9 +425,11 @@ static partial class FfmpegUi
 
         void PositionOverlay()
         {
+            if (animating) return;
             if (!overlay.IsVisible || ClientSize.Width <= 0) return;
-            overlay.Width = details.IsVisible ? Math.Max(280, Math.Min(980, ClientSize.Width - ChromeMargin * 2)) : OrbSize;
+            overlay.Width = details.IsVisible ? Math.Max(280, Math.Min(PanelMaxWidth, ClientSize.Width - ChromeMargin * 2)) : OrbSize;
             overlay.Position = this.PointToScreen(details.IsVisible ? PanelPosition() : OrbPosition());
+            Glass.ClipRounded(overlay, details.IsVisible ? PanelRadius : OrbSize / 2);
             if (!watermark.IsVisible) return;
             watermark.Width = Math.Max(280, Math.Min(920, ClientSize.Width - ChromeMargin * 2));
             watermark.MaxHeight = Math.Max(40, ClientSize.Height - (details.IsVisible ? overlay.ClientSize.Height : 0) - ChromeMargin * 3);
