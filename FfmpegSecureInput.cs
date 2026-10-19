@@ -142,7 +142,7 @@ sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
     {
         this.ordinary = ordinary;
         this.secureActive = secureActive;
-        if (File.Exists(SecureDesktopUdp.KeyPath)) secure = new(SecureDesktopUdp.ReadKey());
+        if (File.Exists(SecureDesktopUdp.KeyPath) && SecureDesktopUdp.TryReadKey("secure input") is { } key) secure = new(key);
         else Console.Error.WriteLine("[secure input] SYSTEM helper key absent; ordinary desktop input remains available.");
         heartbeat = new(_ => Heartbeat(), null, Timeout.Infinite, Timeout.Infinite);
     }

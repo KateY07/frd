@@ -111,9 +111,10 @@ static partial class RemoteLaunch
             {
                 secureHelper.IsEnabled = false;
                 secureHelper.Content = "等待管理员确认…";
-                try { await SecureDesktopService.InstallViaUacAsync(); RefreshSecureHelper(); }
+                try { await SecureDesktopService.InstallViaUacAsync(); SessionTrace.Event("secure-helper", "refresh-ui"); RefreshSecureHelper(); SessionTrace.Event("secure-helper", "refresh-ui-done"); }
                 catch (Exception error)
                 {
+                    SessionTrace.Error("secure-helper", error);
                     Console.Error.WriteLine("[secure helper] Installation failed: " + error);
                     secureHelper.Content = "安装失败，点击重试";
                     secureHelper.IsEnabled = true;

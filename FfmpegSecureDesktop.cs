@@ -13,6 +13,17 @@ static class SecureDesktopUdp
     public static string KeyPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "FRD", "SecureDesktopProbe", "capture.key");
 
+    /// <summary>Reads the key if this account may; a key protected for another account must not take the host down.</summary>
+    public static byte[]? TryReadKey(string caller)
+    {
+        try { return ReadKey(); }
+        catch (Exception error) when (error is UnauthorizedAccessException or IOException or InvalidDataException)
+        {
+            Console.Error.WriteLine($"[secure helper] {caller}: cannot read the SYSTEM helper key ({error.GetType().Name}: {error.Message}); secure-desktop features are off for this session.");
+            return null;
+        }
+    }
+
     public static byte[] ReadKey()
     {
         var key = File.ReadAllBytes(KeyPath);
@@ -90,10 +101,9 @@ sealed class SecureDesktopFrames : IDisposable
             if (!quiet) Console.Error.WriteLine("[secure capture] UDP helper key is absent; secure desktop capture is unavailable.");
             return null;
         }
-        return new(ReadKeyForHost());
+        return SecureDesktopUdp.TryReadKey("secure capture") is { } key ? new(key) : null;
     }
 
-    static byte[] ReadKeyForHost() => SecureDesktopUdp.ReadKey();
 
     internal SecureDesktopFrames(byte[] key, bool useShared = true)
     {

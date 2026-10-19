@@ -1096,6 +1096,8 @@ static partial class RemoteLaunch
         public override void Initialize() => Styles.Add(new SimpleTheme());
         public override void OnFrameworkInitializationCompleted()
         {
+            // The host window keeps running through a failed UI callback; the error goes to the crash log instead of ending the process.
+            Avalonia.Threading.Dispatcher.UIThread.UnhandledException += (_, e) => { CrashLog.Write("host-ui-exception", e.Exception); e.Handled = true; };
             if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop) desktop.MainWindow = Factory!();
             base.OnFrameworkInitializationCompleted();
         }

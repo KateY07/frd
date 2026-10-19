@@ -57,20 +57,48 @@ internal static class SecureDesktopService
     internal static async Task InstallViaUacAsync()
     {
         var executable = Environment.ProcessPath ?? throw new InvalidOperationException("FRD executable path is unavailable.");
-        using var process = Process.Start(new ProcessStartInfo(executable, "--install-secure-helper")
+        // The elevated process may run as a different (administrator) account, so name the interactive user explicitly.
+        var sid = WindowsIdentity.GetCurrent().User?.Value ?? throw new InvalidOperationException("Current user SID is unavailable.");
+        SessionTrace.Event("secure-helper", "install-requested");
+        try { File.Delete(InstallErrorPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        using var process = Process.Start(new ProcessStartInfo(executable, $"--install-secure-helper {sid}")
         {
             UseShellExecute = true, Verb = "runas", WorkingDirectory = AppContext.BaseDirectory
         }) ?? throw new InvalidOperationException("Could not start the elevated FRD installer.");
+        SessionTrace.Event("secure-helper", "elevated-installer-started");
         await process.WaitForExitAsync();
-        if (process.ExitCode != 0) throw new InvalidOperationException($"安全桌面辅助服务安装失败，退出码 {process.ExitCode}。");
+        SessionTrace.Event("secure-helper", $"elevated-installer-exited-{process.ExitCode}");
+        if (process.ExitCode != 0)
+        {
+            string? reason = null;
+            try { reason = File.ReadLines(InstallErrorPath).FirstOrDefault(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            throw new InvalidOperationException($"安全桌面辅助服务安装失败，退出码 {process.ExitCode}。" + (reason == null ? "" : " " + reason));
+        }
         var status = Status();
+        SessionTrace.Event("secure-helper", status.Running ? "service-running" : "service-not-running");
         if (!status.Running) throw new InvalidOperationException(status.Message);
     }
 
-    internal static int Install()
+    static string InstallErrorPath => Path.Combine(DataDirectory, "install-error.txt");
+
+    /// <summary>Elevated entry point. <paramref name="userSid"/> is the interactive user who should read the capture key.</summary>
+    internal static int Install(string? userSid = null)
     {
+        try { return InstallCore(userSid); }
+        catch (Exception error)
+        {
+            try { Directory.CreateDirectory(DataDirectory); File.WriteAllText(InstallErrorPath, error.GetType().Name + ": " + error.Message + "\n" + error); }
+            catch (Exception) { /* the exit code still tells the caller it failed */ }
+            throw;
+        }
+    }
+
+    static int InstallCore(string? userSid)
+    {
+        if (userSid != null && !System.Text.RegularExpressions.Regex.IsMatch(userSid, @"^S-1-\d+(-\d+)+$"))
+            throw new ArgumentException("Invalid user SID.");
         var executable = Environment.ProcessPath ?? throw new InvalidOperationException("FRD executable path is unavailable.");
-        PrepareStorage();
+        PrepareStorage(userSid);
         var manager = OpenSCManager(null, null, ScManagerConnect | ScManagerCreateService);
         if (manager == 0) throw Win32("OpenSCManager");
         try
@@ -104,14 +132,14 @@ internal static class SecureDesktopService
         finally { CloseServiceHandle(manager); }
     }
 
-    static void PrepareStorage()
+    static void PrepareStorage(string? userSid)
     {
         Directory.CreateDirectory(DataDirectory);
         var key = SecureDesktopUdp.KeyPath;
         if (!File.Exists(key)) File.WriteAllBytes(key, RandomNumberGenerator.GetBytes(32));
         var framePath = SecureDesktopShared.PathName;
         using (var frame = new FileStream(framePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite)) frame.SetLength(SecureDesktopShared.Capacity);
-        var sid = WindowsIdentity.GetCurrent().User?.Value ?? throw new InvalidOperationException("Current user SID is unavailable.");
+        var sid = userSid ?? WindowsIdentity.GetCurrent().User?.Value ?? throw new InvalidOperationException("Current user SID is unavailable.");
         Restrict(key, sid, "R");
         Restrict(framePath, sid, "F");
     }

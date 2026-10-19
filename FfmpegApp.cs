@@ -648,6 +648,7 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        CrashLog.Install();
         try
         {
             if (args is ["--help"] or ["--help-window"]) { RemoteLaunch.Help(args[0] == "--help-window"); return 0; }
@@ -658,6 +659,7 @@ static class Program
                 return 0;
             }
             if (args is ["--install-secure-helper"]) return SecureDesktopService.Install();
+            if (args is ["--install-secure-helper", var userSid]) return SecureDesktopService.Install(userSid);
             if (args is ["--secure-service"]) return SecureDesktopService.RunService();
             if (args is ["--secure-worker"]) { SecureDesktopService.RunWorker(); return 0; }
             if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
