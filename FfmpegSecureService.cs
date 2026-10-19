@@ -118,7 +118,7 @@ internal static class SecureDesktopService
 
     static void Restrict(string path, string sid, string userAccess)
     {
-        using var process = Process.Start(new ProcessStartInfo("icacls.exe", $"\"{path}\" /inheritance:r /grant:r \"SYSTEM:(F)\" \"{sid}:({userAccess})\"")
+        using var process = Process.Start(new ProcessStartInfo("icacls.exe", $"\"{path}\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" \"*{sid}:({userAccess})\"")
         { UseShellExecute = false, CreateNoWindow = true }) ?? throw new InvalidOperationException("Could not start icacls.");
         process.WaitForExit();
         if (process.ExitCode != 0) throw new InvalidOperationException($"Could not protect {Path.GetFileName(path)} (icacls exit {process.ExitCode}).");
