@@ -39,6 +39,7 @@ static partial class RemoteLaunch
         readonly ToggleButton clipboard = Glass.Chip(new ToggleButton { IsChecked = true, IsVisible = false }, "剪贴板", "HostClipboard", "clipboard", false);
         readonly Button disconnect = Glass.Chip(new Button { IsVisible = false }, "断开", "HostDisconnect", "power", false);
         readonly ToggleButton more = Glass.Chip(new ToggleButton(), "更多", "HostMore", "sliders", false);
+        readonly Button quit = Glass.Chip(new Button { HorizontalAlignment = HorizontalAlignment.Left }, "退出被控端", "HostQuit", "power");
         readonly Button collapse = Glass.Chip(new Button(), "收起", "HostCollapse", "chevrons", false);
         readonly Button orb = new() { Name = "HostOrb", Width = OrbSize, Height = OrbSize, CornerRadius = new CornerRadius(OrbSize / 2),
             Padding = new Thickness(0), BorderThickness = new Thickness(1), IsVisible = false, Cursor = new Cursor(StandardCursorType.Hand) };
@@ -50,6 +51,7 @@ static partial class RemoteLaunch
         Glass.Palette palette = Glass.For(true);
         DateTime connectedAt;
         long lastActivity = Environment.TickCount64;
+        DateTime closingSince;
         bool closing, finished, moved, controlled, expanded = true, animating;
 
         public HostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
@@ -90,6 +92,8 @@ static partial class RemoteLaunch
             moreSection.Children.Add(Row("会话时长", durationValue));
             moreSection.Children.Add(Row("安全桌面服务", helperValue));
             secureHelper.Margin = new Thickness(-6, 4, 0, 0); moreSection.Children.Add(secureHelper);
+            quit.Classes.Add("danger"); quit.Margin = new Thickness(-6, 4, 0, 0); moreSection.Children.Add(quit);
+            ToolTip.SetTip(quit, "停止监听并退出被控端（正在被控制时会先断开）");
             var stack = new StackPanel(); stack.Children.Add(bar); stack.Children.Add(moreSection);
             card.Child = stack;
             root.ClipToBounds = true; root.Children.Add(card); root.Children.Add(orb);
@@ -102,6 +106,7 @@ static partial class RemoteLaunch
             input.IsCheckedChanged += (_, _) => server.SetInputAllowed(input.IsChecked == true);
             more.IsCheckedChanged += (_, _) => { moreSection.IsVisible = more.IsChecked == true; Touch(); };
             collapse.Click += (_, _) => Animate(true);
+            quit.Click += (_, _) => Close();
             secureHelper.Click += async (_, _) =>
             {
                 secureHelper.IsEnabled = false;
@@ -161,8 +166,11 @@ static partial class RemoteLaunch
             Closing += async (_, e) =>
             {
                 if (finished) return;
-                e.Cancel = true; if (closing) return; closing = true; tick.Stop();
-                try { await server.DisposeAsync(); }
+                e.Cancel = true;
+                if (closing) { if (DateTime.UtcNow - closingSince > TimeSpan.FromSeconds(2)) ShutdownGuard.Kill("host"); return; }
+                closing = true; closingSince = DateTime.UtcNow; tick.Stop();
+                ShutdownGuard.Arm("host", TimeSpan.FromSeconds(10));
+                try { await ShutdownGuard.Bounded(() => server.DisposeAsync().AsTask(), "host-server", TimeSpan.FromSeconds(6)); }
                 catch (Exception error) { Console.Error.WriteLine(error); hostExitCode = 1; }
                 finally { finished = true; Dispatcher.UIThread.Post(Close); }
             };

@@ -110,6 +110,7 @@ static partial class FfmpegUi
         bool updatingInput, changingDiagnostics, updatingDiagnostics;
         long inputSent, inputRejected, coalescedMoves;
         SessionStatus? pendingStatus;
+        DateTime stoppingSince;
         bool started, stopping, allowClose, applying, applyAgain, disconnected, restartRequested, scheduledClose;
         long receivedFrames, shownFrames;
         int successfulChanges;
@@ -600,20 +601,28 @@ static partial class FfmpegUi
         {
             if (allowClose) return;
             args.Cancel = true;
-            if (stopping) return;
-            stopping = true; debounce.Stop(); autoClose.Stop();
+            if (stopping)
+            {
+                // A second close request after the graceful path has been stuck for a while means "just close it".
+                if (DateTime.UtcNow - stoppingSince > TimeSpan.FromSeconds(2)) ShutdownGuard.Kill("controller");
+                return;
+            }
+            stopping = true; stoppingSince = DateTime.UtcNow; debounce.Stop(); autoClose.Stop();
+            ShutdownGuard.Arm("controller", TimeSpan.FromSeconds(10));
             SessionTrace.Event("window", disconnected ? "closing-after-disconnect" : scheduledClose ? "closing-scheduled" : "closing-by-user-or-test");
-            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭捕获、FFmpeg 与 UDP…";
-            try { await SetClipboardAsync(false); } catch (Exception ex) { ReportError(ex); }
-            try { if (cursorClient != null) await cursorClient.DisposeAsync(); } catch (Exception ex) { ReportError(ex); }
-            try { await StopInputAsync(); } catch (Exception ex) { ReportError(ex); }
-            try { if (session != null) await session.StopAsync(); }
+            presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭…（再次点击关闭可强制退出）";
+            var sessionStopped = true;
+            try { await ShutdownGuard.Bounded(() => SetClipboardAsync(false), "clipboard"); } catch (Exception ex) { ReportError(ex); }
+            try { if (cursorClient != null) await ShutdownGuard.Bounded(() => cursorClient.DisposeAsync().AsTask(), "cursor"); } catch (Exception ex) { ReportError(ex); }
+            try { await ShutdownGuard.Bounded(StopInputAsync, "input"); } catch (Exception ex) { ReportError(ex); }
+            try { if (session != null) sessionStopped = await ShutdownGuard.Bounded(() => session.StopAsync(), "session", TimeSpan.FromSeconds(5)); }
             catch (Exception ex) { ReportError(ex); }
             finally
             {
                 refresh.Stop(); idleTimer.Stop();
                 preview.Stop();
-                try { session?.Dispose(); } catch (Exception ex) { ReportError(ex); }
+                // Dispose() waits for the same stop task, so skip it if that task is still stuck; the process exit reclaims it.
+                try { if (sessionStopped) session?.Dispose(); } catch (Exception ex) { ReportError(ex); }
                 captureBackend = capture?.Backend; captureStatistics = capture?.Statistics;
                 try { capture?.Dispose(); } catch (Exception ex) { ReportError(ex); }
                 WriteReport(); allowClose = true;
