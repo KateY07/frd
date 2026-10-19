@@ -22,7 +22,7 @@ static class Glass
     public static readonly WindowTransparencyLevel[] Levels = [WindowTransparencyLevel.AcrylicBlur, WindowTransparencyLevel.Transparent];
 
     public static Palette For(bool dark) => dark
-        ? new(Color.Parse("#80181C24"), Color.Parse("#2EFFFFFF"), Color.Parse("#F2F5F9"), Color.Parse("#B4BCC8"),
+        ? new(Color.Parse("#A6161A22"), Color.Parse("#2EFFFFFF"), Color.Parse("#F2F5F9"), Color.Parse("#CCD3DC"),
             Color.Parse("#26FFFFFF"), Color.Parse("#66528CFF"), Color.Parse("#E6EEFF"), Color.Parse("#26FFFFFF"),
             Color.Parse("#3DD68C"), Color.Parse("#F5B84A"), Color.Parse("#F06A66"))
         : new(Color.Parse("#8CFFFFFF"), Color.Parse("#A6FFFFFF"), Color.Parse("#1D2530"), Color.Parse("#4F5B6B"),
@@ -30,6 +30,9 @@ static class Glass
             Color.Parse("#1E9E5E"), Color.Parse("#B7791F"), Color.Parse("#D64540"));
 
     public static IBrush Brush(Color color) => new SolidColorBrush(color);
+
+    /// <summary>Hovering the orb must keep it glass: raise the tint slightly instead of swapping in a near-transparent wash.</summary>
+    static Color Lift(Color c) => Color.FromArgb(c.A, (byte)Math.Min(255, c.R + 18), (byte)Math.Min(255, c.G + 18), (byte)Math.Min(255, c.B + 22));
 
     public static Styles BuildStyles(Palette p)
     {
@@ -49,6 +52,10 @@ static class Glass
             On(x => x.Is<ToggleButton>().Class("chip").Class(":checked").Template().OfType<ContentPresenter>().Name(Part),
                 (ContentPresenter.BackgroundProperty, Brush(p.Checked)),
                 (ContentPresenter.ForegroundProperty, Brush(p.CheckedText))),
+            On(x => x.Is<Button>().Class("orb").Class(":pointerover").Template().OfType<ContentPresenter>().Name(Part),
+                (ContentPresenter.BackgroundProperty, Brush(Lift(p.Tint)))),
+            On(x => x.Is<Button>().Class("orb").Class(":pressed").Template().OfType<ContentPresenter>().Name(Part),
+                (ContentPresenter.BackgroundProperty, Brush(Lift(p.Tint)))),
             On(x => x.Is<Button>().Class("chip").Class(":disabled"), (Visual.OpacityProperty, .45)),
             On(x => x.Is<Button>().Class("danger").Class(":pointerover").Template().OfType<ContentPresenter>().Name(Part),
                 (ContentPresenter.BackgroundProperty, Brush(p.Bad)),
@@ -65,6 +72,7 @@ static class Glass
         ["sliders"] = "M3 8 H5.5 M10.5 8 H21 M3 16 H13.5 M18.5 16 H21 M10.5 8 A2.5 2.5 0 1 0 5.5 8 A2.5 2.5 0 1 0 10.5 8 M18.5 16 A2.5 2.5 0 1 0 13.5 16 A2.5 2.5 0 1 0 18.5 16",
         ["power"] = "M12 3 V12 M7 6.5 A8 8 0 1 0 17 6.5",
         ["chevrons"] = "M6 6 L12 12 L6 18 M13 6 L19 12 L13 18",
+        ["monitor"] = "M3 5 H21 V16 H3 Z M8 20 H16 M12 16 V20",
         ["menu"] = "M4 7 H20 M4 12 H20 M4 17 H20",
         ["activity"] = "M3 12 H7 L10 5 L14 19 L17 12 H21",
         ["pulse"] = "M4 12 H8 L10.5 6 L13.5 18 L16 12 H20"
@@ -113,7 +121,7 @@ static class Glass
         return button;
     }
 
-    public static Border Divider(Palette p) => new() { Height = 1, Background = Brush(p.Line), Margin = new Thickness(0, 8) };
+    public static Border Divider(Palette p) => new() { Height = 1, Background = Brush(p.Line), Margin = new Thickness(0, 4) };
 
     [DllImport("gdi32.dll")] static extern nint CreateRoundRectRgn(int left, int top, int right, int bottom, int width, int height);
     [DllImport("user32.dll")] static extern int SetWindowRgn(nint window, nint region, [MarshalAs(UnmanagedType.Bool)] bool redraw);

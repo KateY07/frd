@@ -17,7 +17,7 @@ static partial class FfmpegUi
 {
     sealed partial class DesktopWindow
     {
-        const double OrbSize = 50, ChromeMargin = 12, PanelRadius = 16, PanelMaxWidth = 460;
+        const double OrbSize = 50, ChromeMargin = 12, PanelRadius = 16, PanelMaxWidth = 420;
         readonly Button fullScreen = Glass.Chip(new Button(), "全屏", "FullScreen", "expand", false);
         readonly Button reconnect = Glass.Chip(new Button { IsVisible = false }, "重新建立会话", "Reconnect");
         readonly Button disconnectButton = Glass.Chip(new Button(), "断开", "Disconnect", "power", false);
@@ -29,12 +29,12 @@ static partial class FfmpegUi
             CornerRadius = new CornerRadius(OrbSize / 2), Padding = new Thickness(0), FontSize = 12,
             BorderThickness = new Thickness(1), IsVisible = false, Cursor = new Cursor(StandardCursorType.Hand)
         };
-        readonly Border controlPanel = new() { CornerRadius = new CornerRadius(PanelRadius), BorderThickness = new Thickness(1), Padding = new Thickness(8) };
+        readonly Border controlPanel = new() { CornerRadius = new CornerRadius(PanelRadius), BorderThickness = new Thickness(1), Padding = new Thickness(5) };
         readonly Grid chromeRoot = new();
         readonly Avalonia.Controls.Shapes.Ellipse statusDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
         readonly TextBlock statusName = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 130,
             TextTrimming = TextTrimming.CharacterEllipsis };
-        readonly StackPanel moreSection = new() { IsVisible = false, Margin = new Thickness(6, 0, 6, 4) };
+        readonly StackPanel moreSection = new() { IsVisible = false, Margin = new Thickness(6, 0, 6, 2) };
         readonly Avalonia.Controls.Shapes.Ellipse orbDot = new() { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 6, 0), IsHitTestVisible = false };
         Glass.Palette palette = Glass.For(true);
@@ -62,7 +62,7 @@ static partial class FfmpegUi
             ToolTip.SetTip(packetDiagnostics, "主控切换独立诊断包；关闭后跨机延迟不可测");
             ToolTip.SetTip(clipboardEnabled, clipboardMessage);
             disconnectButton.Classes.Add("danger");
-            floatingOrb.Classes.Add("chip");
+            floatingOrb.Classes.Add("orb");
             Glass.SetIcon(floatingOrb, "menu", null, 24); floatingOrb.Width = OrbSize; floatingOrb.Padding = new Thickness(0);
             var orbIcon = (Control)floatingOrb.Content!; floatingOrb.Content = null;
             floatingOrb.Content = new Grid { Width = OrbSize - 2, Height = OrbSize - 2, Children = { orbIcon, orbDot } };
@@ -88,7 +88,7 @@ static partial class FfmpegUi
             moreSection.Children.Add(encoder);
             presetMenu.CornerRadius = new CornerRadius(8); presetMenu.Margin = new Thickness(0, 6, 0, 0);
             moreSection.Children.Add(presetMenu);
-            var frames = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Margin = new Thickness(0, 10, 0, 0) };
+            var frames = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3, Margin = new Thickness(0, 6, 0, 0) };
             frames.Children.Add(new TextBlock { Text = "帧率", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0), Opacity = .75 });
             foreach (var button in fpsButtons)
             {
@@ -97,13 +97,13 @@ static partial class FfmpegUi
                 frames.Children.Add(button);
             }
             moreSection.Children.Add(frames);
-            var options = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 10, 0, 0) };
+            var options = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 4, 0, 0) };
             options.Children.Add(packetDiagnostics); options.Children.Add(showWatermark);
             moreSection.Children.Add(options);
             operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
             operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
             operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
-            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto"), Margin = new Thickness(0, 10, 0, 0) };
+            var connectionRow = new Grid { ColumnDefinitions = new("*,Auto"), Margin = new Thickness(0, 4, 0, 0) };
             operation.VerticalAlignment = VerticalAlignment.Center;
             connectionRow.Children.Add(operation);
             Grid.SetColumn(reconnect, 1); connectionRow.Children.Add(reconnect);
