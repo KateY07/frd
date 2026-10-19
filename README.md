@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v2.pre9）
+# FRD · 远程桌面 CLI（v2.pre10）
+
+v2.pre10：主控端默认开启键鼠与剪贴板（若可用），调试控件默认隐藏（Ctrl+Alt+F12 显示）。
 
 v2.pre9：修复安全桌面辅助服务安装在 UAC 允许后失败（icacls 需按 SID 授权）。
 

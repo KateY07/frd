@@ -270,6 +270,12 @@ static partial class FfmpegUi
                 clipboardEnabled.IsEnabled = session.IsRemote;
                 operation.Text = $"已连接：{config.InitialPreset} / {(HasSelectedBitrateCap() ? $"{config.InitialBitrateKbps / 1000d:0.###} Mbps" : "无损不限码率")} / 原始分辨率 {config.Width}×{config.Height}";
                 if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
+                if (session.IsRemote && InteractionScriptPath == null && autoCloseSeconds == 0)
+                {
+                    // Keyboard/mouse and clipboard sharing default to on wherever the connection supports them.
+                    if (inputEnabled.IsEnabled) inputEnabled.IsChecked = true;
+                    if (clipboardEnabled.IsEnabled) clipboardEnabled.IsChecked = true;
+                }
                 if (InteractionScriptPath != null)
                 {
                     await VerifyOverlayAsync();

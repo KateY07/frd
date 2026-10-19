@@ -22,7 +22,7 @@ static partial class FfmpegUi
         readonly Button reconnect = Glass.Chip(new Button { IsVisible = false }, "重新建立会话", "Reconnect");
         readonly Button disconnectButton = Glass.Chip(new Button(), "断开", "Disconnect", "power", false);
         readonly ToggleButton moreButton = Glass.Chip(new ToggleButton(), "更多", "MoreSettings", "sliders", false);
-        readonly ToggleButton showWatermark = Glass.Chip(new ToggleButton { IsChecked = true }, "诊断水印", "ShowWatermark", "activity");
+        readonly ToggleButton showWatermark = Glass.Chip(new ToggleButton { IsChecked = false }, "诊断水印", "ShowWatermark", "activity");
         readonly Button floatingOrb = new()
         {
             Name = "FloatingOrb", Content = "FRD", Width = OrbSize, Height = OrbSize,
@@ -34,6 +34,7 @@ static partial class FfmpegUi
         readonly Avalonia.Controls.Shapes.Ellipse statusDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
         readonly TextBlock statusName = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 130,
             TextTrimming = TextTrimming.CharacterEllipsis };
+        readonly StackPanel debugRow = new() { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 4, 0, 0), IsVisible = false };
         readonly StackPanel moreSection = new() { IsVisible = false, Margin = new Thickness(6, 0, 6, 2) };
         readonly Avalonia.Controls.Shapes.Ellipse orbDot = new() { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 6, 0), IsHitTestVisible = false };
@@ -97,9 +98,8 @@ static partial class FfmpegUi
                 frames.Children.Add(button);
             }
             moreSection.Children.Add(frames);
-            var options = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 4, 0, 0) };
-            options.Children.Add(packetDiagnostics); options.Children.Add(showWatermark);
-            moreSection.Children.Add(options);
+            debugRow.Children.Add(packetDiagnostics); debugRow.Children.Add(showWatermark);
+            moreSection.Children.Add(debugRow);
             operation.FontSize = 11; operation.Opacity = .8; operation.TextWrapping = TextWrapping.NoWrap;
             operation.TextTrimming = TextTrimming.CharacterEllipsis; operation.Text = "正在连接…";
             operation.Bind(ToolTip.TipProperty, new Binding("Text") { Source = operation });
@@ -258,6 +258,9 @@ static partial class FfmpegUi
             }
         }
 
+        /// <summary>Debug controls (packet diagnostics, diagnostic watermark) stay hidden until Ctrl+Alt+F12.</summary>
+        void SetDebug(bool visible) { debugRow.IsVisible = visible; if (visible) SetMore(true); else PositionOverlay(); }
+
         void SetMore(bool open) { moreButton.IsChecked = open; moreSection.IsVisible = open; PositionOverlay(); }
 
         void UpdateStatusDot()
@@ -320,6 +323,7 @@ static partial class FfmpegUi
                 if (firstFullScreenKey) HandleLocalShortcut(0x7A);
                 args.Handled = true;
             }
+            else if (args.Key == Key.F12) { SetDebug(!debugRow.IsVisible); args.Handled = true; }
         }
 
         void HandleLocalShortcut(int key)
