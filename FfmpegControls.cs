@@ -17,12 +17,13 @@ static partial class FfmpegUi
 {
     sealed partial class DesktopWindow
     {
-        const double OrbSize = 50, ChromeMargin = 12, PanelRadius = 16, PanelMaxWidth = 420;
+        const double OrbSize = 50, ChromeMargin = 12, PanelRadius = 16, PanelMaxWidth = 440, PillWidth = 116, PillHeight = 40;
+        double OrbW = OrbSize, OrbH = OrbSize;
         readonly Button fullScreen = Glass.Chip(new Button(), "全屏", "FullScreen", "expand", false);
         readonly Button reconnect = Glass.Chip(new Button { IsVisible = false }, "重新建立会话", "Reconnect");
         readonly Button disconnectButton = Glass.Chip(new Button(), "断开", "Disconnect", "power", false);
         readonly ToggleButton moreButton = Glass.Chip(new ToggleButton(), "更多", "MoreSettings", "sliders", false);
-        readonly ToggleButton showWatermark = Glass.Chip(new ToggleButton { IsChecked = false }, "诊断水印", "ShowWatermark", "activity");
+        readonly ToggleButton showWatermark = Glass.Chip(new ToggleButton { IsChecked = false }, "诊断信息", "ShowWatermark", "activity");
         readonly Button floatingOrb = new()
         {
             Name = "FloatingOrb", Content = "FRD", Width = OrbSize, Height = OrbSize,
@@ -32,9 +33,15 @@ static partial class FfmpegUi
         readonly Border controlPanel = new() { CornerRadius = new CornerRadius(PanelRadius), BorderThickness = new Thickness(1), Padding = new Thickness(5) };
         readonly Grid chromeRoot = new();
         readonly Avalonia.Controls.Shapes.Ellipse statusDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
-        readonly TextBlock statusName = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 130,
+        readonly TextBlock latencyText = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Text = "— ms", MinWidth = 44 };
+        readonly TextBlock orbText = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, Text = "— ms", MinWidth = 44 };
+        readonly Avalonia.Controls.Shapes.Ellipse pillDot = new() { Width = 8, Height = 8, VerticalAlignment = VerticalAlignment.Center };
+        readonly Grid orbCircle = new() { Width = OrbSize - 2, Height = OrbSize - 2 };
+        readonly StackPanel orbPill = new() { Orientation = Orientation.Horizontal, Spacing = 8, IsVisible = false,
+            HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        readonly TextBlock statusName = new() { FontSize = 12, VerticalAlignment = VerticalAlignment.Center, MaxWidth = 90,
             TextTrimming = TextTrimming.CharacterEllipsis };
-        readonly StackPanel debugRow = new() { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 4, 0, 0), IsVisible = false };
+        readonly StackPanel debugRow = new() { Orientation = Orientation.Horizontal, Spacing = 4, Margin = new Thickness(0, 4, 0, 0), IsVisible = true };
         readonly StackPanel moreSection = new() { IsVisible = false, Margin = new Thickness(6, 0, 6, 2) };
         readonly Avalonia.Controls.Shapes.Ellipse orbDot = new() { Width = 7, Height = 7, HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 6, 6, 0), IsHitTestVisible = false };
@@ -66,15 +73,17 @@ static partial class FfmpegUi
             floatingOrb.Classes.Add("orb");
             Glass.SetIcon(floatingOrb, "menu", null, 24); floatingOrb.Width = OrbSize; floatingOrb.Padding = new Thickness(0);
             var orbIcon = (Control)floatingOrb.Content!; floatingOrb.Content = null;
-            floatingOrb.Content = new Grid { Width = OrbSize - 2, Height = OrbSize - 2, Children = { orbIcon, orbDot } };
+            orbCircle.Children.Add(orbIcon); orbCircle.Children.Add(orbDot);
+            orbPill.Children.Add(pillDot); orbPill.Children.Add(orbText); orbPill.Children.Add(Glass.Icon("menu", 18));
+            floatingOrb.Content = new Grid { Children = { orbCircle, orbPill } };
 
             details.RowDefinitions = new("Auto,Auto");
             var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
             foreach (var chip in new Button[] { inputEnabled, clipboardEnabled, fullScreen, moreButton, disconnectButton, collapse })
                 actions.Children.Add(chip);
-            var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Margin = new Thickness(8, 0, 12, 0),
+            var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 7, Margin = new Thickness(8, 0, 6, 0),
                 VerticalAlignment = VerticalAlignment.Center };
-            status.Children.Add(statusDot); status.Children.Add(statusName);
+            status.Children.Add(statusDot); status.Children.Add(statusName); status.Children.Add(latencyText);
             var bar = new Grid { ColumnDefinitions = new("*,Auto") };
             bar.Children.Add(status);
             Grid.SetColumn(actions, 1); bar.Children.Add(actions);
@@ -198,7 +207,7 @@ static partial class FfmpegUi
             animating = true;
             try
             {
-                Touch();
+                Touch(); UpdateOrbShape();
                 var panelWidth = Math.Max(280, Math.Min(PanelMaxWidth, ClientSize.Width - ChromeMargin * 2));
                 double panelHeight;
                 Rect from, to;
@@ -206,11 +215,11 @@ static partial class FfmpegUi
                 {
                     panelHeight = overlay.ClientSize.Height;
                     from = new Rect(PanelPosition(), new Size(panelWidth, panelHeight));
-                    to = new Rect(OrbPosition(), new Size(OrbSize, OrbSize));
+                    to = new Rect(OrbPosition(), new Size(OrbW, OrbH));
                 }
                 else
                 {
-                    var orbRect = new Rect(OrbPosition(), new Size(OrbSize, OrbSize));
+                    var orbRect = new Rect(OrbPosition(), new Size(OrbW, OrbH));
                     details.IsVisible = true; controlPanel.IsVisible = true; floatingOrb.IsVisible = false;
                     controlPanel.Width = panelWidth; controlPanel.Measure(new Size(panelWidth, double.PositiveInfinity));
                     panelHeight = controlPanel.DesiredSize.Height;
@@ -233,7 +242,7 @@ static partial class FfmpegUi
                     var frame = new Rect(Lerp(from.X, to.X), Lerp(from.Y, to.Y), Lerp(from.Width, to.Width), Lerp(from.Height, to.Height));
                     overlay.Width = Math.Max(1, frame.Width); overlay.Height = Math.Max(1, frame.Height);
                     overlay.Position = this.PointToScreen(frame.TopLeft);
-                    var radius = toOrb ? Lerp(PanelRadius, OrbSize / 2) : Lerp(OrbSize / 2, PanelRadius);
+                    var radius = toOrb ? Lerp(PanelRadius, OrbH / 2) : Lerp(OrbH / 2, PanelRadius);
                     Glass.ClipRounded(overlay, radius);
                     controlPanel.Opacity = toOrb ? 1 - e : e;
                     floatingOrb.Opacity = toOrb ? e : 1 - e;
@@ -261,6 +270,18 @@ static partial class FfmpegUi
         /// <summary>Debug controls (packet diagnostics, diagnostic watermark) stay hidden until Ctrl+Alt+F12.</summary>
         void SetDebug(bool visible) { debugRow.IsVisible = visible; if (visible) SetMore(true); else PositionOverlay(); }
 
+        /// <summary>Collapsed form: a plain orb until connected, then a pill that keeps the network latency visible.</summary>
+        void UpdateOrbShape()
+        {
+            var pill = autoCloseSeconds == 0 && InteractionScriptPath == null && started && !disconnected;
+            orbCircle.IsVisible = !pill; orbPill.IsVisible = pill; orbDot.IsVisible = !pill;
+            if (pill) { floatingOrb.Width = PillWidth; floatingOrb.Height = PillHeight; floatingOrb.CornerRadius = new CornerRadius(PillHeight / 2); OrbW = PillWidth; OrbH = PillHeight; }
+            else { floatingOrb.Width = floatingOrb.Height = OrbSize; floatingOrb.CornerRadius = new CornerRadius(OrbSize / 2); OrbW = OrbH = OrbSize; }
+            if (!animating) PositionOverlay();
+        }
+
+        static string FormatMs(double value) => value < 10 ? $"{value:0.0} ms" : $"{value:0} ms";
+
         void SetMore(bool open) { moreButton.IsChecked = open; moreSection.IsVisible = open; PositionOverlay(); }
 
         void UpdateStatusDot()
@@ -269,7 +290,7 @@ static partial class FfmpegUi
             var color = text.Contains("中断") || text.StartsWith("错误") || text.Contains("失败") ? palette.Bad
                 : text.StartsWith("已连接") || text.StartsWith("已应用") || text.Contains("已启用") || text.Contains("已开启") ? palette.Good : palette.Warn;
             if (text.StartsWith("正在", StringComparison.Ordinal) && statusDot.Fill != null) return;
-            statusDot.Fill = orbDot.Fill = Glass.Brush(color);
+            statusDot.Fill = orbDot.Fill = pillDot.Fill = Glass.Brush(color);
         }
 
         void RebuildPresetMenu()
@@ -305,7 +326,7 @@ static partial class FfmpegUi
             presets.Background = Glass.Brush(palette.Hover); presets.BorderThickness = new Thickness(0); presets.CornerRadius = new CornerRadius(8);
             presetMenu.Background = Glass.Brush(palette.Hover);
             presetMenu.BorderBrush = Brushes.Transparent;
-            statusName.Foreground = Glass.Brush(palette.Subtle);
+            statusName.Foreground = latencyText.Foreground = Glass.Brush(palette.Subtle); orbText.Foreground = Glass.Brush(palette.Text);
             controlTitle.Foreground = bitrateLabel.Foreground = Glass.Brush(palette.Subtle);
             foreach (var divider in moreSection.Children.OfType<Border>().Where(child => child.Height == 1)) divider.Background = Glass.Brush(palette.Line);
             statusDot.Fill = null; UpdateStatusDot();
@@ -364,8 +385,8 @@ static partial class FfmpegUi
             PositionOverlay();
         }
 
-        Point OrbPosition() => new(ChromeMargin + orbFraction.X * Math.Max(0, ClientSize.Width - OrbSize - ChromeMargin * 2),
-            ChromeMargin + orbFraction.Y * Math.Max(0, ClientSize.Height - OrbSize - ChromeMargin * 2));
+        Point OrbPosition() => new(ChromeMargin + orbFraction.X * Math.Max(0, ClientSize.Width - OrbW - ChromeMargin * 2),
+            ChromeMargin + orbFraction.Y * Math.Max(0, ClientSize.Height - OrbH - ChromeMargin * 2));
 
         Point PanelPosition() => new(ChromeMargin + panelFraction.X * Math.Max(0, ClientSize.Width - overlay.Width - ChromeMargin * 2),
             ChromeMargin + panelFraction.Y * Math.Max(0, ClientSize.Height - overlay.ClientSize.Height - ChromeMargin * 2));
@@ -379,8 +400,8 @@ static partial class FfmpegUi
 
         void MoveOrb(Point position)
         {
-            orbFraction = new(Math.Clamp((position.X - ChromeMargin) / Math.Max(1, ClientSize.Width - OrbSize - ChromeMargin * 2), 0, 1),
-                Math.Clamp((position.Y - ChromeMargin) / Math.Max(1, ClientSize.Height - OrbSize - ChromeMargin * 2), 0, 1));
+            orbFraction = new(Math.Clamp((position.X - ChromeMargin) / Math.Max(1, ClientSize.Width - OrbW - ChromeMargin * 2), 0, 1),
+                Math.Clamp((position.Y - ChromeMargin) / Math.Max(1, ClientSize.Height - OrbH - ChromeMargin * 2), 0, 1));
             PositionOverlay();
         }
 
@@ -431,9 +452,9 @@ static partial class FfmpegUi
         {
             if (animating) return;
             if (!overlay.IsVisible || ClientSize.Width <= 0) return;
-            overlay.Width = details.IsVisible ? Math.Max(280, Math.Min(PanelMaxWidth, ClientSize.Width - ChromeMargin * 2)) : OrbSize;
+            overlay.Width = details.IsVisible ? Math.Max(280, Math.Min(PanelMaxWidth, ClientSize.Width - ChromeMargin * 2)) : OrbW;
             overlay.Position = this.PointToScreen(details.IsVisible ? PanelPosition() : OrbPosition());
-            Glass.ClipRounded(overlay, details.IsVisible ? PanelRadius : OrbSize / 2);
+            Glass.ClipRounded(overlay, details.IsVisible ? PanelRadius : OrbH / 2);
             if (!watermark.IsVisible) return;
             watermark.Width = Math.Max(280, Math.Min(920, ClientSize.Width - ChromeMargin * 2));
             watermark.MaxHeight = Math.Max(40, ClientSize.Height - (details.IsVisible ? overlay.ClientSize.Height : 0) - ChromeMargin * 3);

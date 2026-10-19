@@ -265,7 +265,7 @@ static partial class FfmpegUi
                         operation.Text = "远端光标同步中断；视频会话仍在运行。";
                     }), inputStop.Token);
                 if (stopping) return;
-                started = true; presets.IsEnabled = true; UpdateBitrateAvailability();
+                started = true; UpdateOrbShape(); presets.IsEnabled = true; UpdateBitrateAvailability();
                 foreach (var button in fpsButtons) button.IsEnabled = true;
                 inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
                 clipboardEnabled.IsEnabled = session.IsRemote;
@@ -276,6 +276,8 @@ static partial class FfmpegUi
                     // Keyboard/mouse and clipboard sharing default to on wherever the connection supports them.
                     if (inputEnabled.IsEnabled) inputEnabled.IsChecked = true;
                     if (clipboardEnabled.IsEnabled) clipboardEnabled.IsChecked = true;
+                    // Latency needs the lightweight diagnostic packets; keep them on so it is always readable.
+                    if (packetDiagnostics.IsEnabled) packetDiagnostics.IsChecked = true;
                 }
                 if (InteractionScriptPath != null)
                 {
@@ -571,6 +573,11 @@ static partial class FfmpegUi
                 var cap = currentStatus.AppliedLimitKbps > 0 ? $"{currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps" : "无损不限码率";
                 summary.Text = $"{currentStatus.ActivePreset} · {cap} · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
                 metrics.Text = $"发送 {currentStatus.SentMbps:F3} / 接收 {currentStatus.ReceivedMbps:F3} Mbps  |  带宽估计 {currentStatus.EstimatedMbps:F3} Mbps（参考）\n诊断包：{(currentStatus.PacketDiagnosticsEnabled ? "开" : "关")}，开销 {currentStatus.DiagnosticMbps * 1000:F2} kbps（已计入流量）\n捕获 → GPU 完成：{latency}  |  绘制 {currentStatus.RenderedFps:F1} / 解码 {currentStatus.DecodedFps:F1} FPS\n网络延迟趋势 {currentStatus.DelayTrendMs:+0.00;-0.00;0.00} ms  |  丢包 {currentStatus.LossRate:P1}  |  {currentStatus.Message}";
+                var haveLatency = currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming;
+                latencyText.Text = orbText.Text = haveLatency ? FormatMs(currentStatus.MeanTransferMs) : "— ms";
+                ToolTip.SetTip(latencyText, haveLatency
+                    ? $"网络延迟（传输）{FormatMs(currentStatus.MeanTransferMs)} · 端到端 {FormatMs(currentStatus.MeanCaptureToRenderMs)} · 丢包 {currentStatus.LossRate:P1}"
+                    : "等待诊断包计时；关闭“诊断包”后跨机延迟不可测");
                 if (!changingDiagnostics) { updatingDiagnostics = true; packetDiagnostics.IsChecked = currentStatus.PacketDiagnosticsEnabled; updatingDiagnostics = false; }
                 metrics.Text += "\n" + currentStatus.TimingDescription;
                 metrics.Text += status.SimulatedCapacityMbps > 0
@@ -641,7 +648,7 @@ static partial class FfmpegUi
             preview.SetInputEnabled(false);
             presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false;
             foreach (var button in fpsButtons) button.IsEnabled = false;
-            reconnect.IsVisible = true; SetMore(true);
+            reconnect.IsVisible = true; SetMore(true); UpdateOrbShape();
             operation.Text = $"原连接已中断：{ex.Message}；点击“重新建立会话”将创建新连接。";
             SessionTrace.Event("window", "disconnected-awaiting-user");
         }
