@@ -58,8 +58,8 @@ sealed class DesktopStreamSource : IDisposable
     public int Height { get { lock (gate) return height; } }
     public DesktopCaptureStatistics? Statistics { get { lock (gate) return packedCapture?.Statistics ?? capture?.Statistics; } }
     public bool WaitingForSecureTransition { get { lock (gate) return secureFailureStarted != 0; } }
-    public bool SecureActive { get { lock (gate) return secure?.Active == true; } }
-    public string Backend { get { lock (gate) return secure?.Active == true ? "SYSTEM Winlogon capture → loopback UDP" :
+    public bool SecureActive { get { lock (gate) return SecureUsable() && secure!.Active; } }
+    public string Backend { get { lock (gate) return SecureUsable() && secure!.Active ? "SYSTEM Winlogon capture → loopback UDP" :
         packedCapture == null ? capture?.Backend ?? "未初始化" : $"DXGI Desktop Duplication + {packedCapture.Path}"; } }
     public DesktopStreamSource(double scale, bool secureDesktop = false)
     {
@@ -75,7 +75,7 @@ sealed class DesktopStreamSource : IDisposable
         {
             ObjectDisposedException.ThrowIf(disposed, this);
             TryAttachSecureDesktop();
-            if (secure is { } source)
+            if (SecureUsable() && secure is { } source)
             {
                 var frame = source.Take();
                 if (frame.Active)
@@ -88,6 +88,8 @@ sealed class DesktopStreamSource : IDisposable
             }
             try
             {
+                // UAC, the lock screen and Ctrl+Alt+Del run on a desktop an ordinary process cannot capture; wait instead of failing.
+                if (!SecureUsable() && InputDesktop.IsSecure()) throw new SecureDesktopActiveException();
                 RestoreOrdinaryDesktop();
                 var pixels = packedCapture?.Capture() ?? capture?.Capture() ?? throw new InvalidOperationException("Desktop capture is unavailable.");
                 secureFailureStarted = 0;
@@ -102,7 +104,7 @@ sealed class DesktopStreamSource : IDisposable
         {
             ObjectDisposedException.ThrowIf(disposed, this);
             TryAttachSecureDesktop();
-            if (secure is { } source)
+            if (SecureUsable() && secure is { } source)
             {
                 var shared = source.TakeSharedMapped(allowUnchanged);
                 if (shared.Active)
@@ -125,6 +127,7 @@ sealed class DesktopStreamSource : IDisposable
             }
             try
             {
+                if (!SecureUsable() && InputDesktop.IsSecure()) throw new SecureDesktopActiveException();
                 RestoreOrdinaryDesktop();
                 if (packedCapture != null) throw new InvalidOperationException("Packed capture cannot be passed as BGRA mapped pixels.");
                 if (capture == null) throw new InvalidOperationException("Mapped desktop capture is unavailable.");
@@ -134,6 +137,26 @@ sealed class DesktopStreamSource : IDisposable
             }
             catch (Exception error) when (WaitForSecureTransition(error)) { return null; }
         }
+    }
+
+    long nextHelperCheckTick;
+    bool helperRunning;
+
+    /// <summary>
+    /// The helper's frame file keeps its "active" flag after an unclean stop, which would freeze the stream on a stale
+    /// secure-desktop frame forever; only trust the file while the SYSTEM service is actually running (checked every 2 s).
+    /// </summary>
+    bool SecureUsable()
+    {
+        if (secure == null) return false;
+        var now = Stopwatch.GetTimestamp();
+        if (now >= nextHelperCheckTick)
+        {
+            nextHelperCheckTick = now + 2 * Stopwatch.Frequency;
+            try { helperRunning = SecureDesktopService.Status().Running; }
+            catch (Exception error) { Console.Error.WriteLine("[secure helper] Service status check failed: " + error.Message); helperRunning = false; }
+        }
+        return helperRunning;
     }
 
     void TryAttachSecureDesktop()
@@ -173,8 +196,10 @@ sealed class DesktopStreamSource : IDisposable
 
     bool WaitForSecureTransition(Exception error)
     {
-        if (secure == null) return false;
-        if (!secureWasActive)
+        // Without the SYSTEM helper there is no secure-desktop frame source, but a capture failure while the secure desktop
+        // is up (or was just raised) is still only a transition: keep the session and resume when the desktop returns.
+        if (!SecureUsable() && error is not SecureDesktopActiveException && !InputDesktop.IsSecure()) return false;
+        if (SecureUsable() && !secureWasActive)
         {
             try
             {
@@ -193,7 +218,7 @@ sealed class DesktopStreamSource : IDisposable
         if (secureFailureStarted == 0)
         {
             secureFailureStarted = now;
-            Console.Error.WriteLine("[capture] Waiting for secure desktop transition: " + error);
+            Console.Error.WriteLine("[capture] Waiting for secure desktop transition: " + error.Message);
         }
         return true;
     }
@@ -319,5 +344,37 @@ sealed class DesktopStreamSource : IDisposable
             secure?.Dispose();
             ReleaseActive();
         }
+    }
+}
+
+/// <summary>Raised while the input desktop is not the ordinary one (UAC prompt, lock screen, Ctrl+Alt+Del).</summary>
+sealed class SecureDesktopActiveException : InvalidOperationException
+{
+    public SecureDesktopActiveException() : base("The secure desktop is active; ordinary capture is unavailable.") { }
+}
+
+static class InputDesktop
+{
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    static extern nint OpenInputDesktop(uint flags, [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)] bool inherit, uint access);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    static extern bool CloseDesktop(nint desktop);
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    static extern bool GetUserObjectInformationW(nint handle, int index, System.Text.StringBuilder? info, int length, out int needed);
+
+    /// <summary>True when the desktop that receives input is not "Default", or cannot be opened at all (access denied on Winlogon).</summary>
+    public static bool IsSecure()
+    {
+        var desktop = OpenInputDesktop(0, false, 0x0001);
+        if (desktop == 0) return true;
+        try
+        {
+            var name = new System.Text.StringBuilder(128);
+            return GetUserObjectInformationW(desktop, 2, name, name.Capacity * 2, out _) &&
+                !name.ToString().Equals("Default", StringComparison.OrdinalIgnoreCase);
+        }
+        finally { CloseDesktop(desktop); }
     }
 }
