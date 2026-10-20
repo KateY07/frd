@@ -1,9 +1,10 @@
-# FRD v2.pre14
+# FRD v2.pre15
 
 Windows x64，依赖 .NET 10 x64 Runtime，不自包含，不启用 Native AOT。
 
-- 修复被控端在“首次安装安全桌面辅助服务”时闪退（SY0812A 实机复现并验证）：辅助服务尚未安装时，UAC 提示会让屏幕进入安全桌面，普通屏幕捕获失败，该错误被当作致命错误，整个被控端进程以退出码 1 退出。现在把“安全桌面期间捕获失败”视为过渡：会话保持连接，主控端显示“安全桌面切换中”，UAC 结束后自动恢复；锁屏、Ctrl+Alt+Del 同理。
-- 修复辅助服务异常停止后被控端画面可能永久停在旧的安全桌面帧：共享内存中的“活动”标记在服务被杀后不会清除，现在仅当辅助服务确实在运行（每 2 秒检查）时才信任它。
-- 协议、端口、输入通道不变，主被控端无需同时升级。
+- 发布包大幅瘦身：解压后 323 MiB → 约 138 MiB，zip 123 MiB → 约 52 MiB。
+  - 只随包提供 FRD 实际调用的 FFmpeg 库（`avcodec`、`avutil`、`swscale`，以及 avcodec 自身依赖的 `swresample`）和 LICENSE，不再带 `avfilter`、`avformat`、`avdevice`、`ffplay`、`ffmpeg.exe`、`ffprobe`（约 160 MiB，代码从未调用）。
+  - 目标框架由 `net10.0-windows10.0.26100.0` 改为 `net10.0-windows`，不再打入未使用的 Windows SDK 投影（`Microsoft.Windows.SDK.NET.dll`，约 25 MiB），`FRD.exe` 54.7 → 29.0 MiB。
+- 功能、协议、端口、界面均无变化，主被控端无需同时升级。
 
-实机验证（SY0812A，Windows 11 IoT LTSC，用户在 Administrators 组、UAC 为同意提示）：先卸载服务与密钥，被控端 + 主控端建立会话后点击“安装安全桌面辅助服务”并在 UAC 中允许——被控端与主控端均未退出，服务进入运行状态，捕获在 UAC 结束后重建并附加辅助帧源，无崩溃日志。控制浮层回归通过。
+验证：本机控制浮层回归、CPU 预设回归、远程会话（450 帧全部 GPU 确认）和 `--version` 均通过；编解码回归（`--codec-regression`）有 17 项 `keyFrame` 判定为假，改动前的构建上完全相同，不是本版引入。若自行替换 `ffmpeg\` 目录，需保留上述四个库。
