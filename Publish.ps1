@@ -100,6 +100,28 @@ $extensionHash = (Get-FileHash -LiteralPath $extensionArchive -Algorithm SHA256)
 New-Item -ItemType Directory -Force -Path $localReleaseRoot | Out-Null
 Copy-Item -LiteralPath $archivePath -Destination $localArchive -ErrorAction Stop
 [IO.File]::WriteAllText($localHash, "$hash *$version.zip`n")
+# Single-file build (frd-<version>.exe): the same files packed with OneSetup (https://github.com/KateY07/onesetup) in --app mode.
+# The first run unpacks to %LOCALAPPDATA%\OneSetup\apps\<hash>; later runs start FRD.exe from there (arguments and exit code pass through).
+$onesetup = (Get-Command onesetup -ErrorAction SilentlyContinue).Source
+if (-not $onesetup -and (Test-Path -LiteralPath 'D:\1\onesetup\onesetup\publish\onesetup.exe')) { $onesetup = 'D:\1\onesetup\onesetup\publish\onesetup.exe' }
+$singleFile = $null
+if ($onesetup) {
+    $singleStage = Join-Path $releaseRoot ('single-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $singleStage | Out-Null
+    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
+        Copy-Item -LiteralPath (Join-Path $output $item) -Destination $singleStage -Recurse
+    }
+    $singleFile = Join-Path $releaseRoot "frd-$version.exe"
+    if (Test-Path -LiteralPath $singleFile) { Remove-Item -LiteralPath $singleFile }
+    & $onesetup $singleStage --app FRD.exe -l 5 -o $singleFile
+    if ($LASTEXITCODE -ne 0) { throw 'Single-file package failed.' }
+    Remove-Item -LiteralPath $singleStage -Recurse -Force
+    $singleHash = (Get-FileHash -LiteralPath $singleFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    [IO.File]::WriteAllText("$singleFile.sha256", "$singleHash *frd-$version.exe`n")
+    Copy-Item -LiteralPath $singleFile -Destination (Join-Path $localReleaseRoot "frd-$version.exe") -ErrorAction Stop
+    Copy-Item -LiteralPath "$singleFile.sha256" -Destination (Join-Path $localReleaseRoot "frd-$version.exe.sha256") -ErrorAction Stop
+}
+else { Write-Warning 'onesetup.exe not found; the single-file frd-<version>.exe was not built.' }
 $localExtension = Join-Path $localReleaseRoot "$version-ffmpeg.zip"
 if (Test-Path -LiteralPath $localExtension) { throw "Local FFmpeg extension already exists: $localExtension" }
 Copy-Item -LiteralPath $extensionArchive -Destination $localExtension -ErrorAction Stop

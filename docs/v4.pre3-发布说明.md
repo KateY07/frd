@@ -11,3 +11,5 @@ Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。与
 
 **验证**：布局回归 `--ui-layout-regression` 在中英文下共 80 种尺寸与状态，控件无重叠、无越界；两种语言的本机回环远程会话都通过；英文翻译的占位符与中文逐条核对一致。
 **说明**：只翻译了 FRD.exe 的界面文字；README 和发布说明仍是中文，主页是英文。
+
+**单文件版 `frd-v4.pre3.exe`（4.3 MB）**：把 `FRD.exe`、`frd-wintools.exe`、`codec-config.json` 和许可证打成一个 exe（由 [OneSetup](https://github.com/KateY07/onesetup) 的 `--app` 模式打包）。用法与 `FRD.exe` 完全一样，参数、工作目录、控制台和退出码原样传递，例如 `frd-v4.pre3.exe --connect HOST --port 5000 --token ...`。第一次运行解压到 `%LOCALAPPDATA%\OneSetuppps\<内容哈希>`（约 3 秒），之后每次只多约 0.07 秒；环境变量 `ONESETUP_CACHE` 可改位置。没有代码签名，SmartScreen 可能提示。需要 FFmpeg 预设时仍用扩展包，解压到缓存目录里的 `FRD.exe` 旁，或改用 zip 版。校验见 `frd-v4.pre3.exe.sha256`。
