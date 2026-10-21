@@ -54,7 +54,7 @@ public sealed partial class DemoSession
         config = await Task.Run(() => AutoCodecProbe.SelectReceiver(config, welcome.ProbeSamples), stop.Token);
         await receiver.RegisterRemoteAsync(new(remote.Endpoint.Address, remoteOptions.Port), Convert.FromHexString(welcome.Session), stop.Token);
         for (var i = 0; i < 4; i++) await remote.ExchangeAsync(new("status"), stop.Token);
-        await SetPacketDiagnosticsAsync(true);
+        await SetPacketDiagnosticsAsync(false);
         var applied = await ApplyAsync(config.InitialPreset, config.InitialBitrateKbps);
         if (!applied.Success) throw new IOException(applied.Message);
         statusTask = Task.Run(StatusLoopAsync);

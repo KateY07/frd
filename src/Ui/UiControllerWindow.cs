@@ -181,7 +181,7 @@ sealed class UiControllerWindow : UiWindow
             }
         };
         packetDiagnostics.CheckedChanged += () => ChangeDiagnostics();
-        showInfo.IsChecked = true;
+        showInfo.IsChecked = false;
         showInfo.CheckedChanged += () => preview.Invalidate();
         panel.FullScreen.Click += () => ToggleFullScreenWithState();
         panel.Disconnect.Click += () => Close();
