@@ -23,7 +23,7 @@ if ($LASTEXITCODE -ne 0) { throw "Publish failed; staging retained at $staging" 
 if ($LASTEXITCODE -ne 0) { throw "frd-wintools publish failed; staging retained at $staging" }
 $startupError = Join-Path $staging 'startup-error.txt'
 if (Test-Path -LiteralPath $startupError) { Remove-Item -LiteralPath $startupError }
-$documents = @('README.md', 'THIRD-PARTY-NOTICES.md', 'docs/使用.md', 'docs/目标与验收.md',
+$documents = @('README.md', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'licenses/dotnet-ThirdPartyNotices.txt', 'docs/使用.md', 'docs/目标与验收.md',
     'docs/本机输入延迟验证.md', 'docs/公网拥塞控制调查.md', 'docs/受限公网回归设计.md',
     "docs/$version-发布说明.md", "docs/$version-静态检查.md", 'docs/输入生命周期修复.md', 'docs/单端口输入延迟回归.md')
 foreach ($document in $documents) {
@@ -86,6 +86,8 @@ foreach ($file in $extensionFiles) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "third_party/ffmpeg/runtime/$file") -Destination (Join-Path $extension 'ffmpeg') -ErrorAction Stop
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.md') -Destination $extension
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'third_party/ffmpeg/SOURCE-OFFER.txt') -Destination (Join-Path $extension 'ffmpeg') -ErrorAction Stop
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE') -Destination $extension -ErrorAction Stop
 $extensionArchive = Join-Path $releaseRoot "frd-$version-ffmpeg-win-x64.zip"
 if (Test-Path -LiteralPath $extensionArchive) { Remove-Item -LiteralPath $extensionArchive }
 & $zipTool a -tzip -mx=5 -mcu=on $extensionArchive (Join-Path $extension '*')

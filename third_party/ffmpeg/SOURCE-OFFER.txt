@@ -1,0 +1,29 @@
+FFmpeg source code offer
+========================
+
+The libraries in this folder (avcodec, avutil, swscale, swresample) are part of
+FFmpeg 8.1.2, built by Gyan.dev ("full_build-shared"). That build is configured
+with --enable-gpl --enable-version3 and is licensed under the GNU General
+Public License, version 3 (see LICENSE.txt in this folder).
+
+The corresponding source code is available from:
+
+  * FFmpeg release 8.1.2:       https://ffmpeg.org/releases/
+  * Build recipe and sources
+    of the bundled libraries:   https://www.gyan.dev/ffmpeg/builds/
+  * Third-party components
+    compiled into the build:    listed in the build's configuration line
+                                (run "ffmpeg -version" from the same Gyan.dev
+                                package) and available from each project.
+
+The exact archive these files came from is pinned in
+third_party/ffmpeg/provenance.json of the FRD repository
+(https://github.com/KateY07/frd), together with its SHA-256.
+
+If you received this package from the FRD project and cannot obtain the source
+from the places above, open an issue at https://github.com/KateY07/frd/issues
+and the maintainer will provide it. This offer is valid for at least three
+years from the date of the release that contains these files.
+
+FRD itself (FRD.exe, frd-wintools.exe) is not part of FFmpeg and is licensed
+separately under the MIT License.

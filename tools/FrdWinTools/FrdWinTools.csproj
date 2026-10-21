@@ -10,6 +10,9 @@
     <PlatformTarget>x64</PlatformTarget>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Authors>KateY07</Authors>
+    <Copyright>Copyright (c) 2026 KateY07</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Version>3.0.0-pre3</Version>
     <InformationalVersion>v3.pre3</InformationalVersion>
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>

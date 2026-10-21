@@ -177,3 +177,7 @@ v1.pre7 的输入发送改为有界流水：保持事件顺序，后台确认，
 以上控制栏界面继承自已获人工确认的 v1.pre4；本版移除 pre7 的本机专用测试目标和鼠标事件过滤，保留输入流水发送及失败清理。测试目标仅保存在独立测试工程，不进入正式程序或生成的单文件 Demo。未重新执行真实双机或 RDP 对照，自动全局键鼠注入回归继续保持暂停。
 
 进一步阅读：[使用与配置](docs/使用.md)、[目标与验收](docs/目标与验收.md)、[发布说明](docs/v2.pre3-发布说明.md)、[静态检查](docs/v2.pre3-静态检查.md)、[第三方许可证](THIRD-PARTY-NOTICES.md)。
+
+## 许可证
+
+FRD 采用 [MIT 许可证](LICENSE)。第三方组件及 FFmpeg 扩展包（GPL-3.0）的条款见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)：基础包不含 FFmpeg；只有同时分发 FFmpeg 扩展包时，才需要按 GPL-3.0 提供其对应源码。
