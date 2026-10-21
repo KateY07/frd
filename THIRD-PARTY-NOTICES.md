@@ -19,7 +19,7 @@ Windows Media Foundation, Direct3D, Direct2D and DirectWrite are parts of Window
 
 ## FFmpeg (optional extension only)
 
-The base package contains **no FFmpeg code**. FRD loads FFmpeg only if the user unzips the extension package next to `FRD.exe`; without it the FFmpeg presets are reported as unavailable and FRD uses the Windows built-in Media Foundation codecs.
+The base package contains **no FFmpeg code**. FRD loads FFmpeg only if the user installs the extension (the installer writes to `%LOCALAPPDATA%\FRD\ffmpeg\<version>\`, or the zip is unpacked next to `FRD.exe`); without it the FFmpeg presets are reported as unavailable and FRD uses the Windows built-in Media Foundation codecs.
 
 The extension package contains a Gyan.dev FFmpeg 8.1.2 "full" shared build (source and checksum pinned in `third_party/ffmpeg/provenance.json`). That build is configured with `--enable-gpl --enable-version3` and includes GPL components such as libx264 and libx265, so the FFmpeg libraries are licensed under the **GNU GPL version 3**. The license text is shipped in `ffmpeg/LICENSE.txt` and the source offer in `ffmpeg/SOURCE-OFFER.txt`.
 

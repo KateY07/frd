@@ -1,30 +1,13 @@
-# FRD v5.0
+# FRD v5.1
 
-Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。这是第一个正式版：把 v3、v4 系列的改动汇总为稳定版本，**代码和协议与 v4.pre3 相同**，可与 v4.pre1 及以后的版本互连；与 v3 不互通。
+Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。与 v5.0、v4.pre1 及以后的版本可互连（协议未变），与 v3 不互通。
 
-**这个版本是什么**
-- **一个 4 MB 的程序**：基础包约 6 MB，还有单文件版 `frd-v5.0.exe`（约 4 MB）。`FRD.exe` 同时是被控端和主控端，对外接口是命令行。
-- **默认用 Windows 内置的 Media Foundation H.264**（硬件优先，软件回退）；FFmpeg 是可选扩展，提供 zip 和双击安装器。
-- **原生界面**（Direct3D 11 + Direct2D，界面层已开源为 [Glasspane](https://github.com/KateY07/Glasspane)）：深色毛玻璃悬浮面板、可拖动、可收起为悬浮球，延迟始终可见；被控端有同风格的状态卡片。
-- **中英文界面**：`--lang en|zh`，默认跟随 Windows 显示语言。
-- **画面 25 FPS 默认**（10/20/25/30），只按原始分辨率传输。
+**FFmpeg 扩展改装到用户目录的版本文件夹**
+- FFmpeg 扩展安装器 `frd-ffmpeg-8.1.2-setup.exe` 现在安装到 `%LOCALAPPDATA%\FRD\ffmpeg\<版本>\`（例如 `%LOCALAPPDATA%\FRD\ffmpeg\8.1.2\`），只写当前用户的目录：不再去找 FRD 在哪里、不需要选目录，所有 FRD 版本共用一份，单文件版 `frd-v5.1.exe` 也能用。已装同版本时询问是否替换，并逐个文件校验 SHA-256。
+- FRD 自动查找 FFmpeg，顺序是：环境变量 `FRD_FFMPEG_DIR` 指定的目录；`FRD.exe` 旁的 `ffmpeg\` 文件夹（扩展 zip 解压后的位置，与以前相同）；`%LOCALAPPDATA%\FRD\ffmpeg\<版本>\`（取最新版本）。没找到时依赖 FFmpeg 的预设显示为不可用，提示“运行 FFmpeg 扩展安装器，或把其中的 ffmpeg 文件夹放到 FRD.exe 旁”。
+- 无人值守：`frd-ffmpeg-8.1.2-setup.exe -y`；环境变量 `FFMPEG_TARGET` 可改安装目录。扩展 zip 仍可用于脚本。
+- **注意**：新安装器装到用户目录，只有 v5.1 及以后的 FRD 会去那里找；v5.0 及更早的版本只认 `FRD.exe` 旁的 `ffmpeg\` 文件夹，请继续用 zip。
 
-**控制与协作**
-- 键鼠转发、鼠标形状同步、文本/文件/目录双向剪贴板（传输时两端显示进度）。
-- **本地键鼠优先**：被控端的实体键鼠在用时，远程输入暂停，主控端提示“对方正在操作，请等待”。
-- **共享标注**：主控端在画面上画涂鸦、矩形、文字，被控端屏幕同步显示（点击穿透、不被捕获，可随时禁止）。
-- **远程光标叠加**（可选）。
-- **UAC 与锁屏**：独立的 `frd-wintools.exe` 安装一次 SYSTEM 辅助服务（装到 `%ProgramFiles%\FRD\`，仅管理员可写）。
+**发布内容**：`frd-v5.1-win-x64.zip`、`frd-v5.1.exe`（单文件版）、`frd-v5.1-ffmpeg-win-x64.zip` 与 `frd-ffmpeg-8.1.2-setup.exe`、各自的 SHA-256。FFmpeg 扩展也单独发布在 `ffmpeg-8.1.2` 这个 Release。没有代码签名，SmartScreen 可能提示。
 
-**安全**
-- 口令不上网：挑战-应答（PBKDF2-SHA256）双向认证，嗅探到的握手无法重放。
-- 键鼠 UDP 包带会话密钥签名；认证失败按来源地址指数退避，并限制并发握手。
-- 日志不记录口令，只保留最近 20 个。
-- **FRD 不加密内容**（画面、剪贴板、光标、控制消息），这是有意的设计：它假定运行在已加密的底层链路（VPN、隧道、专网）上，避免额外的包大小和延迟。直接暴露在不可信网络前请先建立加密隧道。
-
-**发布内容**：`frd-v5.0-win-x64.zip`（基础包）、`frd-v5.0.exe`（单文件版）、`frd-v5.0-ffmpeg-win-x64.zip` 与 `frd-ffmpeg-8.1.2-setup.exe`（FFmpeg 扩展）、各自的 SHA-256。许可证 MIT；FFmpeg 扩展是 GPL-3.0，见 `THIRD-PARTY-NOTICES.md`。没有代码签名，SmartScreen 可能提示。
-
-**已知限制与未验证项**
-- 内容未加密（见上）；单主控、可信网络、无 NAT 穿透。
-- 键鼠签名在真实键鼠转发下的端到端效果、主程序其余 P/Invoke 里是否还有“32 位参数承载指针”的同类问题，没有做过全量审计，计划在后续版本处理。
-- 被控端通过网络发来的状态文字按被控端的语言显示。
+**验证**：在 `FRD.exe` 旁没有 `ffmpeg\` 的情况下，FRD 从用户目录加载 FFmpeg 8.1.2 并通过 CPU 预设回归；安装器的默认路径、`FFMPEG_TARGET` 覆盖、重复安装均已实测。未覆盖：安装器窗口里的询问（替换/安装）只检查了协议输出，没有在窗口里点击。

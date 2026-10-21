@@ -79,7 +79,7 @@ public sealed record AppConfiguration
                 if (!mfDecoder) return preset with { Enabled = false, UnavailableReason = Loc.T("此系统缺少 Media Foundation H.264 解码器") };
                 return preset;
             }
-            return FfmpegRuntime.IsAvailable ? preset : preset with { Enabled = false, UnavailableReason = Loc.T("需要 FFmpeg 扩展包（把其中的 ffmpeg 文件夹解压到 FRD.exe 旁）") };
+            return FfmpegRuntime.IsAvailable ? preset : preset with { Enabled = false, UnavailableReason = Loc.T("需要 FFmpeg 扩展包（运行 FFmpeg 扩展安装器，或把其中的 ffmpeg 文件夹放到 FRD.exe 旁）") };
         });
         return this with { Presets = presets };
     }

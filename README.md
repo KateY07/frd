@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v5.0）
+# FRD · 远程桌面 CLI（v5.1）
+
+v5.1：FFmpeg 扩展安装器改为装到 `%LOCALAPPDATA%\FRD\ffmpeg\<版本>\`，FRD 自动查找（`FRD_FFMPEG_DIR` → `FRD.exe` 旁 → 用户目录），所有版本和单文件版共用。
 
 v5.0：第一个正式版，汇总 v3、v4 系列：Native AOT 单文件、Media Foundation 默认编码、原生界面（Glasspane）、口令认证与键鼠签名、本地键鼠优先、共享标注、中英文界面。代码和协议与 v4.pre3 相同。
 
@@ -63,7 +65,7 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 
 ## 五分钟入门
 
-1. 在两台 Windows x64 机器解压基础包（`FRD.exe`、`frd-wintools.exe`、`codec-config.json`），无需安装任何运行时。需要 FFmpeg 预设时，再把 FFmpeg 扩展包解压到 `FRD.exe` 同目录。
+1. 在两台 Windows x64 机器解压基础包（`FRD.exe`、`frd-wintools.exe`、`codec-config.json`），无需安装任何运行时。需要 FFmpeg 预设时，运行 FFmpeg 扩展安装器 `frd-ffmpeg-8.1.2-setup.exe`（装到 `%LOCALAPPDATA%\FRD\ffmpeg\8.1.2\`，FRD 自动找到，所有 FRD 版本共用，单文件版也能用）；或把扩展 zip 解压到 `FRD.exe` 同目录。
 2. 在被控机器的普通已登录桌面启动服务端，并明确指定监听地址、端口和本次口令；地址替换为被控端实际网卡 IPv4 或 IPv6 地址：
 
 ```powershell
@@ -143,7 +145,7 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - `initialBitrateKbps` 设置有损编码初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示。不会按滑条数值额外限制链路，允许编码缓冲和帧发送突发。
 - `autoSelectCodec:true` 在启动时对标记 `autoProbe:true` 的有损预设做真实屏幕短测，探测进程最多运行 5 秒；不可用或超时则保留 `initialPreset`。`minimumAutoBitrateKbps` 可让高带宽预设仅在码率足够时参与。双机时被控端测捕获和编码，主控端用样本验证并测解码；结果只是当前画面、当前码率下的启动选择，手动切换始终可用。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 本版为 **Native AOT** 单文件 `FRD.exe`，不需要安装 .NET 运行时。FFmpeg 为可选扩展包：把 `frd-vX-ffmpeg-win-x64.zip`（X 为版本）解压到 `FRD.exe` 同目录即可启用 FFmpeg 预设。该扩展包也单独发布在 [FFmpeg extension 8.1.2](https://github.com/KateY07/frd/releases/tag/ffmpeg-8.1.2)，下载一次即可跨 FRD 版本使用；该页面还提供双击安装包 `frd-ffmpeg-8.1.2-setup.exe`（OneSetup 打包，自动查找 FRD 目录并校验文件，无人值守时用环境变量 `FRD_DIR` 指定目录；构建脚本见 `tools/FfmpegSetup`）。
+- 本版为 **Native AOT** 单文件 `FRD.exe`，不需要安装 .NET 运行时。FFmpeg 为可选扩展。FRD 按顺序查找：环境变量 `FRD_FFMPEG_DIR` 指定的目录；`FRD.exe` 旁的 `ffmpeg\` 文件夹（扩展 zip 解压后的位置）；`%LOCALAPPDATA%\FRD\ffmpeg\<版本>\`（安装器写入的位置，取最新版本）。推荐用安装器 [`frd-ffmpeg-8.1.2-setup.exe`](https://github.com/KateY07/frd/releases/tag/ffmpeg-8.1.2)（OneSetup 打包，只写用户目录，校验每个文件；`-y` 无人值守，环境变量 `FFMPEG_TARGET` 可改目录；构建脚本见 `tools/FfmpegSetup`）；zip 用于脚本。该扩展包也单独发布在 [FFmpeg extension 8.1.2](https://github.com/KateY07/frd/releases/tag/ffmpeg-8.1.2)，下载一次即可跨 FRD 版本使用。
 - 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\<版本>\`，不同版本分目录保留。
 - 发布流程：本机运行 `Publish.ps1` 生成基础包和 FFmpeg 扩展包（含 SHA-256），再用 `gh release create` 上传到 GitHub Release；不使用 GitHub Actions。
 

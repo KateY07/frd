@@ -29,7 +29,7 @@ static class LocEnglish
         ["不自动跟随剪贴板文件中的符号链接或目录联接。"] = "Symbolic links and directory junctions in clipboard files are not followed.",
         ["此系统缺少 Media Foundation H.264 编码器（N 版 Windows 需安装媒体功能包）"] = "This system has no Media Foundation H.264 encoder (N editions of Windows need the Media Feature Pack)",
         ["此系统缺少 Media Foundation H.264 解码器"] = "This system has no Media Foundation H.264 decoder",
-        ["需要 FFmpeg 扩展包（把其中的 ffmpeg 文件夹解压到 FRD.exe 旁）"] = "Needs the FFmpeg extension (unzip its ffmpeg folder next to FRD.exe)",
+        ["需要 FFmpeg 扩展包（运行 FFmpeg 扩展安装器，或把其中的 ffmpeg 文件夹放到 FRD.exe 旁）"] = "Needs the FFmpeg extension (run the FFmpeg extension installer, or put its ffmpeg folder next to FRD.exe)",
         ["没有可用的 H.264 编解码器：请在 Windows 中安装“媒体功能包”（N 版/KN 版），或安装 FRD 的 FFmpeg 扩展包。"] = "No H.264 codec is available: install the Windows \"Media Feature Pack\" (N/KN editions) or FRD's FFmpeg extension.",
         ["已连接：mf_h264 / 2.5 Mbps / 原始分辨率 2560×1440"] = "Connected: mf_h264 / 2.5 Mbps / native resolution 2560×1440",
         ["码率上限 · 2.5 Mbps"] = "Bitrate cap · 2.5 Mbps",

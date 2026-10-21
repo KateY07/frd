@@ -1,14 +1,15 @@
-# Installs the FFmpeg libraries next to FRD.exe (folder "ffmpeg"). Runs inside a OneSetup installer window:
-# lines starting with "." drive the window (.title .info .warn .error .progress .ask .choose), answers arrive on stdin.
+# Installs the FFmpeg libraries for FRD into the current user's profile:  %LOCALAPPDATA%\FRD\ffmpeg\<version>\
+# FRD looks there on its own (newest version first), so the installer does not have to find FRD.exe, works for the single-file frd-<version>.exe
+# too, and one copy serves every FRD version. Nothing outside the user profile is touched.
+#
+# Runs inside a OneSetup installer window: lines starting with "." drive the window (.title .info .warn .error .progress .ask), answers arrive on stdin.
 # Exit codes: 0 installed, 1 failed, 2 cancelled.
 #
-# Environment (for scripted installs and tests):  FRD_DIR  folder that contains FRD.exe (skips the search and the questions)
+# Environment (scripted installs and tests):  FFMPEG_TARGET  install into this folder instead of the default
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-# Questions are only asked inside the installer window. Without it (headless, -y, scripts) nothing is guessed: FRD_DIR must name the target,
-# so an unattended run can never write into some other program's copy of FRD.
-$interactive = [string]::IsNullOrEmpty($env:FRD_DIR) -and ($env:ONESETUP_SHELL -eq 'ui')
+$interactive = ($env:ONESETUP_SHELL -eq 'ui') -and [string]::IsNullOrEmpty($env:FFMPEG_TARGET)
 
 function Say([string]$line) {
     [Console]::Out.WriteLine($line); [Console]::Out.Flush()
@@ -21,85 +22,31 @@ function Ask([string]$question, [string]$yes = 'Yes', [string]$no = 'No') {
     Say ".ask $question | $yes | $no"
     return ([Console]::In.ReadLine() -eq 'yes')
 }
-function Choose([string]$prompt, [string[]]$options) {
-    Say (".choose $prompt; " + ($options -join '; '))
-    $answer = [Console]::In.ReadLine()
-    if ($answer -match '^\d+$') { return [int]$answer }
-    return 0
-}
 
 Say '.title FFmpeg extension for FRD / FRD 的 FFmpeg 扩展'
 Progress 3
 
-# ---- where is FRD? -------------------------------------------------------------------------------------------------
-$candidates = New-Object 'System.Collections.Generic.List[string]'
-function Add-Candidate([string]$directory) {
-    if ([string]::IsNullOrWhiteSpace($directory)) { return }
-    if (-not (Test-Path -LiteralPath (Join-Path $directory 'FRD.exe'))) { return }
-    $full = (Resolve-Path -LiteralPath $directory).Path
-    if (-not $candidates.Contains($full)) { $candidates.Add($full) }
-}
-
-if ($env:FRD_DIR) {
-    if (-not (Test-Path -LiteralPath (Join-Path $env:FRD_DIR 'FRD.exe'))) { Fail "FRD_DIR does not contain FRD.exe: $env:FRD_DIR" }
-    Add-Candidate $env:FRD_DIR
-}
-elseif (-not $interactive) {
-    Fail 'Unattended install: set FRD_DIR to the folder that contains FRD.exe. / 无人值守安装需要设置 FRD_DIR 为 FRD.exe 所在目录。'
-}
+$version = (Get-Content -LiteralPath (Join-Path $here 'version.txt') -TotalCount 1).Trim()
+if ([string]::IsNullOrWhiteSpace($version)) { Fail 'The installer is missing its version file.' }
+if ($env:FFMPEG_TARGET) { $destination = $env:FFMPEG_TARGET }
 else {
-    Info 'Looking for FRD.exe / 正在查找 FRD.exe'
-    # 1) the folder the setup program itself was started from: the first ancestor process that is not a shell and not in %TEMP% or Windows
-    try {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$PID"
-        for ($i = 0; $i -lt 8 -and $process; $i++) {
-            $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($process.ParentProcessId)"
-            $path = $process.ExecutablePath
-            if ($path -and $path -notmatch '\\(cmd|powershell|conhost)\.exe$' -and -not $path.StartsWith($env:TEMP, [StringComparison]::OrdinalIgnoreCase) -and -not $path.StartsWith($env:windir, [StringComparison]::OrdinalIgnoreCase)) {
-                Add-Candidate (Split-Path -Parent $path); break
-            }
-        }
-    }
-    catch { }
-    # 2) a running FRD
-    Get-Process -Name FRD -ErrorAction SilentlyContinue | ForEach-Object { try { Add-Candidate (Split-Path -Parent $_.Path) } catch { } }
-    # 3) the usual per-user install folder, newest version first
-    $programs = Join-Path $env:LOCALAPPDATA 'Programs\FRD'
-    if (Test-Path -LiteralPath $programs) {
-        Get-ChildItem -LiteralPath $programs -Directory | Sort-Object LastWriteTime -Descending | ForEach-Object { Add-Candidate $_.FullName }
-    }
+    if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { Fail 'LOCALAPPDATA is not set; cannot find your profile. / 找不到用户目录。' }
+    $destination = Join-Path $env:LOCALAPPDATA "FRD\ffmpeg\$version"
 }
-Progress 12
+Info "Target: $destination"
+Progress 10
 
-$target = $null
-if ($candidates.Count -eq 1) {
-    $target = $candidates[0]
-    if ($interactive -and -not (Ask "Install the FFmpeg libraries next to FRD in $target ?" 'Install' 'Cancel')) { Fail 'Cancelled.' 2 }
+if ($interactive) {
+    $existing = Join-Path $destination 'avcodec-62.dll'
+    if (Test-Path -LiteralPath $existing) {
+        $current = (Get-Item -LiteralPath $existing).VersionInfo.FileVersion
+        if (-not (Ask "FFmpeg $version is already installed (avcodec $current). Replace it?" 'Replace' 'Cancel')) { Fail 'Cancelled.' 2 }
+    }
+    elseif (-not (Ask "Install FFmpeg $version for FRD in $destination ? Nothing outside your user profile is touched. / 安装到当前用户目录，不会改动其他位置。" 'Install' 'Cancel')) { Fail 'Cancelled.' 2 }
 }
-elseif ($candidates.Count -gt 1) {
-    $shown = @($candidates | Select-Object -First 4) + 'Another folder... / 其他目录...'
-    $pick = Choose 'Which FRD should get the FFmpeg libraries? / 装到哪个 FRD？' $shown
-    if ($pick -eq 0) { Fail 'Cancelled.' 2 }
-    if ($pick -le [Math]::Min(4, $candidates.Count)) { $target = $candidates[$pick - 1] }
-}
-if (-not $target) {
-    Add-Type -AssemblyName System.Windows.Forms
-    $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dialog.Description = 'Select the folder that contains FRD.exe / 选择包含 FRD.exe 的文件夹'
-    if ($dialog.ShowDialog() -ne 'OK') { Fail 'Cancelled.' 2 }
-    if (-not (Test-Path -LiteralPath (Join-Path $dialog.SelectedPath 'FRD.exe'))) { Fail "FRD.exe is not in $($dialog.SelectedPath) / 所选目录里没有 FRD.exe" }
-    $target = $dialog.SelectedPath
-}
-Info "FRD folder: $target"
-Progress 25
 
 # ---- copy -----------------------------------------------------------------------------------------------------------
 $source = Join-Path $here 'ffmpeg'
-$destination = Join-Path $target 'ffmpeg'
-if ((Test-Path -LiteralPath (Join-Path $destination 'avcodec-62.dll')) -and $interactive) {
-    $current = (Get-Item -LiteralPath (Join-Path $destination 'avcodec-62.dll')).VersionInfo.FileVersion
-    if (-not (Ask "FFmpeg libraries are already installed (avcodec $current). Replace them?" 'Replace' 'Cancel')) { Fail 'Cancelled.' 2 }
-}
 Info 'Copying FFmpeg libraries / 正在复制 FFmpeg 库'
 try {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
@@ -108,7 +55,7 @@ try {
     foreach ($file in $files) {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $destination $file.Name) -Force
         $index++
-        Progress (25 + [int](60 * $index / $files.Count))
+        Progress (10 + [int](75 * $index / $files.Count))
     }
 }
 catch {
@@ -128,8 +75,8 @@ foreach ($name in $expected.Keys) {
     if ($actual -ne $expected[$name]) { Fail "Checksum mismatch after copy: $name" }
 }
 Progress 97
-$version = (Get-Item -LiteralPath (Join-Path $destination 'avcodec-62.dll')).VersionInfo.FileVersion
-Info "Installed FFmpeg libraries ($($expected.Count) files, avcodec $version) in $destination"
-Info 'Restart FRD to use the FFmpeg presets. / 重启 FRD 即可使用 FFmpeg 预设。'
+$built = (Get-Item -LiteralPath (Join-Path $destination 'avcodec-62.dll')).VersionInfo.FileVersion
+Info "Installed FFmpeg $version ($($expected.Count) files, avcodec $built) in $destination"
+Info 'FRD finds it automatically; restart FRD to use the FFmpeg presets. / FRD 会自动找到它，重启 FRD 即可使用 FFmpeg 预设。'
 Progress 100
 exit 0

@@ -28,7 +28,7 @@ public static unsafe class FfmpegRuntime
     static string? configuredDirectory;
 
     /// <summary>Remembers where the optional FFmpeg extension would be installed; nothing is loaded until a codec needs it.</summary>
-    public static void Configure(string directory) => configuredDirectory = Path.GetFullPath(directory);
+    public static void Configure(string besideDirectory) => configuredDirectory = FfmpegLocator.Find(besideDirectory);
 
     /// <summary>True when the extension's native libraries are present (or already loaded).</summary>
     public static bool IsAvailable => loadedDirectory != null ||
@@ -73,7 +73,7 @@ public static unsafe class FfmpegRuntime
     {
         if (loadedDirectory != null) return;
         if (configuredDirectory == null || !File.Exists(Path.Combine(configuredDirectory, "avcodec-62.dll")))
-            throw new NotSupportedException("This codec needs the FFmpeg extension package (unpack its ffmpeg folder next to FRD.exe).");
+            throw new NotSupportedException("This codec needs the FFmpeg extension (run the FFmpeg extension installer, or put its ffmpeg folder next to FRD.exe).");
         Initialize(configuredDirectory);
     }
 

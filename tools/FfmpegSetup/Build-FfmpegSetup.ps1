@@ -1,5 +1,5 @@
 # Builds frd-ffmpeg-<version>-setup.exe: a OneSetup installer (https://github.com/KateY07/onesetup) that copies the FFmpeg libraries
-# next to FRD.exe. The zip package stays the scriptable alternative; this is the double-click one.
+# into %LOCALAPPDATA%\FRD\ffmpeg\<version>\, where FRD finds them. The zip package stays the scriptable alternative; this is the double-click one.
 #   .\tools\FfmpegSetup\Build-FfmpegSetup.ps1 [-OneSetup <path to onesetup.exe>] [-OutputDirectory artifacts]
 param(
     [string]$OneSetup,
@@ -26,6 +26,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\SOURCE-OFFER.txt') -Destination $payload
     Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.md') -Destination $payload
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.bat') -Destination $stage
+    [IO.File]::WriteAllText((Join-Path $stage 'version.txt'), "$FfmpegVersion`n")
     # install.ps1 carries Chinese text and is run by Windows PowerShell 5.1, which needs the UTF-8 byte order mark.
     $script = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Raw -Encoding UTF8
     [IO.File]::WriteAllText((Join-Path $stage 'install.ps1'), $script, (New-Object System.Text.UTF8Encoding($true)))
