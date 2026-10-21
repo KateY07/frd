@@ -316,7 +316,7 @@ Ctrl+Alt+F11    <span class="c"># toggle full screen</span>
 Ctrl+Alt+F12    <span class="c"># show/hide debug controls</span></pre></div>
     </div>
     <div class="note"><b>Security:</b> the token lives only for that launch — it is never saved or generated. <code>--listen localhost</code> is loopback only; <code>::</code> binds every interface, so use it on trusted networks. Installing the secure-desktop helper needs administrator consent (UAC), which you confirm yourself.</div>
-    <div class="note" style="margin-top:10px"><b>Not encrypted:</b> since v4 the token is never sent (challenge-response with mutual proof) and keyboard/mouse datagrams are signed, but the picture, clipboard and cursor data are not encrypted. Use FRD over a VPN or a trusted network.</div>
+    <div class="note" style="margin-top:10px"><b>Encryption is the underlay's job:</b> FRD authenticates connections (the token is never sent; challenge-response with mutual proof) and signs keyboard/mouse datagrams, but it deliberately does not encrypt content. It is designed to run over an already-encrypted link such as a VPN, a tunnel or a private network, so it adds no packet size or latency of its own for the picture, clipboard and cursor.</div>
   </section>
 
   <section id="log">

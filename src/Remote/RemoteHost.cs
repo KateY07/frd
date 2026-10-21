@@ -76,7 +76,7 @@ sealed class RemoteHost : IAsyncDisposable
         acceptTask = Task.WhenAll(listeners.Select(listener => Task.Run(() => AcceptAsync(listener))));
         var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
         Console.Error.WriteLine($"Remote listener ready: TCP+UDP {endpoints}");
-        Console.Error.WriteLine("[security] Connections are authenticated (the token is never sent) and keyboard/mouse datagrams are signed, but video, clipboard and cursor data are NOT encrypted. Use a VPN or a trusted network.");
+        Console.Error.WriteLine("[security] FRD authenticates connections (the token is never sent) and signs keyboard/mouse datagrams, but it does not encrypt content. It is designed to run over an already-encrypted link (VPN, tunnel or private network).");
         Status?.Invoke($"被控端正在监听 TCP+UDP {endpoints}\n等待主控连接；关闭此窗口停止监听。");
     }
 
