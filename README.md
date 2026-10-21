@@ -137,7 +137,7 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - `initialBitrateKbps` 设置有损编码初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示。不会按滑条数值额外限制链路，允许编码缓冲和帧发送突发。
 - `autoSelectCodec:true` 在启动时对标记 `autoProbe:true` 的有损预设做真实屏幕短测，探测进程最多运行 5 秒；不可用或超时则保留 `initialPreset`。`minimumAutoBitrateKbps` 可让高带宽预设仅在码率足够时参与。双机时被控端测捕获和编码，主控端用样本验证并测解码；结果只是当前画面、当前码率下的启动选择，手动切换始终可用。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 本版为 **Native AOT** 单文件 `FRD.exe`，不需要安装 .NET 运行时。FFmpeg 为可选扩展包：把 `frd-vX-ffmpeg-win-x64.zip`（X 为版本）解压到 `FRD.exe` 同目录即可启用 FFmpeg 预设。
+- 本版为 **Native AOT** 单文件 `FRD.exe`，不需要安装 .NET 运行时。FFmpeg 为可选扩展包：把 `frd-vX-ffmpeg-win-x64.zip`（X 为版本）解压到 `FRD.exe` 同目录即可启用 FFmpeg 预设。该扩展包也单独发布在 [FFmpeg extension 8.1.2](https://github.com/KateY07/frd/releases/tag/ffmpeg-8.1.2)，下载一次即可跨 FRD 版本使用。
 - 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\<版本>\`，不同版本分目录保留。
 - 发布流程：本机运行 `Publish.ps1` 生成基础包和 FFmpeg 扩展包（含 SHA-256），再用 `gh release create` 上传到 GitHub Release；不使用 GitHub Actions。
 
