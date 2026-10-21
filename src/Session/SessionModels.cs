@@ -33,6 +33,8 @@ public sealed record SessionStatus(string ActivePreset, int AppliedLimitKbps, do
     public double MeanDecodeMs { get; set; }
     public double MeanRenderMs { get; set; }
     public bool PacketDiagnosticsEnabled { get; set; }
+    /// <summary>The person at the host is using its keyboard or mouse; remote input is being dropped.</summary>
+    public bool HostBusy { get; set; }
     public double DiagnosticMbps { get; set; }
     public TransferTimings? TransferDetails { get; set; }
     public string TimingDescription { get; set; } = "同机单调时钟";

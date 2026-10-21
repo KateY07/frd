@@ -2,7 +2,7 @@
   "schemaVersion": 3,
   "width": 1280,
   "height": 720,
-  "framesPerSecond": 30,
+  "framesPerSecond": 25,
   "initialPreset": "mf_h264",
   "autoSelectCodec": false,
   "initialBitrateKbps": 2500,

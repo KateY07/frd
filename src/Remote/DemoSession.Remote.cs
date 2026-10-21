@@ -118,6 +118,7 @@ public sealed partial class DemoSession
             RequestRecovery();
         }
         activePreset = reply.Preset; appliedLimit = reply.LimitKbps; packetDiagnosticsEnabled = reply.Diagnostics;
+        Volatile.Write(ref hostBusy, reply.HostBusy);
         message = string.IsNullOrWhiteSpace(reply.Message) ? "远端发送；预设和码率完全手动" : reply.Message;
         return remoteNetwork = reply.Network ?? throw new InvalidDataException("Missing sender network statistics.");
         }
@@ -176,6 +177,19 @@ public sealed partial class DemoSession
         };
         udpSession.AttachSender(sender);
         encodeTask = Task.Run(EncodeLoop);
+    }
+
+    public async Task<AnnotationClient> ConnectRemoteAnnotationAsync(CancellationToken token)
+    {
+        if (remoteOptions == null || welcome == null) throw new InvalidOperationException("Remote session not connected.");
+        var client = await FrdNetwork.ConnectAsync(remote!.Endpoint.Address.ToString(), remoteOptions.Port, token);
+        try
+        {
+            var (reply, _) = await RemoteAuth.HandshakeAsync(client.GetStream(), remoteOptions.Token, new RemoteRequest("annotate", Session: welcome.Session), token);
+            if (!reply.Success) throw new IOException(reply.Message);
+            return new(client, token);
+        }
+        catch { client.Dispose(); throw; }
     }
 
     public async Task<CursorClient> ConnectRemoteCursorAsync(Action<CursorUpdate> received, Action<Exception> failed, CancellationToken token)

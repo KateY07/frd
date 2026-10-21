@@ -47,6 +47,7 @@ public sealed partial class DemoSession : IDisposable
     Task? serverTask, encodeTask, statusTask;
     Task? shutdown;
     string activePreset = "", message = "初始化";
+    bool hostBusy;
     int requestedGeneration, appliedGeneration, appliedLimit, receiveGeneration, decodedGeneration, renderedGeneration;
     long nextFrameId, nextPacketId, lastReceivedId = -1, encodedFrames, decodedFrames, encodeTicks, captureTicks, decodeTicks, lastRecovery;
     bool needCleanFrame = true, disposed;
@@ -125,7 +126,7 @@ public sealed partial class DemoSession : IDisposable
     public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null, int? framesPerSecond = null)
     {
         if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "仅支持原始分辨率 1×。", AppliedGeneration);
-        if (framesPerSecond is { } fps && fps is not (10 or 20 or 30 or 60)) return new(false, "仅支持 10/20/30/60 FPS。", AppliedGeneration);
+        if (framesPerSecond is { } fps && fps is not (10 or 20 or 25 or 30)) return new(false, "仅支持 10/20/25/30 FPS。", AppliedGeneration);
         if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
         if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
         if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
@@ -226,7 +227,7 @@ public sealed partial class DemoSession : IDisposable
                         if (cmd.LimitKbps < 100 || cmd.LimitKbps > config.MaximumBitrateKbps || cmd.Generation <= AppliedGeneration) throw new InvalidDataException("Invalid control revision or bitrate.");
                         var scale = cmd.Scale ?? config.TransmissionScale;
                         var fps = cmd.FramesPerSecond ?? config.FramesPerSecond;
-                        if (fps is not (10 or 20 or 30 or 60)) throw new InvalidDataException("Unsupported FPS.");
+                        if (fps is not (10 or 20 or 25 or 30)) throw new InvalidDataException("Unsupported FPS.");
                         TransmissionGeometry.ValidateScale(scale);
                         var dimensions = resizeCapture == null ? (Width: config.Width, Height: config.Height) :
                             captureDimensions?.Invoke() ?? TransmissionGeometry.Dimensions(sourceWidth, sourceHeight, scale);
@@ -449,6 +450,7 @@ public sealed partial class DemoSession : IDisposable
                     MeanTransferMs = presentation.Averages.Transfer, MeanDecodeMs = presentation.Averages.Decode,
                     MeanRenderMs = presentation.Averages.Render,
                     PacketDiagnosticsEnabled = Volatile.Read(ref packetDiagnosticsEnabled), DiagnosticMbps = network.DiagnosticMbps,
+                    HostBusy = Volatile.Read(ref hostBusy),
                     TransferDetails = presentation.Transfer,
                     HasRecentRenderTiming = presentation.Rendered > 0, RenderTimingSamples = presentation.Rendered,
                     HasRenderTiming = Interlocked.Read(ref presentationCount) > 0 && (remote == null || packetDiagnosticsEnabled),

@@ -53,6 +53,11 @@ sealed class RemoteUdpSession : IAsyncDisposable
     internal long AppliedInputs => Interlocked.Read(ref appliedInputs);
     internal int PendingInputs { get { lock (gate) return pendingInput.Count; } }
 
+    /// <summary>True while someone uses the host's own keyboard or mouse; remote events other than releases are then dropped.</summary>
+    public Func<bool>? LocalBusy { get; set; }
+    long droppedForLocal;
+    internal long DroppedForLocalInput => Interlocked.Read(ref droppedForLocal);
+
     public RemoteUdpSession(Socket socket, string session, CancellationToken token, Action<Exception>? failed = null)
     {
         this.socket = socket;
@@ -271,6 +276,12 @@ sealed class RemoteUdpSession : IAsyncDisposable
                     if (inputBinding == null || inputBinding.Fault != null || !inputBinding.Active || !inputBinding.Enabled() ||
                         !UdpInputProtocol.TryRead(bytes, inputBinding.Nonce, inputBinding.MacKey, out var sequence, out var input) || sequence <= latestInput) continue;
                     latestInput = sequence;
+                    // Releases always pass, otherwise a key or button pressed just before the local user took over would stay stuck down.
+                    if (input!.Kind is not (RemoteInputKind.MouseUp or RemoteInputKind.KeyUp or RemoteInputKind.ReleaseAll) && LocalBusy?.Invoke() == true)
+                    {
+                        Interlocked.Increment(ref droppedForLocal);
+                        continue;
+                    }
                     var queued = new QueuedInput(input!, received, sequence);
                     if (input!.Kind == RemoteInputKind.MouseMove && pendingInput.Last?.Value.Event.Kind == RemoteInputKind.MouseMove)
                         pendingInput.Last.Value = queued;

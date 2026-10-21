@@ -7,6 +7,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $tests = @(
     @{ Name = 'Stats';       Project = 'tests/Stats/StatsTests.csproj';                 Args = @() },
     @{ Name = 'Diagnostics'; Project = 'tests/Diagnostics/DiagnosticTests.csproj';      Args = @() },
+    @{ Name = 'UiLayout';    Project = 'FRD.csproj';                                    Args = @('--ui-layout-regression', (Join-Path ([IO.Path]::GetTempPath()) 'frd-ui-layout.json')) },
     @{ Name = 'Core';        Project = 'tests/Core/Core.csproj';                        Args = @('--transport', (Join-Path ([IO.Path]::GetTempPath()) 'frd-core-transport.json')) }
 )
 $failed = 0

@@ -48,7 +48,7 @@ public sealed record AppConfiguration
             throw new InvalidDataException("Expected schemaVersion=3 and even video dimensions between 64 and 7680×4320.");
         if (!double.IsFinite(config.MaximumBitrateMbps) || config.MaximumBitrateMbps is < .1 or > 1000)
             throw new InvalidDataException("maximumBitrateMbps must be between 0.1 and 1000.");
-        if (config.FramesPerSecond is not (10 or 20 or 30 or 60) || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
+        if (config.FramesPerSecond is not (10 or 20 or 25 or 30) || config.InitialBitrateKbps < 100 || config.InitialBitrateKbps > config.MaximumBitrateKbps || !config.Presets.ContainsKey(config.InitialPreset))
             throw new InvalidDataException("Invalid FPS, initial bitrate, or initial preset.");
         TransmissionGeometry.ValidateScale(config.TransmissionScale);
         foreach (var (id, preset) in config.Presets.Where(entry => entry.Value.Enabled))

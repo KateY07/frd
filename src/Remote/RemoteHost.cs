@@ -17,6 +17,18 @@ sealed class RemoteHost : IAsyncDisposable
     readonly CodecProbeSample[] probeSamples;
     readonly string token;
     readonly AuthThrottle throttle = new();
+    /// <summary>Set by the host window: true while someone uses the host's own keyboard or mouse.</summary>
+    public Func<bool>? LocalInputBusy { get; set; }
+    /// <summary>File transfer progress of the clipboard channel (null when idle).</summary>
+    public event Action<ClipboardTransferProgress?>? ClipboardProgress;
+    /// <summary>A step of the controller's shared annotation (raised on a background thread).</summary>
+    public event Action<AnnotationMessage>? AnnotationReceived;
+
+    public void SetAnnotationAllowed(bool allowed)
+    {
+        lock (gate) annotateAllowed = allowed;
+        Console.Error.WriteLine($"[host permission] Annotation {(allowed ? "allowed" : "revoked")}.");
+    }
     byte[] sessionKey = [];
     readonly TcpListener[] listeners;
     readonly Socket[] inputSockets;
@@ -30,7 +42,7 @@ sealed class RemoteHost : IAsyncDisposable
     internal long AppliedUdpInputs { get { lock (gate) return activeUdp?.AppliedInputs ?? 0; } }
     string sessionId = "";
     IPAddress? controller;
-    bool hasInput, hasClipboard, hasCursor;
+    bool hasInput, hasClipboard, hasCursor, hasAnnotate, annotateAllowed = true;
     bool inputAllowed = true, clipboardAllowed = true;
     CancellationTokenSource? inputPermissionStop, clipboardPermissionStop;
     nint clipboardOwner;
@@ -179,6 +191,32 @@ sealed class RemoteHost : IAsyncDisposable
                     }
                     return;
                 }
+                if (hello.Kind == "annotate")
+                {
+                    CancellationToken annotateToken;
+                    lock (gate)
+                    {
+                        if (activeStop == null || hello.Session != sessionId || !address.Equals(controller) || hasAnnotate)
+                            throw new InvalidDataException("Annotation channel does not belong to an available active session.");
+                        hasAnnotate = true; annotateToken = activeStop.Token;
+                    }
+                    try
+                    {
+                        await RemoteWire.WriteAsync(stream, new RemoteReply(true, ServerProof: serverProof), timeout.Token);
+                        await AnnotationWire.ServeAsync(client, message =>
+                        {
+                            bool allowed;
+                            lock (gate) allowed = annotateAllowed;
+                            if (allowed) AnnotationReceived?.Invoke(message);
+                        }, annotateToken);
+                    }
+                    finally
+                    {
+                        SessionTrace.Event("host-annotate-tcp", "closed");
+                        lock (gate) { if (sessionId == hello.Session) hasAnnotate = false; }
+                    }
+                    return;
+                }
                 if (hello.Kind == "clipboard")
                 {
                     CancellationToken clipboardToken;
@@ -195,6 +233,7 @@ sealed class RemoteHost : IAsyncDisposable
                     {
                         await RemoteWire.WriteAsync(stream, new RemoteReply(true, ServerProof: serverProof), timeout.Token);
                         await using var clipboard = new ClipboardSyncSession(client, new WindowsClipboard(clipboardOwner), token: clipboardToken);
+                        clipboard.ProgressChanged += value => ClipboardProgress?.Invoke(value);
                         await clipboard.Completion;
                     }
                     finally
@@ -264,7 +303,7 @@ sealed class RemoteHost : IAsyncDisposable
                 {
                     if (activeStop != null) throw new InvalidOperationException("被控端已有主控连接。");
                     activeStop = lifetime = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
-                    hasInput = hasClipboard = hasCursor = false;
+                    hasInput = hasClipboard = hasCursor = hasAnnotate = false;
                     controller = address; sessionId = id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
                     sessionKey = RemoteAuth.SessionKey(key, hostNonce, clientNonce);
                 }
@@ -275,6 +314,7 @@ sealed class RemoteHost : IAsyncDisposable
                     Volatile.Write(ref activeCapture, capture);
                     await using var udpSession = new RemoteUdpSession(FindInputSocket(address), id, lifetime.Token,
                         error => { SessionTrace.Error("host-udp", error); lifetime.Cancel(); });
+                    udpSession.LocalBusy = () => LocalInputBusy?.Invoke() == true;
                     lock (gate) activeUdp = udpSession;
                     var streamConfig = config with { Width = capture.Width, Height = capture.Height };
                     using var session = new DemoSession(streamConfig, capture.Capture, capture.Resize, capture.SourceWidth,
@@ -294,7 +334,7 @@ sealed class RemoteHost : IAsyncDisposable
                         received = Stopwatch.GetTimestamp();
                         if (request.Kind == "status")
                         {
-                            var status = session.SenderStatus();
+                            var status = session.SenderStatus() with { HostBusy = LocalInputBusy?.Invoke() == true };
                             if (capture.WaitingForSecureTransition)
                                 status = status with { Message = "安全桌面切换中：正在等待捕获画面恢复；会话保持连接" };
                             else if (capture.SecureActive)

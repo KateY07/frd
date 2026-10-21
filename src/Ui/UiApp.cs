@@ -7,6 +7,7 @@ static class UiApp
 {
     static void Prepare()
     {
+        UiIcons.Register();
         UiThread.Error += (source, error) => CrashLog.Write(source, error);
         // Screenshot aid kept from earlier builds: FRD_UI_ALLOW_CAPTURE=1 lets screen capture see FRD's own windows.
         if (Environment.GetEnvironmentVariable("FRD_UI_ALLOW_CAPTURE") == "1") Environment.SetEnvironmentVariable("GLASSPANE_ALLOW_CAPTURE", "1");

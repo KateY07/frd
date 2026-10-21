@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.ComponentModel;
@@ -139,6 +140,21 @@ public sealed class WindowsClipboard(nint owner) : IClipboardAccess
 
 public sealed record ClipboardEntry(string Path, bool Directory, long Length);
 public sealed record ClipboardManifest(string Kind, Guid Id, int TextBytes, string[] Roots, ClipboardEntry[] Entries);
+/// <summary>Progress of a file transfer in either direction (null when no transfer is running).</summary>
+public sealed record ClipboardTransferProgress(bool Sending, long DoneBytes, long TotalBytes, int FileIndex, int FileCount, string FileName)
+{
+    public double Fraction => TotalBytes <= 0 ? 0 : Math.Clamp((double)DoneBytes / TotalBytes, 0, 1);
+
+    static string Size(long bytes) => bytes >= 1L << 30 ? $"{bytes / (double)(1L << 30):0.##} GB" : bytes >= 1L << 20 ? $"{bytes / (double)(1L << 20):0.#} MB" : $"{bytes / 1024.0:0} KB";
+
+    /// <summary>For example "正在发送 2/5 · report.zip · 45% (12.3 MB / 27.5 MB)".</summary>
+    public string Describe()
+    {
+        var name = FileName.Length > 28 ? FileName[..25] + "…" : FileName;
+        return $"{(Sending ? "正在发送" : "正在接收")} {FileIndex}/{FileCount} · {name} · {Fraction * 100:0}% ({Size(DoneBytes)} / {Size(TotalBytes)})";
+    }
+}
+
 public sealed record ClipboardSyncStatus(long Sent, long Received, long SentBytes, long ReceivedBytes, string Message, bool Connected);
 
 public sealed class ClipboardSyncSession : IAsyncDisposable
@@ -161,6 +177,21 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
     ClipboardSyncStatus snapshot = new(0, 0, 0, 0, "等待新复制的文本或文件", true);
     public ClipboardSyncStatus Snapshot => Volatile.Read(ref snapshot);
     public Task Completion => work;
+
+    /// <summary>Raised (at most about ten times a second) while a file transfer runs, and with null when it ends.</summary>
+    public event Action<ClipboardTransferProgress?>? ProgressChanged;
+    ClipboardTransferProgress? progress;
+    long progressTick;
+    public ClipboardTransferProgress? Progress => Volatile.Read(ref progress);
+
+    void ReportProgress(ClipboardTransferProgress? value, bool force = false)
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (!force && value != null && now - Volatile.Read(ref progressTick) < Stopwatch.Frequency / 10) return;
+        Volatile.Write(ref progressTick, now); Volatile.Write(ref progress, value);
+        try { ProgressChanged?.Invoke(value); }
+        catch (Exception error) { Console.Error.WriteLine("[clipboard] Progress callback failed: " + error.Message); }
+    }
 
     public ClipboardSyncSession(TcpClient client, IClipboardAccess clipboard, string? cacheRoot = null, CancellationToken token = default)
     {
@@ -232,13 +263,24 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
             var prefix = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(prefix, header.Length);
             await stream.WriteAsync(prefix, stop.Token); await stream.WriteAsync(header, stop.Token);
             if (text != null) { await stream.WriteAsync(text, stop.Token); Interlocked.Add(ref sentBytes, text.Length); }
-            else foreach (var entry in manifest.Entries.Where(entry => !entry.Directory))
+            else
             {
-                var path = files[entry.Path]; RejectReparse(path);
-                await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                if (file.Length != entry.Length) throw new IOException("复制过程中源文件发生变化。");
-                var hash = await TransferAsync(file, stream, entry.Length);
-                await stream.WriteAsync(hash, stop.Token); Interlocked.Add(ref sentBytes, entry.Length);
+                var sendEntries = manifest.Entries.Where(entry => !entry.Directory).ToArray();
+                long sendTotal = sendEntries.Sum(entry => entry.Length), sendDone = 0;
+                try
+                {
+                    for (var index = 0; index < sendEntries.Length; index++)
+                    {
+                        var entry = sendEntries[index]; var number = index + 1; var shown = Path.GetFileName(entry.Path);
+                        var path = files[entry.Path]; RejectReparse(path);
+                        await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                        if (file.Length != entry.Length) throw new IOException("复制过程中源文件发生变化。");
+                        var hash = await TransferAsync(file, stream, entry.Length,
+                            count => { sendDone += count; ReportProgress(new(true, sendDone, sendTotal, number, sendEntries.Length, shown)); });
+                        await stream.WriteAsync(hash, stop.Token); Interlocked.Add(ref sentBytes, entry.Length);
+                    }
+                }
+                finally { ReportProgress(null, true); }
             }
             Interlocked.Increment(ref sent); Publish("剪贴板内容已发送");
         }
@@ -276,19 +318,28 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                     if (used + incoming > MaximumFileBytes * 2) throw new IOException("剪贴板缓存超过 4 GiB，请在粘贴完成后清理 FRD/Clipboard 缓存。");
                     directory = Path.Combine(cacheRoot, Guid.NewGuid().ToString("N"));
                     Directory.CreateDirectory(directory);
-                    foreach (var entry in manifest.Entries)
+                    var receiveFiles = manifest.Entries.Count(entry => !entry.Directory);
+                    long receiveTotal = manifest.Entries.Sum(entry => entry.Length), receiveDone = 0;
+                    var receiveNumber = 0;
+                    try
                     {
-                        var destination = Resolve(directory, entry.Path);
-                        if (entry.Directory) { Directory.CreateDirectory(destination); continue; }
-                        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                        await using (var file = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.Asynchronous))
+                        foreach (var entry in manifest.Entries)
                         {
-                            var actual = await TransferAsync(stream, file, entry.Length);
-                            var expected = new byte[32]; await stream.ReadExactlyAsync(expected, stop.Token);
-                            if (!CryptographicOperations.FixedTimeEquals(actual, expected)) throw new InvalidDataException("剪贴板文件 SHA-256 校验失败。");
+                            var destination = Resolve(directory, entry.Path);
+                            if (entry.Directory) { Directory.CreateDirectory(destination); continue; }
+                            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                            var number = ++receiveNumber; var shown = Path.GetFileName(entry.Path);
+                            await using (var file = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536, FileOptions.Asynchronous))
+                            {
+                                var actual = await TransferAsync(stream, file, entry.Length,
+                                    count => { receiveDone += count; ReportProgress(new(false, receiveDone, receiveTotal, number, receiveFiles, shown)); });
+                                var expected = new byte[32]; await stream.ReadExactlyAsync(expected, stop.Token);
+                                if (!CryptographicOperations.FixedTimeEquals(actual, expected)) throw new InvalidDataException("剪贴板文件 SHA-256 校验失败。");
+                            }
+                            Interlocked.Add(ref receivedBytes, entry.Length);
                         }
-                        Interlocked.Add(ref receivedBytes, entry.Length);
                     }
+                    finally { ReportProgress(null, true); }
                     contents = new(Paths: manifest.Roots.Select(path => Resolve(directory, path)).ToArray(), Origin: marker);
                 }
                 lock (clipboardGate)
@@ -310,7 +361,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
         }
     }
 
-    async Task<byte[]> TransferAsync(Stream source, Stream destination, long length)
+    async Task<byte[]> TransferAsync(Stream source, Stream destination, long length, Action<int>? progress = null)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(65536);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
@@ -323,6 +374,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                 hash.AppendData(buffer, 0, count);
                 await destination.WriteAsync(buffer.AsMemory(0, count), stop.Token);
                 remaining -= count;
+                progress?.Invoke(count);
             }
             return hash.GetHashAndReset();
         }

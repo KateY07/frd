@@ -19,7 +19,7 @@ sealed record RemoteWelcome(string Session, int Width, int Height, int SourceWid
 sealed record RemoteReply(bool Success, string Message = "", RemoteWelcome? Welcome = null, ControlResult? Control = null,
     NetworkSnapshot? Network = null, string Preset = "", int LimitKbps = 0, bool Diagnostics = false,
     long ReceiveTick = 0, long SendTick = 0, long Frequency = 0,
-    int Generation = 0, int Width = 0, int Height = 0, string InputSession = "", string ServerProof = "");
+    int Generation = 0, int Width = 0, int Height = 0, string InputSession = "", string ServerProof = "", bool HostBusy = false);
 
 static class RemoteWire
 {

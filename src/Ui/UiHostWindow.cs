@@ -14,6 +14,7 @@ sealed class UiHostPanel : UiGlassPanel
     public readonly UiLabel Status = new("等待主控", 13) { MaxWidth = 150 };
     public readonly UiButton Input = new() { Label = "", Icon = "mouse", IsToggle = true, IsVisible = false, ToolTip = "键鼠：允许主控使用键盘和鼠标" };
     public readonly UiButton Clipboard = new() { Label = "", Icon = "clipboard", IsToggle = true, IsVisible = false, ToolTip = "剪贴板：允许与主控同步" };
+    public readonly UiButton Annotate = new() { Label = "", Icon = "pen", IsToggle = true, IsVisible = false, ToolTip = "标注：允许主控在本机屏幕上画笔" };
     public readonly UiButton Disconnect = new() { Icon = "power", IsDanger = true, IsVisible = false, ToolTip = "断开当前主控" };
     public readonly UiButton More = new() { Icon = "sliders", IsToggle = true, ToolTip = "监听地址、会话时长与安全桌面服务" };
     public readonly UiButton Collapse = new() { Icon = "chevrons", ToolTip = "收起为悬浮球（空闲 10 秒自动收起）" };
@@ -25,13 +26,17 @@ sealed class UiHostPanel : UiGlassPanel
     readonly UiElement[] moreElements;
     float dotX, dotY;
     bool installVisible;
+    RectangleF transferRect;
+
+    /// <summary>The running file transfer, shown as a text line and a thin bar under the card's first row.</summary>
+    public ClipboardTransferProgress? Transfer { get; set; }
 
     public UiHostPanel(object gate) : base(gate)
     {
         MaxWidth = 320;
         moreElements = [ListenTitle, DurationTitle, ServiceTitle, ListenValue, DurationValue, ServiceValue, Install, Quit];
-        elements = [Status, Input, Clipboard, Disconnect, More, Collapse, .. moreElements];
-        Input.IsChecked = true; Clipboard.IsChecked = true;
+        elements = [Status, Input, Clipboard, Annotate, Disconnect, More, Collapse, .. moreElements];
+        Input.IsChecked = true; Clipboard.IsChecked = true; Annotate.IsChecked = true;
     }
 
     public bool MoreOpen => More.IsChecked == true;
@@ -41,7 +46,9 @@ sealed class UiHostPanel : UiGlassPanel
     public void SetInstallVisible(bool visible) { installVisible = visible; Install.IsVisible = visible; Invalidate?.Invoke(); }
     public void Wire(Action invalidate) { Invalidate = invalidate; foreach (var element in elements) element.Invalidate = invalidate; }
 
-    protected override float MeasureContent(UiText text, float width)
+    const float TransferRowHeight = 34;
+
+    float MeasureBase()
     {
         var height = 28f;
         if (!MoreOpen) return height;
@@ -50,22 +57,26 @@ sealed class UiHostPanel : UiGlassPanel
         return height + 4 + 28;
     }
 
+    protected override float MeasureContent(UiText text, float width) => MeasureBase() + (Transfer != null ? TransferRowHeight : 0);
+
     protected override void LayoutContent(UiText text, RectangleF content)
     {
         var x = content.X; var y = content.Y; var width = content.Width;
         var buttons = new List<UiButton>();
-        if (Controlled) buttons.AddRange([Input, Clipboard, Disconnect]);
+        if (Controlled) buttons.AddRange([Input, Clipboard, Annotate, Disconnect]);
         buttons.AddRange([More, Collapse]);
-        foreach (var hidden in new[] { Input, Clipboard, Disconnect }) hidden.IsVisible = Controlled;
+        foreach (var hidden in new[] { Input, Clipboard, Annotate, Disconnect }) hidden.IsVisible = Controlled;
         var sizes = buttons.Select(button => button.Measure(text, 0)).ToArray();
         var buttonsWidth = sizes.Sum(size => size.X) + 2 * (buttons.Count - 1);
-        var cursor = x + width - buttonsWidth;
+        var buttonsLeft = x + width - buttonsWidth;
+        var cursor = buttonsLeft;
         for (var i = 0; i < buttons.Count; i++) { buttons[i].Bounds = new RectangleF(cursor, y, sizes[i].X, 28); cursor += sizes[i].X + 2; }
         dotX = x + 12; dotY = y + 14;
-        Status.MaxWidth = Math.Max(40, cursor - x - 36);
+        Status.MaxWidth = Math.Max(30, buttonsLeft - (x + 23) - 8);
         var statusSize = Status.Measure(text, 0);
-        Status.Bounds = new RectangleF(x + 23, y + 14 - statusSize.Y / 2, Status.MaxWidth, statusSize.Y);
+        Status.Bounds = new RectangleF(x + 23, y + 14 - statusSize.Y / 2, Math.Min(statusSize.X, Status.MaxWidth), statusSize.Y);
         foreach (var element in moreElements) element.IsVisible = MoreOpen && (element != Install || installVisible);
+        transferRect = Transfer != null ? new RectangleF(x + 6, content.Y + MeasureBase() + 2, width - 12, TransferRowHeight - 4) : default;
         if (!MoreOpen) return;
         y += 28 + 11;
         var left = x + 6; var valueX = left + 92;
@@ -88,6 +99,13 @@ sealed class UiHostPanel : UiGlassPanel
         paint.FillCircle(new Vector2(dotX, dotY), 4, UiPaint.WithAlpha(StatusColor, opacity));
         foreach (var element in elements) if (element.IsVisible) element.Draw(paint, opacity);
         if (MoreOpen) paint.FillRounded(new RectangleF(CurrentRect.X + 11, CurrentRect.Y + 5 + 28 + 5, CurrentRect.Width - 22, 1), 0, UiPaint.WithAlpha(UiTheme.Line, opacity));
+        if (Transfer is { } transfer && transferRect.Width > 0)
+        {
+            paint.DrawText(transfer.Describe(), transferRect.X, transferRect.Y, 11, UiPaint.WithAlpha(UiTheme.Subtle, opacity), 400, false, transferRect.Width);
+            var track = new RectangleF(transferRect.X, transferRect.Y + 20, transferRect.Width, 4);
+            paint.FillRounded(track, 2, UiPaint.WithAlpha(UiTheme.Track, opacity));
+            paint.FillRounded(new RectangleF(track.X, track.Y, Math.Max(4, track.Width * (float)transfer.Fraction), track.Height), 2, UiPaint.WithAlpha(UiTheme.Thumb, opacity));
+        }
     }
 }
 
@@ -102,6 +120,7 @@ sealed class UiHostWindow : UiWindow
     readonly UiDevices devices;
     readonly UiText text;
     readonly UiBackdrop backdrop = new();
+    UiAnnotationOverlay? overlay;
     UiSurface? surface;
     UiPaint? paint;
     readonly UiTimer tick = new(500), animationTimer = new(16);
@@ -133,9 +152,34 @@ sealed class UiHostWindow : UiWindow
         panel.Disconnect.Click += () => server!.DisconnectActive();
         panel.Clipboard.CheckedChanged += () => server!.SetClipboardAllowed(panel.Clipboard.IsChecked == true);
         panel.Input.CheckedChanged += () => server!.SetInputAllowed(panel.Input.IsChecked == true);
+        panel.Annotate.CheckedChanged += () =>
+        {
+            var allowed = panel.Annotate.IsChecked == true;
+            server!.SetAnnotationAllowed(allowed);
+            if (!allowed) overlay?.Reset();
+        };
         panel.Install.Click += InstallHelper;
 
         server = new(config, addresses, port, token, probeSamples);
+        server.ClipboardProgress += value => UiThread.Post(() =>
+        {
+            var changedShape = (panel.Transfer == null) != (value == null);
+            lock (sceneGate) { panel.Transfer = value; if (changedShape) panel.Relayout(text); }
+            if (changedShape) ApplyRegion();
+            RequestRender();
+        });
+        server.AnnotationReceived += message =>
+        {
+            var current = overlay;
+            if (current != null) { current.Enqueue(message); return; }
+            UiThread.Post(() =>
+            {
+                try { (overlay ??= new UiAnnotationOverlay()).Enqueue(message); }
+                catch (Exception error) { Console.Error.WriteLine("[annotation] " + error.Message); }
+            });
+        };
+        LocalInputMonitor.Start();
+        server.LocalInputBusy = () => LocalInputMonitor.IsActive;
         server.ControllerChanged += address => UiThread.Post(() => OnControllerChanged(address));
         server.Status += message => UiThread.Post(() => panel.Status.ToolTip = message);
         server.Failed += error => UiThread.Post(() => { Console.Error.WriteLine(error); RemoteLaunch.hostExitCode = 1; Close(); });
@@ -191,7 +235,7 @@ sealed class UiHostWindow : UiWindow
     void OnControllerChanged(IPAddress? address)
     {
         controlled = address != null;
-        if (controlled) connectedAt = DateTime.UtcNow;
+        if (controlled) connectedAt = DateTime.UtcNow; else overlay?.Reset();
         lock (sceneGate)
         {
             panel.Controlled = controlled;
@@ -206,8 +250,16 @@ sealed class UiHostWindow : UiWindow
         ApplyRegion(); RequestRender();
     }
 
+    bool localBusyReported;
+
     void OnTick()
     {
+        var busy = LocalInputMonitor.IsActive;
+        if (busy != localBusyReported)
+        {
+            localBusyReported = busy;
+            if (controlled) Console.Error.WriteLine(busy ? "[input] Local keyboard/mouse in use: remote input is paused." : "[input] Local keyboard/mouse idle: remote input resumes.");
+        }
         if (controlled && panel.MoreOpen) { lock (sceneGate) panel.DurationValue.Text = (DateTime.UtcNow - connectedAt).ToString(@"hh\:mm\:ss"); }
         if (closing || panel.Animating || panel.Collapsed || panel.IsPointerOver) return;
         if (Environment.TickCount64 - lastActivity >= 10_000) Animate(true);
@@ -329,6 +381,8 @@ sealed class UiHostWindow : UiWindow
 
     protected override void OnDestroying()
     {
+        LocalInputMonitor.Stop();
+        overlay?.Dispose(); overlay = null;
         tick.Dispose(); animationTimer.Dispose();
         backdrop.Dispose(); paint?.Dispose(); surface?.Dispose(); devices.Dispose();
     }

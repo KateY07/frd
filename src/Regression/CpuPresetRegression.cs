@@ -44,7 +44,7 @@ static class CpuPresetRegression
         var stats = capture.Statistics;
         if (stats?.CapturePath != "NativeNoScale" || stats.CpuRowCopyMs != 0)
             throw new InvalidDataException("x264rgb did not use a native-size mapped DDA frame without an application row copy.");
-        foreach (var fps in new[] { 10, 20, 30, 60 })
+        foreach (var fps in new[] { 10, 20, 25, 30 })
         {
             var result = await session.ApplyAsync("h264_rgb_fast", 2000, framesPerSecond: fps);
             if (!result.Success || result.FramesPerSecond != fps || session.Configuration.FramesPerSecond != fps)
@@ -64,7 +64,7 @@ static class CpuPresetRegression
             Passed = true, Capture = "DDA native-size staging Map; no application pixel row copy",
             CaptureSize = new { capture.SourceWidth, capture.SourceHeight },
             X264Rgb = new { stats.CapturePath, stats.CpuRowCopyMs },
-            RuntimeFpsSwitches = new[] { 10, 20, 30, 60 },
+            RuntimeFpsSwitches = new[] { 10, 20, 25, 30 },
             UdpFrames = received.Count,
             Scope = "Synthetic x264rgb codec roundtrip plus real desktop frame through localhost UDP, decoder and session callback; display scan-out is not tested."
         }, AppConfiguration.JsonOptions));

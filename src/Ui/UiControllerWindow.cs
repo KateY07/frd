@@ -51,6 +51,7 @@ sealed class UiControllerWindow : UiWindow
     RemoteInputClient? inputClient;
     ClipboardSyncSession? clipboardSync;
     CursorClient? cursorClient;
+    AnnotationClient? annotationClient;
     readonly SemaphoreSlim clipboardTransition = new(1, 1);
     bool updatingClipboard;
     Task? inputWorker;
@@ -59,6 +60,22 @@ sealed class UiControllerWindow : UiWindow
     bool updatingInput, changingDiagnostics, updatingDiagnostics;
     long inputSent, inputRejected, coalescedMoves;
     SessionStatus? pendingStatus;
+    bool hostBusyShown;
+    readonly RemoteCursorOverlay remoteCursor = new();
+    readonly AnnotationBoard board = new();
+    bool annotating, resumeInputAfterAnnotate, updatingTool;
+    AnnotationKind tool = AnnotationKind.Pen;
+    bool textEditing;
+    Vector2 textAt;
+    readonly System.Text.StringBuilder textBuffer = new();
+    float TextFontFraction(float fitWidth) => (panel.Thick.IsChecked == true ? 30f : 20f) / Math.Max(1, fitWidth);
+    Vortice.Mathematics.Color4 penColor = UiPaint.Hex(0xFFFF4D4F);
+
+    static uint ToArgb(Vortice.Mathematics.Color4 c) =>
+        ((uint)MathF.Round(c.A * 255) << 24) | ((uint)MathF.Round(c.R * 255) << 16) | ((uint)MathF.Round(c.G * 255) << 8) | (uint)MathF.Round(c.B * 255);
+    [System.Runtime.InteropServices.DllImport("user32.dll")] static extern short GetKeyState(int key);
+    bool showRemoteCursor;
+    ClipboardTransferProgress? transfer;
     DateTime stoppingSince;
     bool started, stopping, allowClose, applying, applyAgain, disconnected, restartRequested, scheduledClose;
     long receivedFrames, shownFrames;
@@ -86,6 +103,27 @@ sealed class UiControllerWindow : UiWindow
         panel = new UiControlPanel(sceneGate);
         panel.Wire(() => preview?.Invalidate());
         panel.StatusName.Text = remote?.Host ?? "本机演示";
+        panel.Annotate.CheckedChanged += OnAnnotateChanged;
+        foreach (var swatch in panel.Swatches)
+        {
+            var chosen = swatch;
+            swatch.Click += () => { foreach (var other in panel.Swatches) other.IsSelected = ReferenceEquals(other, chosen); penColor = chosen.Fill; preview?.Invalidate(); };
+        }
+        void SelectTool(UiButton chosen, AnnotationKind kind)
+        {
+            if (updatingTool) return;
+            updatingTool = true;
+            foreach (var button in new[] { panel.ToolPen, panel.ToolRect, panel.ToolText }) button.IsChecked = ReferenceEquals(button, chosen);
+            updatingTool = false;
+            CommitText();
+            tool = kind;
+        }
+        panel.ToolPen.CheckedChanged += () => { if (panel.ToolPen.IsChecked == true) SelectTool(panel.ToolPen, AnnotationKind.Pen); else if (!updatingTool) panel.ToolPen.IsChecked = tool == AnnotationKind.Pen; };
+        panel.ToolRect.CheckedChanged += () => { if (panel.ToolRect.IsChecked == true) SelectTool(panel.ToolRect, AnnotationKind.Rectangle); else if (!updatingTool) panel.ToolRect.IsChecked = tool == AnnotationKind.Rectangle; };
+        panel.ToolText.CheckedChanged += () => { if (panel.ToolText.IsChecked == true) SelectTool(panel.ToolText, AnnotationKind.Text); else if (!updatingTool) panel.ToolText.IsChecked = tool == AnnotationKind.Text; };
+        panel.Undo.Click += () => { board.Undo(); annotationClient?.Undo(); preview?.Invalidate(); };
+        panel.ClearBoard.Click += () => { board.Clear(); annotationClient?.Clear(); preview?.Invalidate(); };
+        panel.ShowRemoteCursor.CheckedChanged += () => { Volatile.Write(ref showRemoteCursor, panel.ShowRemoteCursor.IsChecked == true); preview?.Invalidate(); };
         panel.Backdrop = (paint, rect, radius, _) => preview!.DrawGlass(paint, rect, radius);   // preview is assigned right below, before the first draw
         panel.AnimationFinished += _ => { UiThread.Post(() => { UpdateOrbShape(); }); };
         panel.InteractionStarted = () => lastActivity = Environment.TickCount64;
@@ -267,7 +305,11 @@ sealed class UiControllerWindow : UiWindow
             else session = new(config, remoteOptions);
             session.Failed += error => UiThread.Post(() => ReportError(error));
             session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(new VideoFrame(frame.Bgra, frame.Width, frame.Height, frame.Pts)); };
-            session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
+            session.StatusChanged += status =>
+            {
+                lock (receiveGate) pendingStatus = status;
+                if (Volatile.Read(ref hostBusyShown) != status.HostBusy) { Volatile.Write(ref hostBusyShown, status.HostBusy); preview.Invalidate(); }
+            };
             await session.StartAsync();
             if (remoteOptions != null)
             {
@@ -285,6 +327,8 @@ sealed class UiControllerWindow : UiWindow
                 cursorClient = await session.ConnectRemoteCursorAsync(update => UiThread.Post(() =>
                 {
                     if (stopping) return;
+                    remoteCursor.Apply(update);
+                    if (Volatile.Read(ref showRemoteCursor)) preview.Invalidate();
                     try { inputSource?.SetRemoteCursor(update); }
                     catch (Exception error) { ReportError(error); }
                 }), error => UiThread.Post(() =>
@@ -292,8 +336,18 @@ sealed class UiControllerWindow : UiWindow
                     Console.Error.WriteLine("[cursor] Auxiliary channel failed; video session remains active: " + error);
                     operation.Text = "远端光标同步中断；视频会话仍在运行。";
                 }), inputStop.Token);
+            if (session.IsRemote)
+            {
+                try
+                {
+                    var channel = await session.ConnectRemoteAnnotationAsync(inputStop.Token);
+                    channel.Failed += error => UiThread.Post(() => { Console.Error.WriteLine("[annotation] Channel failed; strokes stay local: " + error.Message); annotationClient = null; });
+                    annotationClient = channel;
+                }
+                catch (Exception error) { Console.Error.WriteLine("[annotation] The host does not accept annotations; they stay local: " + error.Message); }
+            }
             if (stopping) return;
-            started = true; UpdateOrbShape(); presets.IsEnabled = true; UpdateBitrateAvailability();
+            started = true; UpdateOrbShape(); presets.IsEnabled = true; UpdateBitrateAvailability(); panel.Annotate.IsEnabled = true;
             foreach (var button in fpsButtons) button.IsEnabled = true;
             inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
             clipboardEnabled.IsEnabled = session.IsRemote;
@@ -359,6 +413,7 @@ sealed class UiControllerWindow : UiWindow
                 if (enabled)
                 {
                     clipboardSync = await session!.ConnectRemoteClipboardAsync(new WindowsClipboard(Handle), inputStop.Token);
+                    clipboardSync.ProgressChanged += value => { Volatile.Write(ref transfer, value); preview.Invalidate(); };
                     clipboardSync.Status += status => UiThread.Post(() =>
                     {
                         clipboardMessage.Text = status.Message;
@@ -661,10 +716,11 @@ sealed class UiControllerWindow : UiWindow
         stopping = true; stoppingSince = DateTime.UtcNow; debounce.Stop(); autoClose.Stop();
         ShutdownGuard.Arm("controller", TimeSpan.FromSeconds(10));
         SessionTrace.Event("window", disconnected ? "closing-after-disconnect" : scheduledClose ? "closing-scheduled" : "closing-by-user-or-test");
-        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; operation.Text = "正在关闭…（再次点击关闭可强制退出）";
+        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; panel.Annotate.IsEnabled = false; operation.Text = "正在关闭…（再次点击关闭可强制退出）";
         var sessionStopped = true;
         try { await ShutdownGuard.Bounded(() => SetClipboardAsync(false), "clipboard"); } catch (Exception ex) { ReportError(ex); }
         try { if (cursorClient != null) await ShutdownGuard.Bounded(() => cursorClient.DisposeAsync().AsTask(), "cursor"); } catch (Exception ex) { ReportError(ex); }
+        try { if (annotationClient != null) await ShutdownGuard.Bounded(() => annotationClient.DisposeAsync().AsTask(), "annotation"); } catch (Exception ex) { ReportError(ex); }
         try { await ShutdownGuard.Bounded(StopInputAsync, "input"); } catch (Exception ex) { ReportError(ex); }
         try { if (session != null) sessionStopped = await ShutdownGuard.Bounded(() => session.StopAsync(), "session", TimeSpan.FromSeconds(5)); }
         catch (Exception ex) { ReportError(ex); }
@@ -690,7 +746,7 @@ sealed class UiControllerWindow : UiWindow
         if (remoteOptions == null) { UiThread.Post(Close); return; }
         disconnected = true;
         inputForwarding = false; inputSource?.SetEnabled(false);
-        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false;
+        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; panel.Annotate.IsEnabled = false;
         foreach (var button in fpsButtons) button.IsEnabled = false;
         panel.SetReconnectVisible(true); panel.More.IsChecked = true; UpdateOrbShape();
         operation.Text = $"原连接已中断：{ex.Message}；点击“重新建立会话”将创建新连接。";
@@ -737,6 +793,23 @@ sealed class UiControllerWindow : UiWindow
 
     void DrawOverlay(UiPaint paint, float width, float height)
     {
+        if ((board.HasShapes || textEditing) && preview.VideoWidth > 0)
+        {
+            var area = UiVideoView.FitRect(width, height, preview.VideoWidth, preview.VideoHeight);
+            board.Draw(paint, new RectangleF(area.X, area.Y, area.Width, area.Height));
+            if (textEditing)
+            {
+                var fontSize = Math.Max(8f, TextFontFraction(area.Width) * area.Width);
+                var x = area.X + textAt.X * area.Width; var y = area.Y + textAt.Y * area.Height;
+                paint.DrawText(textBuffer.ToString() + "|", x + 1, y + 1, fontSize, new Vortice.Mathematics.Color4(0, 0, 0, .55f), 600);
+                paint.DrawText(textBuffer.ToString() + "|", x, y, fontSize, penColor, 600);
+            }
+        }
+        if (Volatile.Read(ref showRemoteCursor) && preview.VideoWidth > 0)
+        {
+            var fit = UiVideoView.FitRect(width, height, preview.VideoWidth, preview.VideoHeight);
+            remoteCursor.Draw(paint, new RectangleF(fit.X, fit.Y, fit.Width, fit.Height), fit.Width / preview.VideoWidth);
+        }
         var lines = Volatile.Read(ref infoLines);
         if (showInfo.IsChecked == true && lines.Length > 0 && width > 200)
         {
@@ -746,6 +819,28 @@ sealed class UiControllerWindow : UiWindow
             var box = new RectangleF(12, Math.Max(12, height - boxHeight - 12), boxWidth, boxHeight);
             paint.FillRounded(box, 8, UiPaint.Hex(0xB817202B));
             for (var i = 0; i < lines.Length; i++) paint.DrawText(lines[i], box.X + 10, box.Y + 6 + i * lineHeight, 11, UiPaint.WithAlpha(UiPaint.Hex(0xFFFFFFFF), .85f), 400, true, box.Width - 20);
+        }
+        if (Volatile.Read(ref transfer) is { } moving && width > 260)
+        {
+            var text = moving.Describe();
+            var size = paint.Text.Measure(text, 12);
+            var boxWidth = Math.Min(width - 24, Math.Max(280, size.X + 36));
+            var box = new RectangleF((width - boxWidth) / 2, height - 78, boxWidth, 50);
+            paint.FillRounded(box, 12, UiPaint.Hex(0xD017202B));
+            paint.StrokeRounded(box, 12, UiTheme.Border);
+            paint.DrawText(text, box.X + 18, box.Y + 9, 12, UiTheme.Text, 400, false, box.Width - 36);
+            var track = new RectangleF(box.X + 18, box.Y + 32, box.Width - 36, 5);
+            paint.FillRounded(track, 2.5f, UiTheme.Track);
+            paint.FillRounded(new RectangleF(track.X, track.Y, Math.Max(5, track.Width * (float)moving.Fraction), track.Height), 2.5f, UiTheme.Thumb);
+        }
+        if (inputForwarding && Volatile.Read(ref hostBusyShown))
+        {
+            const string notice = "对方正在操作，请等待";
+            var size = paint.Text.Measure(notice, 13);
+            var banner = new RectangleF((width - size.X - 36) / 2, Math.Max(70, height * .12f), size.X + 36, size.Y + 18);
+            paint.FillRounded(banner, 12, UiPaint.Hex(0xD0301A14));
+            paint.StrokeRounded(banner, 12, UiPaint.Hex(0x80FFC45C));
+            paint.DrawText(notice, banner.X + 18, banner.Y + 9, 13, UiPaint.Hex(0xFFFFE2A8));
         }
         lock (sceneGate)
         {
@@ -796,6 +891,7 @@ sealed class UiControllerWindow : UiWindow
                 if (!trackingMouse) { var track = new TRACKMOUSEEVENT { cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf<TRACKMOUSEEVENT>(), dwFlags = 2, hwndTrack = Handle }; TrackMouseEvent(ref track); trackingMouse = true; }
                 var point = ToDip(lParam);
                 lastPointer = point;
+                if (annotating && board.IsDrawing) { var relative = ToRelative(point); board.Add(relative); annotationClient?.Add(relative.X, relative.Y); preview.Invalidate(); }
                 lock (sceneGate)
                 {
                     panel.PointerMove(point);
@@ -816,6 +912,24 @@ sealed class UiControllerWindow : UiWindow
                 bool consumed;
                 lock (sceneGate) consumed = panel.PointerDown(point);
                 if (consumed) { SetCapture(Handle); handled = true; }
+                else if (annotating && preview.VideoWidth > 0)
+                {
+                    CommitText();
+                    var relative = ToRelative(point);
+                    var fit = UiVideoView.FitRect(ClientWidth / Scale, ClientHeight / Scale, preview.VideoWidth, preview.VideoHeight);
+                    if (tool == AnnotationKind.Text)
+                    {
+                        textEditing = true; textAt = relative; textBuffer.Clear();
+                        handled = true; preview.Invalidate();
+                    }
+                    else
+                    {
+                        var widthFraction = (panel.Thick.IsChecked == true ? 7f : 3f) / Math.Max(1, fit.Width);
+                        board.Begin(tool, relative, penColor, widthFraction);
+                        annotationClient?.Begin(tool == AnnotationKind.Rectangle ? "rect" : "pen", ToArgb(penColor), widthFraction, relative.X, relative.Y);
+                        SetCapture(Handle); handled = true; preview.Invalidate();
+                    }
+                }
                 SetFocus(Handle);
                 return 0;
             }
@@ -825,6 +939,7 @@ sealed class UiControllerWindow : UiWindow
                 var orbClick = false; var consumed = false;
                 lock (sceneGate) orbClick = panel.PointerUp(point, out consumed);
                 if (consumed) { if (GetCapture() == Handle) ReleaseCapture(); handled = true; }
+                if (board.IsDrawing) { board.End(); annotationClient?.End(); if (GetCapture() == Handle) ReleaseCapture(); handled = true; }
                 if (orbClick) AnimateChrome(false);
                 preview.Invalidate();
                 return 0;
@@ -846,9 +961,22 @@ sealed class UiControllerWindow : UiWindow
                 var point = new Vector2(position.X / Scale, position.Y / Scale);
                 bool over; bool hot;
                 lock (sceneGate) { over = panel.Contains(point); hot = over && HoverElement(point) is { IsEnabled: true }; }
-                if (over || !(inputForwarding)) { SetCursor(LoadCursor(0, hot ? IDC_HAND : IDC_ARROW)); handled = true; return 1; }
+                if (over || !(inputForwarding)) { SetCursor(LoadCursor(0, hot ? IDC_HAND : annotating && !over ? 32515 /* IDC_CROSS */ : IDC_ARROW)); handled = true; return 1; }
                 return 0;
             }
+            case 0x0102 /* WM_CHAR */ when annotating && textEditing:
+                if (wParam == 13) CommitText();
+                else if (wParam == 8) { if (textBuffer.Length > 0) textBuffer.Length--; }
+                else if (wParam >= 32 && wParam != 127 && textBuffer.Length < AnnotationBoard.MaximumTextLength) textBuffer.Append((char)wParam);
+                preview.Invalidate(); handled = true; return 0;
+            case WM_KEYDOWN when annotating && (wParam == 0x1B || wParam == 0x5A && (GetKeyState(0x11) & 0x8000) != 0):
+                if (wParam == 0x1B)
+                {
+                    if (textEditing) { textEditing = false; textBuffer.Clear(); preview.Invalidate(); }
+                    else panel.Annotate.IsChecked = false;
+                }
+                else { board.Undo(); annotationClient?.Undo(); preview.Invalidate(); }
+                handled = true; return 0;
             case WM_KEYDOWN when wParam == 0x7B:   // F12 toggles the diagnostic overlay
                 showInfo.IsChecked = showInfo.IsChecked != true; handled = true; return 0;
             case WM_SIZE:
@@ -861,6 +989,47 @@ sealed class UiControllerWindow : UiWindow
     {
         foreach (var element in panel.AllElements) if (element.IsVisible && element.IsHovered && element.ToolTip != null) return element;
         return null;
+    }
+
+    /// <summary>A window point in DIPs as a position relative to the video rectangle (0..1 inside the picture).</summary>
+    Vector2 ToRelative(Vector2 point)
+    {
+        var fit = UiVideoView.FitRect(ClientWidth / Scale, ClientHeight / Scale, preview.VideoWidth, preview.VideoHeight);
+        return new((point.X - fit.X) / Math.Max(1, fit.Width), (point.Y - fit.Y) / Math.Max(1, fit.Height));
+    }
+
+    /// <summary>Turns the text being typed into a mark (locally and on the host).</summary>
+    void CommitText()
+    {
+        if (!textEditing) return;
+        textEditing = false;
+        var text = textBuffer.ToString().Trim(); textBuffer.Clear();
+        if (text.Length == 0 || preview.VideoWidth <= 0) { preview.Invalidate(); return; }
+        var fit = UiVideoView.FitRect(ClientWidth / Scale, ClientHeight / Scale, preview.VideoWidth, preview.VideoHeight);
+        var size = TextFontFraction(fit.Width);
+        board.AddText(textAt, text, penColor, size);
+        annotationClient?.Text(ToArgb(penColor), size, textAt.X, textAt.Y, text);
+        preview.Invalidate();
+    }
+
+    void OnAnnotateChanged()
+    {
+        annotating = panel.Annotate.IsChecked == true;
+        if (annotating)
+        {
+            // Pen strokes must not reach the host: pause key/mouse forwarding (this also releases anything held) and resume it afterwards.
+            resumeInputAfterAnnotate = inputEnabled.IsChecked == true;
+            if (resumeInputAfterAnnotate) inputEnabled.IsChecked = false;
+        }
+        else
+        {
+            if (board.IsDrawing) { board.End(); annotationClient?.End(); }
+            textEditing = false; textBuffer.Clear();
+            if (resumeInputAfterAnnotate && started && !stopping) inputEnabled.IsChecked = true;
+            resumeInputAfterAnnotate = false;
+        }
+        lock (sceneGate) panel.Relayout(measureText);
+        preview.Invalidate();
     }
 
     Vector2 ToDip(nint lParam) => new(LoWord(lParam) / Scale, HiWord(lParam) / Scale);

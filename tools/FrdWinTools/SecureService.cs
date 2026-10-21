@@ -54,6 +54,14 @@ internal static class SecureDesktopService
         finally { CloseServiceHandle(manager); }
     }
 
+    static string InstallTracePath => Path.Combine(DataDirectory, "install-trace.txt");
+
+    /// <summary>Progress marker for the elevated installer, whose console nobody sees; a crash leaves the last step reached in install-trace.txt.</summary>
+    static void Trace(string step)
+    {
+        try { File.AppendAllText(InstallTracePath, $"{DateTimeOffset.Now:O} {step}{Environment.NewLine}"); } catch (Exception) { }
+    }
+
     static string InstallErrorPath => Path.Combine(DataDirectory, "install-error.txt");
 
     /// <summary>Elevated entry point. <paramref name="userSid"/> is the interactive user who should read the capture key.</summary>
@@ -78,7 +86,11 @@ internal static class SecureDesktopService
         if (userSid != null && !System.Text.RegularExpressions.Regex.IsMatch(userSid, @"^S-1-\d+(-\d+)+$"))
             throw new ArgumentException("Invalid user SID.");
         var source = Environment.ProcessPath ?? throw new InvalidOperationException("frd-wintools executable path is unavailable.");
+        Directory.CreateDirectory(DataDirectory);
+        try { File.Delete(InstallTracePath); } catch (Exception) { }
+        Trace("start " + source);
         PrepareStorage(userSid);
+        Trace("storage prepared");
         var manager = OpenSCManager(null, null, ScManagerConnect | ScManagerCreateService);
         if (manager == 0) throw Win32("OpenSCManager");
         try
@@ -101,10 +113,13 @@ internal static class SecureDesktopService
                 }
                 finally { CloseServiceHandle(service); }
             }
+            Trace("opened service manager");
             var executable = InstallBinary(source);
+            Trace("binary installed " + executable);
             var command = $"\"{executable}\" --secure-service";
             service = CreateService(manager, Name, "FRD secure-desktop capture", ServiceAllAccess,
                 ServiceWin32OwnProcess, ServiceDemandStart, ServiceErrorNormal, command, null, 0, null, null, null);
+            Trace("CreateService returned");
             if (service == 0)
             {
                 if (Marshal.GetLastWin32Error() != ErrorServiceExists) throw Win32("CreateService");
@@ -115,8 +130,11 @@ internal static class SecureDesktopService
             {
                 if (!ChangeServiceConfig(service, ServiceWin32OwnProcess, ServiceDemandStart, ServiceErrorNormal, command,
                     null, 0, null, null, null, "FRD secure-desktop capture")) throw Win32("ChangeServiceConfig");
+                Trace("service configured");
                 if (!StartService(service, 0, null) && Marshal.GetLastWin32Error() != ErrorServiceAlreadyRunning) throw Win32("StartService");
+                Trace("service start requested");
                 WaitForState(service, ServiceRunning, TimeSpan.FromSeconds(15));
+                Trace("service running");
                 Console.Error.WriteLine($"[secure helper] Installed and started from {executable}.");
                 return 0;
             }
@@ -405,7 +423,7 @@ internal static class SecureDesktopService
 
     [DllImport("advapi32.dll", EntryPoint = "OpenSCManagerW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenSCManager(string? machine, string? database, uint access);
     [DllImport("advapi32.dll", EntryPoint = "OpenServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenService(nint manager, string name, uint access);
-    [DllImport("advapi32.dll", EntryPoint = "CreateServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateService(nint manager, string name, string display, uint access, uint type, uint start, uint error, string binary, string? group, uint tag, string? dependencies, string? account, string? password);
+    [DllImport("advapi32.dll", EntryPoint = "CreateServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateService(nint manager, string name, string display, uint access, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password);   // tag is an LPDWORD (pointer-sized): a 32-bit parameter leaves garbage in the upper half under NativeAOT and crashes RPCRT4
     [DllImport("advapi32.dll", EntryPoint = "ChangeServiceConfigW", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ChangeServiceConfig(nint service, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password, string display);
     [DllImport("advapi32.dll", EntryPoint = "StartServiceW", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool StartService(nint service, uint count, string[]? arguments);
     [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ControlService(nint service, uint control, out ServiceStatus status);
