@@ -256,6 +256,15 @@
       <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3c-3.500 0-5.500 2.500-5.500 6v6c0 3.500 2 6 5.500 6s5.500-2.500 5.500-6V9c0-3.500-2-6-5.500-6zM12 3v7"/></svg></div>
         <h3>Keyboard, mouse and clipboard</h3>
         <p>Input forwarding with cursor shape sync, plus two-way text, file and folder clipboard. On by default on the controller when available.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 20l1-4.500L16.500 4 20 7.500 8.500 19z"/><path d="M14 6.500l3.500 3.500"/></svg></div>
+        <h3>Shared annotations</h3>
+        <p>Draw doodles, rectangles and text on the picture. The host sees them live on its own screen through a click-through overlay that screen capture ignores. Low priority by design: a separate connection, batched and rate-limited, so it costs video neither latency nor bandwidth.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3c-3.500 0-5.500 2.500-5.500 6v6c0 3.500 2 6 5.500 6s5.500-2.500 5.500-6V9c0-3.500-2-6-5.500-6zM12 3v7"/><path d="M3 3l3 3M21 3l-3 3"/></svg></div>
+        <h3>Local input first</h3>
+        <p>When someone is using the host's own keyboard or mouse, remote input is paused (releases still pass, so nothing sticks) and the controller shows “the other side is using the keyboard or mouse”. Only the injected flag and a timestamp are read, never key codes.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h12M12 7l5 5-5 5"/><path d="M4 5h16M4 19h16"/></svg></div>
+        <h3>Progress and remote cursor</h3>
+        <p>File copies show a progress bar on both sides (file n of m, percent, size). An optional overlay draws the host's pointer, position and shape, over the picture, even without input forwarding.</p></div>
       <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
         <h3>Reaches UAC and the lock screen</h3>
         <p>A separate <code>frd-wintools.exe</code> installs a SYSTEM helper once, enabling capture and input on the secure desktop. FRD never auto-clicks UAC.</p></div>
@@ -268,7 +277,7 @@
   <section id="how">
     <div class="eyebrow">How it works</div>
     <h2>A short, honest pipeline</h2>
-    <p class="sub">Video is sent at native resolution only; the window scales it. Bitrate cap and codec preset can be changed live from the controller.</p>
+    <p class="sub">Video is sent at native resolution only (25 FPS by default; 10, 20, 25 or 30 on request); the window scales it. Bitrate cap, frame rate and codec preset can be changed live from the controller.</p>
     <div class="pipe">
       <div class="glass step reveal"><b>Capture</b><span>DXGI Desktop Duplication</span></div>
       <div class="glass step reveal"><b>Encode</b><span>Media Foundation H.264</span></div>
@@ -313,7 +322,8 @@
       <div class="term reveal"><div class="top"><i></i><i></i><i></i><em>Shortcuts</em></div>
 <pre>Ctrl+Alt        <span class="c"># leave input forwarding</span>
 Ctrl+Alt+F11    <span class="c"># toggle full screen</span>
-Ctrl+Alt+F12    <span class="c"># show/hide debug controls</span></pre></div>
+Ctrl+Alt+F12    <span class="c"># show/hide debug controls</span>
+Esc / Ctrl+Z    <span class="c"># annotation mode: leave / undo the last mark</span></pre></div>
     </div>
     <div class="note"><b>Security:</b> the token lives only for that launch — it is never saved or generated. <code>--listen localhost</code> is loopback only; <code>::</code> binds every interface, so use it on trusted networks. Installing the secure-desktop helper needs administrator consent (UAC), which you confirm yourself.</div>
     <div class="note" style="margin-top:10px"><b>Encryption is the underlay's job:</b> FRD authenticates connections (the token is never sent; challenge-response with mutual proof) and signs keyboard/mouse datagrams, but it deliberately does not encrypt content. It is designed to run over an already-encrypted link such as a VPN, a tunnel or a private network, so it adds no packet size or latency of its own for the picture, clipboard and cursor.</div>
