@@ -1,7 +1,7 @@
-# FRD v3.pre2
+# FRD v3.pre3
 
-Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时；FFmpeg 扩展包与 `frd-wintools.exe` 的用法同 v3.pre1。
+Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时；与 v3.pre2 功能、协议、端口完全一致，可互连。
 
-- 界面层拆出为独立开源库 [Glasspane](https://github.com/KateY07/Glasspane)（MIT），FRD 以子模块 `external/Glasspane` 引用，行为不变。克隆本仓库请用 `--recurse-submodules`。
-- 修复高 DPI（如 200% 缩放）下主控端毛玻璃错位：模糊区域与其后的视频内容对不上，面板中间还有一条接缝。
-- 功能、协议、端口、预设 JSON 均无变化，可与 v3.pre1 互连。
+- 新增项目主页（GitHub Pages，`/docs` 为根）：https://katey07.github.io/frd/ 。纯英文、深色毛玻璃风格，含特性、原理、下载、入门和更新记录；页面会通过 GitHub API 显示最新发布版本和下载链接。
+- README“五分钟入门”改为无需安装 .NET 运行时（v3 起为 Native AOT），并说明 FFmpeg 为可选扩展包。
+- 发布流程：本机 `Publish.ps1` 打包后用 `gh release create` 上传，不再使用 GitHub Actions。

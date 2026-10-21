@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v3.pre2）
+# FRD · 远程桌面 CLI（v3.pre3）
+
+v3.pre3：新增项目主页 https://katey07.github.io/frd/ ；入门改为无需运行时。
 
 v3.pre2：界面层拆出为开源库 Glasspane（子模块），修复高 DPI 下毛玻璃错位。
 
@@ -38,7 +40,7 @@ FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对
 
 ## 五分钟入门
 
-1. 在两台 Windows x64 机器安装 .NET 10 x64 Runtime，将完整便携包解压并保留 `FRD.exe`、`codec-config.json` 和 `ffmpeg/`。本版新增预设已随便携包提供。
+1. 在两台 Windows x64 机器解压基础包（`FRD.exe`、`frd-wintools.exe`、`codec-config.json`），无需安装任何运行时。需要 FFmpeg 预设时，再把 FFmpeg 扩展包解压到 `FRD.exe` 同目录。
 2. 在被控机器的普通已登录桌面启动服务端，并明确指定监听地址、端口和本次口令；地址替换为被控端实际网卡 IPv4 或 IPv6 地址：
 
 ```powershell

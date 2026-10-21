@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FRD · Remote desktop CLI component</title>
+<meta name="description" content="FRD: a Windows x64 remote-desktop component. Native AOT single file, Windows built-in Media Foundation hardware encoding, low-latency UDP, frosted-glass floating controls.">
+<meta name="theme-color" content="#0b1020">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%237fa2ff'/%3E%3Cstop offset='1' stop-color='%2335e0c0'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='16' fill='%230b1020'/%3E%3Crect x='10' y='14' width='44' height='30' rx='7' fill='none' stroke='url(%23g)' stroke-width='4'/%3E%3Cpath d='M24 52h16' stroke='url(%23g)' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b1020; --fg: #eef2fb; --muted: #9aa8c2; --line: rgba(255,255,255,.12);
+    --glass: rgba(255,255,255,.06); --glass-strong: rgba(18,24,44,.62);
+    --blue: #7fa2ff; --teal: #35e0c0; --pink: #ff6ba6; --amber: #ffc45c;
+    --radius: 18px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg); overflow-x: hidden;
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 16px; position: relative; z-index: 1; }
+
+  /* ambient background */
+  .aurora { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  .aurora i { position: absolute; width: 56vmax; height: 56vmax; border-radius: 50%; filter: blur(90px); opacity: .5; animation: drift 24s ease-in-out infinite alternate; }
+  .aurora i:nth-child(1) { background: #3b5bff; left: -18vmax; top: -22vmax; }
+  .aurora i:nth-child(2) { background: #0fd3b0; right: -22vmax; top: 10vmax; animation-duration: 30s; opacity: .32; }
+  .aurora i:nth-child(3) { background: #b1307a; left: 18vmax; bottom: -34vmax; animation-duration: 36s; opacity: .34; }
+  @keyframes drift { to { transform: translate3d(6vmax, 4vmax, 0) scale(1.12); } }
+  .grain { position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: .05;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+  /* nav */
+  header.nav { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(16px) saturate(140%); -webkit-backdrop-filter: blur(16px) saturate(140%); background: rgba(11,16,32,.55); border-bottom: 1px solid var(--line); }
+  .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 58px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .3px; color: var(--fg); }
+  .brand:hover { text-decoration: none; }
+  .brand svg { width: 26px; height: 26px; }
+  nav.links { display: flex; align-items: center; gap: 4px; }
+  nav.links a { color: var(--muted); font-size: 14px; padding: 6px 10px; border-radius: 8px; }
+  nav.links a:hover { color: var(--fg); background: var(--glass); text-decoration: none; }
+  @media (max-width: 760px) { nav.links a.opt { display: none; } }
+
+  /* hero */
+  .hero { padding: 64px 0 28px; text-align: center; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); border: 1px solid var(--line); background: var(--glass); border-radius: 999px; padding: 5px 12px 5px 8px; }
+  .pill b { color: var(--teal); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 0 rgba(53,224,192,.6); animation: ping 2.2s infinite; }
+  @keyframes ping { 70% { box-shadow: 0 0 0 9px rgba(53,224,192,0); } 100% { box-shadow: 0 0 0 0 rgba(53,224,192,0); } }
+  h1 { font-size: clamp(36px, 7vw, 68px); line-height: 1.06; letter-spacing: -1.2px; margin: 18px 0 14px; }
+  h1 .grad { background: linear-gradient(100deg, var(--blue), var(--teal) 55%, #9cf3ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lead { max-width: 700px; margin: 0 auto 26px; color: var(--muted); font-size: clamp(16px, 2.2vw, 19px); }
+  .cta { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 12px; border: 1px solid var(--line); background: var(--glass); color: var(--fg); font-weight: 600; font-size: 15px; backdrop-filter: blur(10px); }
+  .btn:hover { text-decoration: none; border-color: rgba(255,255,255,.3); transform: translateY(-1px); }
+  .btn.primary { background: linear-gradient(120deg, #4d74ff, #2fd2c0); border-color: transparent; color: #04101a; box-shadow: 0 10px 30px rgba(60,130,255,.35); }
+  .btn svg { width: 18px; height: 18px; }
+  .meta { margin-top: 12px; color: var(--muted); font-size: 13px; min-height: 20px; }
+
+  /* the hero "desktop" mock */
+  .stage { position: relative; margin: 44px auto 0; max-width: 980px; aspect-ratio: 16 / 9.4; border-radius: 22px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 40px 90px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.04) inset; background: #0d1226; }
+  .desk { position: absolute; inset: 0; background:
+      radial-gradient(60% 70% at 18% 20%, #5b7cff 0%, transparent 60%),
+      radial-gradient(50% 60% at 85% 25%, #ff6ba6 0%, transparent 62%),
+      radial-gradient(70% 70% at 60% 95%, #35e0c0 0%, transparent 60%),
+      #101735; animation: hue 18s linear infinite; }
+  @keyframes hue { to { filter: hue-rotate(360deg); } }
+  .win { position: absolute; border-radius: 10px; background: rgba(14,18,34,.82); border: 1px solid rgba(255,255,255,.1); box-shadow: 0 14px 34px rgba(0,0,0,.4); }
+  .win::before { content: ""; position: absolute; left: 10px; top: 9px; width: 7px; height: 7px; border-radius: 50%; background: #ff6b6b; box-shadow: 12px 0 #ffc45c, 24px 0 #46d97a; }
+  .win span { position: absolute; left: 14px; right: 14px; height: 7px; border-radius: 4px; background: rgba(255,255,255,.14); }
+  .w1 { left: 7%; top: 24%; width: 38%; height: 44%; } .w1 span:nth-child(1) { top: 34px; width: 60%; } .w1 span:nth-child(2) { top: 52px; right: 30px; } .w1 span:nth-child(3) { top: 70px; width: 45%; } .w1 span:nth-child(4) { top: 88px; width: 70%; }
+  .w2 { left: 40%; top: 40%; width: 34%; height: 40%; background: rgba(240,244,255,.9); } .w2 span { background: rgba(20,28,60,.16); } .w2 span:nth-child(1) { top: 34px; width: 50%; } .w2 span:nth-child(2) { top: 52px; right: 40px; } .w2 span:nth-child(3) { top: 70px; width: 62%; }
+
+  .bar { position: absolute; left: 50%; top: 14px; height: 44px; border-radius: 16px; display: flex; align-items: center; gap: 4px; padding: 0 8px 0 14px; color: var(--fg); white-space: nowrap;
+      background: rgba(14,20,40,.5); backdrop-filter: blur(22px) saturate(160%); -webkit-backdrop-filter: blur(22px) saturate(160%);
+      border: 1px solid rgba(255,255,255,.16); box-shadow: 0 10px 30px rgba(0,0,0,.35);
+      transform: translateX(-50%); animation: collapse 9s cubic-bezier(.6,.05,.2,1) infinite; overflow: hidden; }
+  .bar .state { display: flex; align-items: center; gap: 8px; font-size: 13px; padding-right: 8px; }
+  .bar .led { width: 8px; height: 8px; border-radius: 50%; background: #3ddc97; box-shadow: 0 0 10px #3ddc97; }
+  .bar .ms { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar .tools { display: flex; gap: 2px; animation: fade 9s ease infinite; }
+  .bar .tools i { width: 32px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: #dfe7ff; }
+  .bar .tools i.on { background: rgba(110,150,255,.38); }
+  .bar .tools svg, .orb svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .bar .tools i.danger { color: #ff8b88; }
+  @keyframes collapse { 0%, 44% { width: 372px; border-radius: 16px; } 54%, 92% { width: 120px; border-radius: 22px; } 100% { width: 372px; border-radius: 16px; } }
+  @keyframes fade { 0%, 40% { opacity: 1; } 48%, 90% { opacity: 0; } 100% { opacity: 1; } }
+  .bar .pillmenu { position: absolute; right: 12px; top: 0; height: 100%; display: grid; place-items: center; opacity: 0; animation: fadeIn 9s ease infinite; }
+  .bar .pillmenu svg { width: 17px; height: 17px; stroke: #dfe7ff; fill: none; stroke-width: 1.8; stroke-linecap: round; }
+  @keyframes fadeIn { 0%, 46% { opacity: 0; } 54%, 90% { opacity: 1; } 100% { opacity: 0; } }
+
+  .hostcard { position: absolute; right: 16px; bottom: 16px; display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 16px; font-size: 13px;
+      background: rgba(14,20,40,.5); backdrop-filter: blur(22px) saturate(160%); -webkit-backdrop-filter: blur(22px) saturate(160%); border: 1px solid rgba(255,255,255,.16); box-shadow: 0 10px 30px rgba(0,0,0,.35); }
+  .hostcard .led { width: 8px; height: 8px; border-radius: 50%; background: #ffc45c; box-shadow: 0 0 10px #ffc45c; }
+  .hostcard small { color: var(--muted); }
+  .cursor { position: absolute; left: 52%; top: 56%; width: 18px; height: 18px; animation: wander 9s ease-in-out infinite; filter: drop-shadow(0 2px 3px rgba(0,0,0,.5)); }
+  @keyframes wander { 0% { transform: translate(-80px, 30px); } 40% { transform: translate(70px, -26px); } 70% { transform: translate(-30px, 60px); } 100% { transform: translate(-80px, 30px); } }
+  .caption { text-align: center; color: var(--muted); font-size: 13px; margin-top: 12px; }
+
+  /* sections */
+  section { padding: 64px 0 10px; }
+  .eyebrow { color: var(--teal); font-size: 13px; font-weight: 700; letter-spacing: 1.6px; text-transform: uppercase; }
+  h2 { font-size: clamp(26px, 4vw, 38px); line-height: 1.15; letter-spacing: -.6px; margin: 8px 0 12px; }
+  .sub { color: var(--muted); max-width: 680px; margin: 0 0 28px; }
+  .glass { background: var(--glass); border: 1px solid var(--line); border-radius: var(--radius); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-top: 36px; }
+  .stat { padding: 18px 20px; }
+  .stat b { display: block; font-size: 32px; letter-spacing: -1px; line-height: 1.1; background: linear-gradient(100deg, #fff, #a9c0ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .stat span { color: var(--muted); font-size: 14px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .card { padding: 22px; transition: transform .2s, border-color .2s; }
+  .card:hover { transform: translateY(-3px); border-color: rgba(255,255,255,.26); }
+  .ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 14px; background: linear-gradient(135deg, rgba(127,162,255,.3), rgba(53,224,192,.22)); border: 1px solid var(--line); }
+  .ico svg { width: 21px; height: 21px; fill: none; stroke: #dbe6ff; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  /* pipeline */
+  .pipe { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 6px; position: relative; }
+  .step { padding: 18px 14px; text-align: center; position: relative; }
+  .step b { display: block; font-size: 15px; margin-bottom: 4px; }
+  .step span { color: var(--muted); font-size: 13px; }
+  .step:not(:last-child)::after { content: ""; position: absolute; right: -11px; top: 50%; width: 12px; height: 2px; background: linear-gradient(90deg, var(--blue), var(--teal)); }
+  .flow { height: 3px; border-radius: 3px; margin: 18px 4px 0; background: linear-gradient(90deg, transparent, var(--blue), var(--teal), transparent); background-size: 200% 100%; animation: flow 3s linear infinite; opacity: .8; }
+  @keyframes flow { to { background-position: -200% 0; } }
+  @media (max-width: 860px) { .pipe { grid-template-columns: 1fr; } .step:not(:last-child)::after { display: none; } }
+
+  /* packages */
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { padding: 13px 14px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .8px; }
+  tr:last-child td { border-bottom: 0; }
+  .tag { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+  .tag.must { color: #04101a; background: var(--teal); border-color: transparent; font-weight: 700; }
+  .scroll { overflow-x: auto; }
+
+  /* code */
+  .term { border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); background: rgba(8,12,26,.8); }
+  .term .top { display: flex; gap: 7px; padding: 11px 14px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.03); align-items: center; }
+  .term .top i { width: 10px; height: 10px; border-radius: 50%; background: #394058; }
+  .term .top em { margin-left: 8px; font-style: normal; font-size: 12px; color: var(--muted); }
+  pre { margin: 0; padding: 16px 18px; overflow-x: auto; font: 13.5px/1.7 ui-monospace, "Cascadia Mono", Consolas, monospace; color: #d9e3ff; }
+  pre .c { color: #6f7c9b; } pre .k { color: var(--teal); } pre .s { color: #ffc98a; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+  .note { margin-top: 14px; padding: 14px 16px; border-radius: 14px; border: 1px solid rgba(255,196,92,.35); background: rgba(255,196,92,.07); color: #f3dcae; font-size: 14.5px; }
+
+  /* timeline */
+  .tl { position: relative; padding-left: 22px; border-left: 2px solid var(--line); margin-left: 6px; }
+  .tl div { position: relative; padding: 0 0 20px; }
+  .tl div::before { content: ""; position: absolute; left: -29px; top: 7px; width: 12px; height: 12px; border-radius: 50%; background: var(--bg); border: 2px solid var(--blue); }
+  .tl div:first-child::before { border-color: var(--teal); background: var(--teal); }
+  .tl b { font-size: 16px; } .tl small { color: var(--muted); margin-left: 8px; }
+  .tl p { margin: 4px 0 0; color: var(--muted); font-size: 15px; }
+
+  footer { margin-top: 70px; padding: 30px 0 50px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+  footer .row { display: flex; flex-wrap: wrap; gap: 14px 28px; justify-content: space-between; }
+  footer a { color: var(--muted); } footer a:hover { color: var(--fg); }
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity .7s ease, transform .7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .reveal { opacity: 1; transform: none; }
+    .bar { width: 372px; } .bar .pillmenu { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="aurora"><i></i><i></i><i></i></div>
+<div class="grain"></div>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7fa2ff"/><stop offset="1" stop-color="#35e0c0"/></linearGradient></defs><rect x="6" y="12" width="52" height="34" rx="8" fill="none" stroke="url(#lg)" stroke-width="4.5"/><path d="M22 54h20" stroke="url(#lg)" stroke-width="4.5" stroke-linecap="round"/></svg>
+      FRD
+    </a>
+    <nav class="links">
+      <a class="opt" href="#features">Features</a>
+      <a class="opt" href="#how">How it works</a>
+      <a class="opt" href="#download">Download</a>
+      <a class="opt" href="#start">Quick start</a>
+      <a href="https://github.com/KateY07/frd">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top" class="wrap">
+  <div class="hero">
+    <span class="pill"><span class="dot"></span><span><b id="ver">v3.pre3</b> · Native AOT single file · no runtime to install</span></span>
+    <h1>A remote desktop component<br>in <span class="grad">11 MB</span></h1>
+    <p class="lead">
+      
+      One <code>FRD.exe</code> is both host and controller. Capture → hardware encode → UDP → decode → GPU present, with a frosted-glass panel floating over the picture. Built to be embedded: the command line is the API.
+    </p>
+    <div class="cta">
+      <a class="btn primary" id="dl" href="https://github.com/KateY07/frd/releases">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 5-5m-5 5-5-5M4 20h16"/></svg>
+        Download latest
+      </a>
+      <a class="btn" href="#start">Five-minute start</a>
+      <a class="btn" href="https://github.com/KateY07/frd"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 0 0-3.2 19.5c.5.1.7-.2.7-.5v-1.8c-2.8.6-3.4-1.2-3.4-1.2-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 .1 1.5 1 1.5 1 .9 1.5 2.4 1.1 3 .8.1-.7.4-1.1.6-1.4-2.2-.3-4.6-1.1-4.6-5 0-1.1.4-2 1-2.7-.1-.3-.4-1.300.1-2.700 0 0 .8-.3 2.800 1a9.600 9.600 0 0 1 5 0c1.900-1.300 2.800-1 2.800-1 .5 1.400.2 2.400.1 2.700.6.7 1 1.600 1 2.700 0 3.900-2.400 4.700-4.600 5 .4.3.7.9.7 1.900v2.800c0 .3.2.6.7.5A10 10 0 0 0 12 2z"/></svg>GitHub</a>
+    </div>
+    <div class="meta" id="meta"></div>
+
+    <div class="stage" role="img" aria-label="FRD controller: a frosted-glass toolbar floating over a remote desktop, collapsing into a pill">
+      <div class="desk"></div>
+      <div class="win w1"><span></span><span></span><span></span><span></span></div>
+      <div class="win w2"><span></span><span></span><span></span></div>
+      <svg class="cursor" viewBox="0 0 24 24"><path d="M4 2l15 9-6.500 1.800L9.500 19z" fill="#fff" stroke="#111" stroke-width="1.400" stroke-linejoin="round"/></svg>
+      <div class="bar">
+        <div class="state"><span class="led"></span><span>192.168.1.20</span><span class="ms">12 ms</span></div>
+        <div class="tools">
+          <i class="on"><svg viewBox="0 0 24 24"><path d="M12 3c-3.500 0-5.500 2.500-5.500 6v6c0 3.500 2 6 5.500 6s5.500-2.500 5.500-6V9c0-3.500-2-6-5.500-6zM12 3v7"/></svg></i>
+          <i class="on"><svg viewBox="0 0 24 24"><path d="M8 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 3h6v4H9z"/></svg></i>
+          <i><svg viewBox="0 0 24 24"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/></svg></i>
+          <i><svg viewBox="0 0 24 24"><path d="M3 8h2.500M10.500 8H21M3 16h10.500M18 16h3"/><circle cx="8" cy="8" r="2.500"/><circle cx="15.500" cy="16" r="2.500"/></svg></i>
+          <i class="danger"><svg viewBox="0 0 24 24"><path d="M12 3v9M7 6.500a8 8 0 1 0 10 0"/></svg></i>
+          <i><svg viewBox="0 0 24 24"><path d="M6 6l6 6-6 6M13 6l6 6-6 6"/></svg></i>
+        </div>
+        <div class="pillmenu"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></div>
+      </div>
+      <div class="hostcard"><span class="led"></span><span>Controlled by <b>Alice</b> <small>· 12 ms</small></span></div>
+    </div>
+    <div class="caption">Illustration of the controller's floating panel (it folds into a pill after 10 s idle) and the host's status card</div>
+
+    <div class="stats">
+      <div class="glass stat reveal"><b>≈ 11 MB</b><span>NativeAOT single-file FRD.exe</span></div>
+      <div class="glass stat reveal"><b>6 MB</b><span>base package zip (with helper)</span></div>
+      <div class="glass stat reveal"><b>0</b><span>runtimes to pre-install</span></div>
+      <div class="glass stat reveal"><b>1 × UDP</b><span>video, input and diagnostics on one port</span></div>
+    </div>
+  </div>
+
+  <section id="features">
+    <div class="eyebrow">Features</div>
+    <h2>Remote desktop only — small and steady</h2>
+    <p class="sub">Made for integration, not another bloated remote-control suite.</p>
+    <div class="grid">
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div>
+        <h3>Windows built-in hardware encoding</h3>
+        <p>Defaults to Media Foundation H.264: GPU hardware encoders first (Intel Quick Sync, NVIDIA…), built-in software as fallback. No codec library to ship.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3l8 4.500v9L12 21l-8-4.500v-9z"/><path d="M12 12l8-4.500M12 12v9M12 12L4 7.500"/></svg></div>
+        <h3>FFmpeg is an optional extension</h3>
+        <p>Need <code>libx264rgb</code>, H.265 or AV1? Unzip the extension next to FRD.exe. Without it those presets are clearly marked unavailable.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M12 2l2.500 5.500L20 8l-4 4 1 6-5-3-5 3 1-6-4-4 5.500-.5z"/></svg></div>
+        <h3>Frosted-glass floating panel</h3>
+        <p>Direct2D blurs the live frame behind the panel. Drag it, fold it into an orb, latency always visible. The UI layer is open source as <a href="https://github.com/KateY07/Glasspane">Glasspane</a>.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3c-3.500 0-5.500 2.500-5.500 6v6c0 3.500 2 6 5.500 6s5.500-2.500 5.500-6V9c0-3.500-2-6-5.500-6zM12 3v7"/></svg></div>
+        <h3>Keyboard, mouse and clipboard</h3>
+        <p>Input forwarding with cursor shape sync, plus two-way text, file and folder clipboard. On by default on the controller when available.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>Reaches UAC and the lock screen</h3>
+        <p>A separate <code>frd-wintools.exe</code> installs a SYSTEM helper once, enabling capture and input on the secure desktop. FRD never auto-clicks UAC.</p></div>
+      <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></div>
+        <h3>Measurable latency</h3>
+        <p>Capture, encode, transfer, decode and present are timed per stage, with GPU completion confirmed. A separate diagnostics stream measures cross-machine latency.</p></div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="eyebrow">How it works</div>
+    <h2>A short, honest pipeline</h2>
+    <p class="sub">Video is sent at native resolution only; the window scales it. Bitrate cap and codec preset can be changed live from the controller.</p>
+    <div class="pipe">
+      <div class="glass step reveal"><b>Capture</b><span>DXGI Desktop Duplication</span></div>
+      <div class="glass step reveal"><b>Encode</b><span>Media Foundation H.264</span></div>
+      <div class="glass step reveal"><b>UDP</b><span>one port, TCP handshake</span></div>
+      <div class="glass step reveal"><b>Decode</b><span>Media Foundation</span></div>
+      <div class="glass step reveal"><b>Present</b><span>Direct3D 11 + Direct2D</span></div>
+    </div>
+    <div class="flow"></div>
+  </section>
+
+  <section id="download">
+    <div class="eyebrow">Download</div>
+    <h2>Two packages, take what you need</h2>
+    <p class="sub">Windows 10 / 11 x64. Every file has a SHA-256 in <code>SHA256SUMS.txt</code> on the release page.</p>
+    <div class="glass scroll reveal">
+      <table>
+        <tr><th>Package</th><th>Contents</th><th>Size</th></tr>
+        <tr><td><code>frd-vX-win-x64.zip</code><span class="tag must">required</span></td>
+            <td><code>FRD.exe</code> (NativeAOT)· <code>frd-wintools.exe</code> (secure-desktop helper)· <code>codec-config.json</code> · docs</td><td>≈ 6 MB</td></tr>
+        <tr><td><code>frd-vX-ffmpeg-win-x64.zip</code><span class="tag">optional</span></td>
+            <td>FFmpeg libraries and license; unzip into <code>ffmpeg\</code> beside FRD.exe</td><td>≈ 38 MB</td></tr>
+      </table>
+    </div>
+    <p style="margin-top:16px"><a class="btn primary" id="dl2" href="https://github.com/KateY07/frd/releases">Open the releases page</a></p>
+  </section>
+
+  <section id="start">
+    <div class="eyebrow">Quick start</div>
+    <h2>Running in five minutes</h2>
+    <p class="sub">Unzip the base package on both machines — nothing else to install. The host must be given an explicit listen address, port and token; there is no default token.</p>
+    <div class="two">
+      <div class="term reveal"><div class="top"><i></i><i></i><i></i><em>Host (a normal signed-in desktop)</em></div>
+<pre><span class="c">PS&gt;</span> .\FRD.exe <span class="k">--host</span> <span class="k">--listen</span> 192.168.1.20 <span class="k">--port</span> 5000 <span class="k">--token</span> <span class="s">"our-secret"</span></pre></div>
+      <div class="term reveal"><div class="top"><i></i><i></i><i></i><em>Controller</em></div>
+<pre><span class="c">PS&gt;</span> .\FRD.exe <span class="k">--connect</span> 192.168.1.20 <span class="k">--port</span> 5000 <span class="k">--token</span> <span class="s">"our-secret"</span></pre></div>
+    </div>
+    <div class="two" style="margin-top:14px">
+      <div class="term reveal"><div class="top"><i></i><i></i><i></i><em>Other commands</em></div>
+<pre>.\FRD.exe <span class="k">--version</span>        <span class="c"># v3.pre3+&lt;commit&gt;</span>
+.\FRD.exe <span class="k">--help-window</span>    <span class="c"># help window</span>
+.\FRD.exe                   <span class="c"># local demo (localhost)</span></pre></div>
+      <div class="term reveal"><div class="top"><i></i><i></i><i></i><em>Shortcuts</em></div>
+<pre>Ctrl+Alt        <span class="c"># leave input forwarding</span>
+Ctrl+Alt+F11    <span class="c"># toggle full screen</span>
+Ctrl+Alt+F12    <span class="c"># show/hide debug controls</span></pre></div>
+    </div>
+    <div class="note"><b>Security:</b> the token lives only for that launch — it is never saved or generated. <code>--listen localhost</code> is loopback only; <code>::</code> binds every interface, so use it on trusted networks. Installing the secure-desktop helper needs administrator consent (UAC), which you confirm yourself.</div>
+  </section>
+
+  <section id="log">
+    <div class="eyebrow">What's new</div>
+    <h2>Recent releases</h2>
+    <div class="tl reveal">
+      <div><b>v3.pre3</b><small>this site</small><p>Project site on GitHub Pages; the README quick start no longer asks for a runtime.</p></div>
+      <div><b>v3.pre2</b><p>UI layer extracted as the open-source Glasspane; fixed glass misalignment at high DPI.</p></div>
+      <div><b>v3.pre1</b><p>Native AOT single file; Media Foundation by default with optional FFmpeg; native Direct3D/Direct2D UI replaces Avalonia; helper service split into frd-wintools.exe.</p></div>
+      <div><b>v2.pre15</b><p>Slimmer package: only the FFmpeg libraries in use.</p></div>
+      <div><b>v2.pre7 – v2.pre14</b><p>Dark glass floating panel and orb, host status card, always-visible latency, bounded shutdown, hardened secure-desktop helper.</p></div>
+    </div>
+    <p><a href="https://github.com/KateY07/frd/blob/main/docs/release-notes.md">Full release notes →</a> &nbsp; <a href="https://github.com/KateY07/frd/tree/main/docs">All documents →</a></p>
+  </section>
+
+  <footer>
+    <div class="row">
+      <div><b>FRD</b> · A Windows x64 remote-desktop component; the interface is the command line.</div>
+      <div><a href="https://github.com/KateY07/frd">GitHub</a> · <a href="https://github.com/KateY07/frd/releases">Releases</a> · <a href="https://github.com/KateY07/Glasspane">Glasspane</a> · <a href="https://github.com/KateY07/frd/blob/main/THIRD-PARTY-NOTICES.md">Third-party notices</a></div>
+    </div>
+  </footer>
+</main>
+
+<script>
+(function () {
+
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }); }, { threshold: .12 });
+    document.querySelectorAll('.reveal').forEach(function (el) { io.observe(el); });
+  } else document.querySelectorAll('.reveal').forEach(function (el) { el.classList.add('in'); });
+
+  // Show the newest release (pre-releases included) and link straight to its files; fall back to the static page if the API is unreachable.
+  fetch('https://api.github.com/repos/KateY07/frd/releases?per_page=1', { headers: { Accept: 'application/vnd.github+json' } })
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+    .then(function (list) {
+      var rel = list && list[0]; if (!rel) return;
+      document.getElementById('ver').textContent = rel.tag_name;
+      var base = (rel.assets || []).filter(function (a) { return /win-x64\.zip$/.test(a.name) && !/ffmpeg/.test(a.name); })[0];
+      ['dl', 'dl2'].forEach(function (id) { document.getElementById(id).href = base ? base.browser_download_url : rel.html_url; });
+      var when = new Date(rel.published_at).toISOString().slice(0, 10);
+      document.getElementById('meta').textContent = rel.tag_name + ' · ' + when + (base ? ' · ' + (base.size / 1048576).toFixed(1) + ' MB' : '');
+    }).catch(function () {});
+})();
+</script>
+</body>
+</html>
