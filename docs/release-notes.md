@@ -11,12 +11,13 @@ Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。与
 **修复：辅助服务重装/升级失败**
 - 已装过辅助服务时再次安装，会因为先写日志冲掉了错误码，把“服务已存在”误判为失败。现在先读错误码再写日志，失败信息里带上错误码。
 
-**新增：辅助服务的安装与卸载脚本**
-- `frd-wintools.exe --uninstall-secure-helper`：停止并删除服务，删除 `%ProgramFiles%\FRD` 和 `%ProgramData%\FRD\SecureDesktopProbe`。
-- 基础包里的 `install-frd-wintools.bat` / `uninstall-frd-wintools.bat`：双击后自动请求管理员权限（UAC 由你亲自确认）。安装时这两个脚本也会复制到 `%ProgramFiles%\FRD`，以后可直接在那里卸载。
+**新增：辅助服务的独立安装包 `frd-service-v5.3-setup.exe`**（OneSetup）
+- 双击后窗口里选择 **1 安装（覆盖）** 或 **2 卸载**，显示当前是否已安装；选择后弹出 UAC，由你亲自确认。完成后检查服务是否在运行、安装的文件是否与包内一致；卸载则检查服务和文件夹是否清除。
+- 服务装在 `%ProgramFiles%\FRD`，只放服务用的 `frd-wintools.exe`。被控端 FRD 正在运行时会占用 `%ProgramData%\FRD\SecureDesktopProbe\frames.map`，卸载会提示它将在下次重启时删除（先关闭 FRD 可彻底清理）。
+- 命令行：`frd-wintools.exe --uninstall-secure-helper`（管理员）可直接卸载；无人值守时设环境变量 `FRD_SERVICE_ACTION=install|uninstall` 运行安装包。
 
-**升级辅助服务**：运行 `install-frd-wintools.bat`，或在被控端界面点“安装被控服务”。
+**升级辅助服务**：运行 `frd-service-v5.3-setup.exe` 选 1，或在被控端界面点“安装被控服务”。
 
-**发布内容**：`frd-v5.3-win-x64.zip`、`frd-v5.3.exe`（单文件版）、`frd-v5.3-ffmpeg-win-x64.zip` 与 `frd-ffmpeg-8.1.2-setup.exe`、各自的 SHA-256。没有代码签名，SmartScreen 可能提示。
+**发布内容**：`frd-v5.3-win-x64.zip`、`frd-v5.3.exe`（单文件版）、`frd-v5.3-ffmpeg-win-x64.zip` 与 `frd-ffmpeg-8.1.2-setup.exe`、`frd-service-v5.3-setup.exe`、各自的 SHA-256。没有代码签名，SmartScreen 可能提示。
 
-**验证**：在 SY0812A 上安装新辅助服务并连接，通道和监听端口已确认；任务管理器场景的最后一版修复（焦点在管理员窗口时所有事件走辅助服务）尚待你确认。未覆盖：卸载脚本没有实际运行过；没有自动化测试。
+**验证**：在 SY0812A 上用安装包实测了全新安装、覆盖安装和卸载（服务状态、文件夹、残留文件均已核对，UAC 由你确认）；任务管理器场景的最后一版修复（焦点在管理员窗口时所有事件走辅助服务）尚待你确认。未覆盖：没有自动化测试；安装包窗口里 1/2 两个按钮的点击没有人工点过（实测走的是环境变量指定动作的路径）。

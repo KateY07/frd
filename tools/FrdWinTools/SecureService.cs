@@ -95,15 +95,31 @@ internal static class SecureDesktopService
         }
         finally { CloseServiceHandle(manager); }
         var leftovers = new List<string>();
+        var pending = new List<string>();
         foreach (var directory in new[] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "FRD"), DataDirectory })
         {
-            try { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
-            catch (Exception error) { leftovers.Add($"{directory} ({error.Message})"); }
+            if (!Directory.Exists(directory)) continue;
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories))
+            {
+                try { File.Delete(file); }
+                catch (Exception)
+                {
+                    // Typically frames.map while an FRD host still has the shared frame buffer open: remove it at the next restart.
+                    if (MoveFileEx(file, null, 4)) pending.Add(file); else leftovers.Add(file);
+                }
+            }
+            try { Directory.Delete(directory, true); }
+            catch (Exception error)
+            {
+                if (pending.Any(file => file.StartsWith(directory, StringComparison.OrdinalIgnoreCase))) MoveFileEx(directory, null, 4);
+                else leftovers.Add($"{directory} ({error.Message})");
+            }
         }
         try
         {
             var data = Path.GetDirectoryName(DataDirectory)!;
             if (Directory.Exists(data) && !Directory.EnumerateFileSystemEntries(data).Any()) Directory.Delete(data);
+            else if (Directory.Exists(data)) MoveFileEx(data, null, 4);
         }
         catch (Exception) { /* an empty parent folder is harmless */ }
         if (leftovers.Count > 0)
@@ -111,7 +127,9 @@ internal static class SecureDesktopService
             Console.Error.WriteLine("[secure helper] Service removed, but could not delete: " + string.Join("; ", leftovers) + ". Delete them manually.");
             return 2;
         }
-        Console.Error.WriteLine("[secure helper] Uninstalled.");
+        if (pending.Count > 0)
+            Console.Error.WriteLine("[secure helper] Service removed. Still in use, will be deleted at the next restart: " + string.Join("; ", pending) + ". Close FRD and delete them now if you prefer.");
+        else Console.Error.WriteLine("[secure helper] Uninstalled.");
         return 0;
     }
 
@@ -218,12 +236,6 @@ internal static class SecureDesktopService
                 throw new InvalidDataException("The copied helper does not match its source (SHA-256 mismatch).");
             }
             File.Move(temporary, target, overwrite: true);
-        }
-        // The folder belongs to the service alone, so it also gets the scripts that remove the service again.
-        foreach (var script in new[] { "uninstall-frd-wintools.bat", "install-frd-wintools.bat" })
-        {
-            var from = Path.Combine(Path.GetDirectoryName(source)!, script);
-            if (File.Exists(from)) File.Copy(from, Path.Combine(directory, script), overwrite: true);
         }
         Console.Error.WriteLine($"[secure helper] Installed {target} (SHA-256 {sourceHash}).");
         return target;
@@ -502,6 +514,7 @@ internal static class SecureDesktopService
     [StructLayout(LayoutKind.Sequential)] struct BitmapInfoHeader { public uint Size; public int Width, Height; public ushort Planes, BitCount; public uint Compression, SizeImage; public int XPelsPerMeter, YPelsPerMeter; public uint ClrUsed, ClrImportant; }
 
     [DllImport("advapi32.dll", EntryPoint = "OpenSCManagerW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenSCManager(string? machine, string? database, uint access);
+    [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool MoveFileEx(string existing, string? target, uint flags);
     [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool DeleteService(nint service);
     [DllImport("advapi32.dll", EntryPoint = "OpenServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenService(nint manager, string name, uint access);
     [DllImport("advapi32.dll", EntryPoint = "CreateServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateService(nint manager, string name, string display, uint access, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password);   // tag is an LPDWORD (pointer-sized): a 32-bit parameter leaves garbage in the upper half under NativeAOT and crashes RPCRT4

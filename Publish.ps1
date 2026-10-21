@@ -32,12 +32,9 @@ foreach ($document in $documents) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/使用.md') -Destination $staging
-foreach ($script in @('install-frd-wintools.bat', 'uninstall-frd-wintools.bat')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "tools/FrdWinTools/$script") -Destination $staging -ErrorAction Stop
-}
 $productVersion = (Get-Item -LiteralPath (Join-Path $staging 'FRD.exe')).VersionInfo.ProductVersion
 if (-not $productVersion.StartsWith($version + '+') -and $productVersion -ne $version) { throw 'Published binary version mismatch.' }
-foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe', 'install-frd-wintools.bat', 'uninstall-frd-wintools.bat')) {
+foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $staging $required))) { throw "Missing release file: $required" }
 }
 if (Test-Path -LiteralPath (Join-Path $staging 'ffmpeg')) { throw 'The base package must not contain FFmpeg.' }
@@ -111,7 +108,7 @@ $singleFile = $null
 if ($onesetup) {
     $singleStage = Join-Path $releaseRoot ('single-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $singleStage | Out-Null
-    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'install-frd-wintools.bat', 'uninstall-frd-wintools.bat', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
+    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
         Copy-Item -LiteralPath (Join-Path $output $item) -Destination $singleStage -Recurse
     }
     $singleFile = Join-Path $releaseRoot "frd-$version.exe"
@@ -133,6 +130,13 @@ if ($onesetup) {
     & $buildSetup -OneSetup $onesetup -OutputDirectory $releaseRoot | Out-Null
     if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { throw 'FFmpeg setup package failed.' }
     foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter 'frd-ffmpeg-*-setup.exe*' -File) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
+    }
+}
+# Service helper installer (frd-service-<version>-setup.exe): installs, updates or removes the SYSTEM helper service, UAC confirmed by the user.
+if ($onesetup) {
+    & (Join-Path $PSScriptRoot 'tools/ServiceSetup/Build-ServiceSetup.ps1') -Version $version -WintoolsPath (Join-Path $output 'frd-wintools.exe') -OneSetup $onesetup -OutputDirectory $releaseRoot | Out-Null
+    foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter "frd-service-$version-setup.exe*" -File) {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
     }
 }
