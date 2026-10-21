@@ -366,7 +366,8 @@ internal static class SecureDesktopService
                 finally { CloseDesktop(active); }
                 if (!desktop.Equals("Winlogon", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (previousDesktop == "Winlogon") { shared.SetInactive(); SecureDesktopUdp.Send(udp, key, ++frameId, 0, 0, null); }
+                    // First pass too (previousDesktop is null): a worker killed while the UAC prompt was up leaves a stale "secure desktop active" flag in the shared buffer.
+                    if (previousDesktop is null or "Winlogon") { shared.SetInactive(); SecureDesktopUdp.Send(udp, key, ++frameId, 0, 0, null); }
                     previousDesktop = desktop; lastHash = null; Thread.Sleep(250); continue;
                 }
                 previousDesktop = desktop;
