@@ -20,7 +20,7 @@ static class FfmpegRegression
             }
             catch (Exception ex) { Console.Error.WriteLine(ex); passed = false; results.Add(new { Encoder = name, Passed = false, Error = ex.ToString() }); }
         }
-        File.WriteAllText(Path.Combine(output, "static-500kbps.json"), JsonSerializer.Serialize(new
+        File.WriteAllText(Path.Combine(output, "static-500kbps.json"), ReportJson.Serialize(new
         {
             Passed = passed, ConfiguredCapKbps = 500, MotionSeconds = 2, StaticSeconds = 12,
             Scope = "Synthetic pixels through real FFmpeg encoder/decoder only, at 30 media FPS; no capture, transport or rendering. Repeated frozen pixels are submitted normally. Tail byte count includes coded frame headers and actual periodic keyframes; no application idle suppression or forced refinement is added.",
@@ -33,7 +33,7 @@ static class FfmpegRegression
     {
         Directory.CreateDirectory(output);
         var report = IntegrationTest(config).GetAwaiter().GetResult();
-        File.WriteAllText(Path.Combine(output, "control-regression.json"), JsonSerializer.Serialize(report, AppConfiguration.JsonOptions));
+        File.WriteAllText(Path.Combine(output, "control-regression.json"), ReportJson.Serialize(report, AppConfiguration.JsonOptions));
         Environment.ExitCode = report.Passed ? 0 : 1;
         Console.WriteLine($"Manual control regression {(report.Passed ? "PASS" : "FAIL")}: {Path.GetFullPath(output)}");
     }
@@ -54,7 +54,7 @@ static class FfmpegRegression
                 var entry = FindPreset(config, encoderName);
                 var result = CodecTest(entry.Key, entry.Value, source, output);
                 results.Add(result); pass &= result.Passed;
-                File.WriteAllText(Path.Combine(output, encoderName + ".json"), JsonSerializer.Serialize(result, AppConfiguration.JsonOptions));
+                File.WriteAllText(Path.Combine(output, encoderName + ".json"), ReportJson.Serialize(result, AppConfiguration.JsonOptions));
             }
             catch (Exception ex)
             {
@@ -77,7 +77,7 @@ static class FfmpegRegression
             RateAcceptance = "Encoded total must fit 1 Mbps over media duration plus at most 100 kbit (12500 bytes) of initial VBV burst. This is a codec bitstream check; transport separately enforces actual wire pacing including headers.",
             CodecResults = results, Integration = integration
         };
-        File.WriteAllText(Path.Combine(output, "ffmpeg-regression.json"), JsonSerializer.Serialize(report, AppConfiguration.JsonOptions));
+        File.WriteAllText(Path.Combine(output, "ffmpeg-regression.json"), ReportJson.Serialize(report, AppConfiguration.JsonOptions));
         Environment.ExitCode = pass ? 0 : 1;
         Console.WriteLine($"FFmpeg regression {(pass ? "PASS" : "FAIL")}: {Path.GetFullPath(output)}");
     }
@@ -248,7 +248,7 @@ static class FfmpegRegression
         return new(steps.Count >= 11 && steps.All(step => step.Passed), steps, session.GetReport(),
             "Synthetic source through real FFmpeg, localhost UDP video and TCP manual control; decoded frame receipt confirms each new generation. No screen capture or UI render is claimed by this test.");
 
-        long DiagnosticFrames() => JsonSerializer.SerializeToElement(session.GetReport()).GetProperty("ReceivedDiagnosticFrames").GetInt64();
+        long DiagnosticFrames() => ReportJson.ToElement(session.GetReport()).GetProperty("ReceivedDiagnosticFrames").GetInt64();
 
         async Task Apply(string name, string presetId, int cap)
         {

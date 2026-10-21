@@ -9,23 +9,31 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>2.0.0-pre15</Version>
-    <InformationalVersion>v2.pre15</InformationalVersion>
-    <SelfContained>false</SelfContained>
-    <PublishAot>false</PublishAot>
+    <Version>3.0.0-pre1</Version>
+    <InformationalVersion>v3.pre1</InformationalVersion>
+    <!-- NativeAOT: one native exe, no .NET runtime to install. JSON stays reflection-based (rooted below), reports use anonymous types. -->
+    <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <IlcGenerateStackTraceData>true</IlcGenerateStackTraceData>
+    <NoWarn>$(NoWarn);IL2026;IL3050;IL2067;IL2070;IL2072;IL2075;IL2087;IL2091</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <TrimmerRootAssembly Include="FRD" />
     <InternalsVisibleTo Include="MouseFollowDual" />
     <InternalsVisibleTo Include="PathSwitchResilience" />
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
     <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
-    <PackageReference Include="Avalonia.Themes.Simple" Version="12.1.1" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+    <PackageReference Include="Vortice.DirectComposition" Version="3.8.3" />
     <Compile Include="Ffmpeg*.cs" />
+    <Compile Include="Mf*.cs" />
+    <Compile Include="Ui*.cs" />
     <Content Include="codec-config.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- Only the libraries FRD actually calls (avcodec, avutil, swscale) plus avcodec own dependency swresample. -->
-    <FfmpegRuntimeFile Include="third_party\ffmpeg\runtime\avcodec-62.dll;third_party\ffmpeg\runtime\avutil-60.dll;third_party\ffmpeg\runtime\swscale-9.dll;third_party\ffmpeg\runtime\swresample-6.dll;third_party\ffmpeg\runtime\LICENSE.txt" />
+    <FfmpegRuntimeFile Condition="'$(IncludeFfmpegRuntime)' != 'false'" Include="third_party\ffmpeg\runtime\avcodec-62.dll;third_party\ffmpeg\runtime\avutil-60.dll;third_party\ffmpeg\runtime\swscale-9.dll;third_party\ffmpeg\runtime\swresample-6.dll;third_party\ffmpeg\runtime\LICENSE.txt" />
     <Content Include="@(FfmpegRuntimeFile)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" TargetPath="ffmpeg\%(Filename)%(Extension)" />
   </ItemGroup>
 </Project>

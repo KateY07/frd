@@ -115,7 +115,7 @@ static class GpuQuantizedEncodeRegression
                         : route.Path == DesktopCapturePath.PixelShaderRgb565 ? 2 : 4,
                     route.Encoder, 0, 0, null, null, null, 0, 0, 0, 0, 0, error.ToString()));
             }
-            File.WriteAllText(output, JsonSerializer.Serialize(new
+            File.WriteAllText(output, ReportJson.Serialize(new
             {
                 Source = $"Live {width}x{height} primary desktop captured with DDA; intended controlled full-motion stimulus at 30 FPS.",
                 Boundary = "Capture API call start through complete H.264 packet; excludes source-frame waiting, UDP, decode timing and rendering.",
@@ -177,7 +177,7 @@ static class GpuQuantizedEncodeRegression
         }
         finally { await session.StopAsync(); }
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
-        File.WriteAllText(output, JsonSerializer.Serialize(new
+        File.WriteAllText(output, ReportJson.Serialize(new
         {
             Passed = true,
             Scope = "Real DDA capture, live preset switch, x264 H.264, localhost UDP, decoder callback; excludes UI rendering and subjective color review.",

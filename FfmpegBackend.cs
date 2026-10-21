@@ -25,6 +25,15 @@ public static unsafe class FfmpegRuntime
     static readonly av_log_set_callback_callback LogCallback = WriteLog;
     static readonly ConcurrentDictionary<nint, ConcurrentQueue<string>> InitializationProblems = new();
     static string? loadedDirectory;
+    static string? configuredDirectory;
+
+    /// <summary>Remembers where the optional FFmpeg extension would be installed; nothing is loaded until a codec needs it.</summary>
+    public static void Configure(string directory) => configuredDirectory = Path.GetFullPath(directory);
+
+    /// <summary>True when the extension's native libraries are present (or already loaded).</summary>
+    public static bool IsAvailable => loadedDirectory != null ||
+        (configuredDirectory != null && File.Exists(Path.Combine(configuredDirectory, "avcodec-62.dll")));
+    public static bool IsLoaded => loadedDirectory != null;
     public static event Action<string>? Log;
     static string version = "not initialized";
     public static string Version => version;
@@ -62,7 +71,10 @@ public static unsafe class FfmpegRuntime
     public static bool HasDecoder(string name) { RequireInitialized(); return ffmpeg.avcodec_find_decoder_by_name(name) != null; }
     internal static void RequireInitialized()
     {
-        if (loadedDirectory == null) throw new InvalidOperationException("Call FfmpegRuntime.Initialize before using a codec.");
+        if (loadedDirectory != null) return;
+        if (configuredDirectory == null || !File.Exists(Path.Combine(configuredDirectory, "avcodec-62.dll")))
+            throw new NotSupportedException("This codec needs the FFmpeg extension package (unpack its ffmpeg folder next to FRD.exe).");
+        Initialize(configuredDirectory);
     }
 
     internal static void Check(int result, string operation)

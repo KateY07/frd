@@ -63,7 +63,7 @@ static class GpuPreReadbackRegression
                     route.Path == DesktopCapturePath.PixelShaderGray8 ? 1 : 4, 0,
                     false, false, null, null, null, null, null, null, null, null, 0, error.ToString()));
             }
-            File.WriteAllText(output, JsonSerializer.Serialize(new
+            File.WriteAllText(output, ReportJson.Serialize(new
             {
                 Source = "Real primary desktop DDA BGRA8 texture; transformation runs on the same D3D11 GPU before staging readback.",
                 Boundary = "AcquireNextFrame(0) call start through GPU transform, staging Map, and complete CPU output buffer; excludes encode, UDP, decode and rendering.",

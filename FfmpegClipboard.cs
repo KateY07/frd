@@ -227,7 +227,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
             { Console.Error.WriteLine("[clipboard] Copy rejected: " + error); Publish("复制未同步：" + error.Message); continue; }
             Publish(manifest.Kind == "text" ? "正在同步文本" : $"正在同步 {manifest.Entries.Count(x => !x.Directory)} 个文件");
-            var header = JsonSerializer.SerializeToUtf8Bytes(manifest);
+            var header = JsonSerializer.SerializeToUtf8Bytes(manifest, FrdJson.Plain);
             if (header.Length > 2 * 1024 * 1024) throw new InvalidDataException("Clipboard manifest is too large.");
             var prefix = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(prefix, header.Length);
             await stream.WriteAsync(prefix, stop.Token); await stream.WriteAsync(header, stop.Token);
@@ -253,7 +253,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
             var length = BinaryPrimitives.ReadInt32LittleEndian(prefix);
             if (length is < 2 or > 2 * 1024 * 1024) throw new InvalidDataException("Invalid clipboard manifest size.");
             var bytes = new byte[length]; await stream.ReadExactlyAsync(bytes, stop.Token);
-            var manifest = JsonSerializer.Deserialize<ClipboardManifest>(bytes) ?? throw new InvalidDataException("Missing clipboard manifest.");
+            var manifest = JsonSerializer.Deserialize<ClipboardManifest>(bytes, FrdJson.Plain) ?? throw new InvalidDataException("Missing clipboard manifest.");
             Validate(manifest);
             uint sequence;
             lock (clipboardGate) sequence = clipboard.Sequence;

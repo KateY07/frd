@@ -3,7 +3,7 @@
   "width": 1280,
   "height": 720,
   "framesPerSecond": 30,
-  "initialPreset": "h264",
+  "initialPreset": "mf_h264",
   "autoSelectCodec": false,
   "initialBitrateKbps": 2500,
   "maximumBitrateMbps": 100,
@@ -14,6 +14,20 @@
     "maxDelayMs": 0
   },
   "presets": {
+    "mf_h264": {
+      "label": "H.264 / Windows 内置 · 硬件优先（默认）",
+      "encoderArguments": "-c:v mf-h264 -rc cbr -profile high -g 300 -hw auto",
+      "decoderArguments": "-c:v mf-h264-decode",
+      "inputPixelMode": "bgra",
+      "bitrateControlled": true
+    },
+    "mf_h264_sw": {
+      "label": "H.264 / Windows 内置 · 软件编码",
+      "encoderArguments": "-c:v mf-h264 -rc cbr -profile high -g 300 -hw off",
+      "decoderArguments": "-c:v mf-h264-decode",
+      "inputPixelMode": "bgra",
+      "bitrateControlled": true
+    },
     "h264_rgb_fast": {
       "label": "H.264 / x264rgb · 原始分辨率低延迟",
       "autoProbe": true,

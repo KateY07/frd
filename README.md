@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v2.pre15）
+# FRD · 远程桌面 CLI（v3.pre1）
+
+v3.pre1：Native AOT 单文件（约 10.8 MB，无需 .NET 运行时）；默认改用 Windows 内置 Media Foundation H.264 编解码，FFmpeg 变为可选扩展包；界面由 Avalonia 改为原生 Direct3D11/Direct2D；Windows 辅助服务拆为独立的 `frd-wintools.exe`。
 
 v2.pre15：发布包瘦身（解压 323→约 138 MiB，zip 123→约 52 MiB），仅随包提供实际使用的 FFmpeg 库并去掉未使用的 Windows SDK 投影。
 
@@ -22,9 +24,9 @@ v2.pre7：主控/被控界面改为深色毛玻璃悬浮面板，收起为悬浮
 
 继承 v2.pre2 修复：输入异常不再终止视频；旧通道清理、迟到输入包及重复启用不会影响新通道；远程输入事件只走 UDP。输入握手升级为协议 2，主被控需一起更新，端口与数据报尺寸不变。详见 [输入生命周期修复与回归](docs/输入生命周期修复.md)。
 
-FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，Avalonia 提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
+FRD 是供二次开发集成的 Windows x64 远程桌面基础组件，当前对外接口为 **CLI（进程级 API）**。同一个 `FRD.exe` 通过命令行启动被控端或主控端；编码预设由 JSON 定义，原生 Win32/Direct3D11/Direct2D 界面提供连接状态、控制和画面预览。开发者可以从 C#、Python 或其他语言启动并管理该进程。
 
-真实链路为：屏幕捕获 → 编码 → UDP → 解码 → GPU 呈现。本版提供 FFmpeg `libx264rgb` 等预设；视频只按原始分辨率传输，窗口可等比缩放。保留手动码率与预设切换、键鼠转发、鼠标形状、双向文本/文件/目录剪贴板，以及鼠标穿透的半透明诊断水印。
+真实链路为：屏幕捕获 → 编码 → UDP → 解码 → GPU 呈现。本版默认使用 Windows 内置 Media Foundation H.264（硬件优先），安装可选 FFmpeg 扩展包后另有 `libx264rgb` 等预设；视频只按原始分辨率传输，窗口可等比缩放。保留手动码率与预设切换、键鼠转发、鼠标形状、双向文本/文件/目录剪贴板，以及鼠标穿透的半透明诊断水印。
 
 ## 当前锁定的实验目标
 
@@ -112,7 +114,7 @@ Console.WriteLine($"FRD 退出码：{process.ExitCode}");
 - `initialBitrateKbps` 设置有损编码初始码率，`maximumBitrateMbps` 设置滑条上限（默认 100 Mbps，可配置至 1000 Mbps）。码率通过滑条调整，当前数值在标签中以 Mbps 显示。不会按滑条数值额外限制链路，允许编码缓冲和帧发送突发。
 - `autoSelectCodec:true` 在启动时对标记 `autoProbe:true` 的有损预设做真实屏幕短测，探测进程最多运行 5 秒；不可用或超时则保留 `initialPreset`。`minimumAutoBitrateKbps` 可让高带宽预设仅在码率足够时参与。双机时被控端测捕获和编码，主控端用样本验证并测解码；结果只是当前画面、当前码率下的启动选择，手动切换始终可用。
 - 当前会话的码率与预设通过主控 UI 调整并传到被控端；JSON 在启动时读取，尚未提供运行中 JSON 热加载或独立外部 RPC 接口。
-- 本版依赖 **.NET 10 x64 Runtime**，不再自包含运行时，也不启用 Native AOT；仍直接运行 `FRD.exe`。需在主控与被控机器预先安装相应运行时，SDK 非必需；[微软下载页](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)。Avalonia 与 FFmpeg 原生依赖仍随包提供。原生调试符号另存于本机构建产物，不进入便携包。
+- 本版为 **Native AOT** 单文件 `FRD.exe`，不需要安装 .NET 运行时。FFmpeg 为可选扩展包：把 `frd-v3.pre1-ffmpeg-win-x64.zip` 解压到 `FRD.exe` 同目录即可启用 FFmpeg 预设。
 - 推荐无需管理员权限的目录：`%LOCALAPPDATA%\Programs\FRD\v2.pre3\`，不同版本分目录保留。
 - 本机发布包为 `D:\pub\FRD\v2.pre3.zip` 与同名 SHA-256 文件；工作区也保留 `artifacts/v2.pre3/` 构建副本。推送 `v*` 标签会由 GitHub Actions 在 Windows runner 上重新构建，并创建带 ZIP 和校验文件的 GitHub Pre-release；标签必须与项目版本一致。
 

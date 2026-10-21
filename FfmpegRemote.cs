@@ -7,11 +7,6 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using Avalonia;
-using Avalonia.Controls;
-using Avalonia.Controls.ApplicationLifetimes;
-using Avalonia.Layout;
-using Avalonia.Themes.Simple;
 
 namespace Frd;
 
@@ -29,7 +24,7 @@ static class RemoteWire
 {
     public static async Task WriteAsync<T>(NetworkStream stream, T value, CancellationToken token)
     {
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(value);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(value, FrdJson.Plain);
         if (bytes.Length > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
             throw new InvalidDataException("Remote control message exceeds its size limit.");
         var header = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
@@ -43,7 +38,7 @@ static class RemoteWire
         if (size < 1 || size > (typeof(T) == typeof(RemoteReply) ? 2 * 1024 * 1024 : 65536))
             throw new InvalidDataException("Invalid remote control message length.");
         var bytes = new byte[size]; await stream.ReadExactlyAsync(bytes, token);
-        return JsonSerializer.Deserialize<T>(bytes) ?? throw new InvalidDataException("Empty remote message.");
+        return JsonSerializer.Deserialize<T>(bytes, FrdJson.Plain) ?? throw new InvalidDataException("Empty remote message.");
     }
 }
 
@@ -1033,7 +1028,7 @@ sealed class RemoteHost : IAsyncDisposable
 
 static partial class RemoteLaunch
 {
-    static int hostExitCode;
+    internal static int hostExitCode;
     public const string Usage = "FRD CLI\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。远程模式只使用 --port：被控端在该端口同时绑定 TCP/UDP；主控的全部 TCP 连接和 UDP 数据报均以该端口为目标。视频、反馈、诊断和键鼠复用同一个 UDP socket。";
     public static void Help(bool window)
     {
@@ -1072,34 +1067,14 @@ static partial class RemoteLaunch
     {
         if (!options.Host)
         {
-            FfmpegUi.InteractionScriptPath = options.InteractionScript;
-            FfmpegUi.Run(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
+            UiApp.RunController(config, options.Seconds, options.Report, new(options.Peer!, options.Port, options.Token));
             return Environment.ExitCode;
         }
-        HostApplication.Factory = () => new HostWindow(config, options.Addresses, options.Port, options.Token, probeSamples);
-        hostExitCode = 0;
-        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]);
-        SessionTrace.Event("host-process", $"exit-code-{hostExitCode}");
-        return hostExitCode;
+        return UiApp.RunHost(config, options.Addresses, options.Port, options.Token, probeSamples);
     }
 
     static void ShowMessage(string text)
     {
-        HostApplication.Factory = () => new Window { Title = "FRD 命令行", Width = 700, Height = 250,
-            Content = new TextBlock { Text = text, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Margin = new Thickness(20) } };
-        AppBuilder.Configure<HostApplication>().UsePlatformDetect().StartWithClassicDesktopLifetime([]);
-    }
-
-    sealed class HostApplication : Application
-    {
-        public static Func<Window>? Factory;
-        public override void Initialize() => Styles.Add(new SimpleTheme());
-        public override void OnFrameworkInitializationCompleted()
-        {
-            // The host window keeps running through a failed UI callback; the error goes to the crash log instead of ending the process.
-            Avalonia.Threading.Dispatcher.UIThread.UnhandledException += (_, e) => { CrashLog.Write("host-ui-exception", e.Exception); e.Handled = true; };
-            if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop) desktop.MainWindow = Factory!();
-            base.OnFrameworkInitializationCompleted();
-        }
+        UiNative.MessageBox(0, text, "FRD 命令行", 0x40 /* MB_ICONINFORMATION */);
     }
 }

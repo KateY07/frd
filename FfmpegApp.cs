@@ -10,33 +10,33 @@ namespace Frd;
 
 public sealed record CodecPreset
 {
-    public string Label { get; init; } = "";
-    public string EncoderArguments { get; init; } = "";
-    public string DecoderArguments { get; init; } = "";
-    public string InputPixelMode { get; init; } = "bgra";
-    public bool BitrateControlled { get; init; } = true;
-    public bool AutoProbe { get; init; }
-    public int MinimumAutoBitrateKbps { get; init; } = 100;
-    public bool Enabled { get; init; } = true;
-    public string? UnavailableReason { get; init; }
+    public string Label { get; set; } = "";
+    public string EncoderArguments { get; set; } = "";
+    public string DecoderArguments { get; set; } = "";
+    public string InputPixelMode { get; set; } = "bgra";
+    public bool BitrateControlled { get; set; } = true;
+    public bool AutoProbe { get; set; }
+    public int MinimumAutoBitrateKbps { get; set; } = 100;
+    public bool Enabled { get; set; } = true;
+    public string? UnavailableReason { get; set; }
 }
 
 public sealed record AppConfiguration
 {
-    public int SchemaVersion { get; init; } = 3;
-    public int Width { get; init; } = 1280;
-    public int Height { get; init; } = 720;
-    public double TransmissionScale { get; init; } = 1;
-    public int FramesPerSecond { get; init; } = 30;
-    public string InitialPreset { get; init; } = "h264";
-    public bool AutoSelectCodec { get; init; }
-    public int InitialBitrateKbps { get; init; } = 2500;
-    public double MaximumBitrateMbps { get; init; } = 100;
+    public int SchemaVersion { get; set; } = 3;
+    public int Width { get; set; } = 1280;
+    public int Height { get; set; } = 720;
+    public double TransmissionScale { get; set; } = 1;
+    public int FramesPerSecond { get; set; } = 30;
+    public string InitialPreset { get; set; } = "h264";
+    public bool AutoSelectCodec { get; set; }
+    public int InitialBitrateKbps { get; set; } = 2500;
+    public double MaximumBitrateMbps { get; set; } = 100;
     [System.Text.Json.Serialization.JsonIgnore]
     public int MaximumBitrateKbps => checked((int)Math.Round(MaximumBitrateMbps * 1000));
-    public string LibraryDirectory { get; init; } = "ffmpeg";
-    public NetworkSimulation Simulation { get; init; } = new();
-    public Dictionary<string, CodecPreset> Presets { get; init; } = new();
+    public string LibraryDirectory { get; set; } = "ffmpeg";
+    public NetworkSimulation Simulation { get; set; } = new();
+    public Dictionary<string, CodecPreset> Presets { get; set; } = new();
 
     public static AppConfiguration Load(string path)
     {
@@ -57,50 +57,85 @@ public sealed record AppConfiguration
                 throw new InvalidDataException($"Preset {id}: only bitrate-controlled FFmpeg codecs are supported.");
         }
         var directory = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(path))!, config.LibraryDirectory));
-        FfmpegRuntime.Initialize(directory);
-        return config;
+        FfmpegRuntime.Configure(directory);
+        return config.WithAvailability();
     }
 
-    public static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true };
+    /// <summary>Marks presets whose codec is not installed (FFmpeg extension missing, no Media Foundation H.264) as disabled.</summary>
+    public AppConfiguration WithAvailability()
+    {
+        var mfEncoder = MediaFoundationRuntime.HasH264Encoder();
+        var mfDecoder = MediaFoundationRuntime.HasH264Decoder();
+        var presets = Presets.ToDictionary(entry => entry.Key, entry =>
+        {
+            var preset = entry.Value;
+            if (!preset.Enabled) return preset;
+            if (MfArguments.IsMediaFoundation(preset.EncoderArguments))
+            {
+                if (!mfEncoder) return preset with { Enabled = false, UnavailableReason = "此系统缺少 Media Foundation H.264 编码器（N 版 Windows 需安装媒体功能包）" };
+                if (!mfDecoder) return preset with { Enabled = false, UnavailableReason = "此系统缺少 Media Foundation H.264 解码器" };
+                return preset;
+            }
+            return FfmpegRuntime.IsAvailable ? preset : preset with { Enabled = false, UnavailableReason = "需要 FFmpeg 扩展包（把其中的 ffmpeg 文件夹解压到 FRD.exe 旁）" };
+        });
+        return this with { Presets = presets };
+    }
+
+    /// <summary>Falls back to the first installed codec when the configured initial preset is unavailable; null when none is.</summary>
+    public AppConfiguration? WithUsableInitialPreset(out string? problem)
+    {
+        problem = null;
+        if (Presets.TryGetValue(InitialPreset, out var initial) && initial.Enabled) return this;
+        var fallback = Presets.FirstOrDefault(entry => entry.Value.Enabled && entry.Value.BitrateControlled);
+        if (fallback.Key != null)
+        {
+            Console.Error.WriteLine($"Initial preset \"{InitialPreset}\" is unavailable ({Presets.GetValueOrDefault(InitialPreset)?.UnavailableReason ?? "not defined"}); using \"{fallback.Key}\".");
+            return this with { InitialPreset = fallback.Key };
+        }
+        problem = "没有可用的 H.264 编解码器：请在 Windows 中安装“媒体功能包”（N 版/KN 版），或安装 FRD 的 FFmpeg 扩展包。";
+        return null;
+    }
+
+    public static readonly JsonSerializerOptions JsonOptions = FrdJson.Config;
 }
 
 public sealed record SessionStatus(string ActivePreset, int AppliedLimitKbps, double SentMbps, double ReceivedMbps,
     double EstimatedMbps, double DelayTrendMs, double LossRate, string Message)
 {
-    public double CaptureToRenderMs { get; init; }
-    public double MeanCaptureToRenderMs { get; init; }
-    public double RenderedFps { get; init; }
-    public double DecodedFps { get; init; }
-    public bool HasRenderTiming { get; init; }
-    public bool HasRecentRenderTiming { get; init; }
-    public int RenderTimingSamples { get; init; }
+    public double CaptureToRenderMs { get; set; }
+    public double MeanCaptureToRenderMs { get; set; }
+    public double RenderedFps { get; set; }
+    public double DecodedFps { get; set; }
+    public bool HasRenderTiming { get; set; }
+    public bool HasRecentRenderTiming { get; set; }
+    public int RenderTimingSamples { get; set; }
     public double RenderTimingWindowSeconds => 1;
-    public double CaptureMs { get; init; }
-    public double EncodeMs { get; init; }
-    public double TransferMs { get; init; }
-    public double DecodeMs { get; init; }
-    public double RenderMs { get; init; }
-    public double MeanCaptureMs { get; init; }
-    public double MeanEncodeMs { get; init; }
-    public double MeanTransferMs { get; init; }
-    public double MeanDecodeMs { get; init; }
-    public double MeanRenderMs { get; init; }
-    public bool PacketDiagnosticsEnabled { get; init; }
-    public double DiagnosticMbps { get; init; }
-    public TransferTimings? TransferDetails { get; init; }
-    public string TimingDescription { get; init; } = "同机单调时钟";
-    public int SendBudgetKbps { get; init; }
-    public int BurstBudgetWireBytes { get; init; }
-    public double SimulatedCapacityMbps { get; init; }
+    public double CaptureMs { get; set; }
+    public double EncodeMs { get; set; }
+    public double TransferMs { get; set; }
+    public double DecodeMs { get; set; }
+    public double RenderMs { get; set; }
+    public double MeanCaptureMs { get; set; }
+    public double MeanEncodeMs { get; set; }
+    public double MeanTransferMs { get; set; }
+    public double MeanDecodeMs { get; set; }
+    public double MeanRenderMs { get; set; }
+    public bool PacketDiagnosticsEnabled { get; set; }
+    public double DiagnosticMbps { get; set; }
+    public TransferTimings? TransferDetails { get; set; }
+    public string TimingDescription { get; set; } = "同机单调时钟";
+    public int SendBudgetKbps { get; set; }
+    public int BurstBudgetWireBytes { get; set; }
+    public double SimulatedCapacityMbps { get; set; }
 }
 public sealed record TransferTimings(int PayloadBytes, int Packets, double SenderMs, double PlannedWaitMs,
     double WakeupOverrunMs, double LastSendToReassemblyMs, double ReceiveQueueMs);
 public sealed record ControlResult(bool Success, string Message, int Generation)
 {
-    public int Width { get; init; }
-    public int Height { get; init; }
-    public double TransmissionScale { get; init; } = 1;
-    public int FramesPerSecond { get; init; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public double TransmissionScale { get; set; } = 1;
+    public int FramesPerSecond { get; set; }
 }
 sealed record ControlCommand(string Kind, int Generation, string PresetId, int LimitKbps, bool DiagnosticsEnabled = false, double? Scale = null, int? FramesPerSecond = null);
 sealed record PendingControl(ControlCommand Command, TaskCompletionSource<ControlResult> Completion);
@@ -261,9 +296,9 @@ public sealed partial class DemoSession : IDisposable
     {
         if (remote != null) return await RemoteControlAsync(command);
         if (requests == null || replies == null) throw new InvalidOperationException("Control channel not connected.");
-        await requests.WriteLineAsync(JsonSerializer.Serialize(command).AsMemory(), stop.Token);
+        await requests.WriteLineAsync(JsonSerializer.Serialize(command, FrdJson.Plain).AsMemory(), stop.Token);
         var line = await replies.ReadLineAsync(stop.Token) ?? throw new IOException("Sender control channel closed.");
-        return JsonSerializer.Deserialize<ControlResult>(line) ?? throw new IOException("Invalid control response.");
+        return JsonSerializer.Deserialize<ControlResult>(line, FrdJson.Plain) ?? throw new IOException("Invalid control response.");
     }
 
     async Task ServeControlAsync()
@@ -280,14 +315,14 @@ public sealed partial class DemoSession : IDisposable
                 ControlResult result;
                 try
                 {
-                    var command = JsonSerializer.Deserialize<ControlCommand>(line) ?? throw new InvalidDataException("Empty control command.");
+                    var command = JsonSerializer.Deserialize<ControlCommand>(line, FrdJson.Plain) ?? throw new InvalidDataException("Empty control command.");
                     if (command.Kind != "apply" && command.Kind != "keyframe" && command.Kind != "diagnostics") throw new InvalidDataException("Unknown control command.");
                     var pending = new PendingControl(command, new(TaskCreationOptions.RunContinuationsAsynchronously));
                     await commands.Writer.WriteAsync(pending, stop.Token);
                     result = await pending.Completion.Task.WaitAsync(stop.Token);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException) { Console.Error.WriteLine(ex); result = new(false, ex.Message, AppliedGeneration); }
-                await output.WriteLineAsync(JsonSerializer.Serialize(result).AsMemory(), stop.Token);
+                await output.WriteLineAsync(JsonSerializer.Serialize(result, FrdJson.Plain).AsMemory(), stop.Token);
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Control server stopped."); }
@@ -358,7 +393,23 @@ public sealed partial class DemoSession : IDisposable
                 }
                 if (encoder == null) { stop.Token.WaitHandle.WaitOne(5); continue; }
                 var waitMs = (next - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency;
-                if (waitMs > 0 && stop.Token.WaitHandle.WaitOne((int)Math.Ceiling(waitMs))) break;
+                if (waitMs > 0)
+                {
+                    if (encoder.HasPending)
+                    {
+                        // Hardware encoders answer asynchronously: wait in short slices and forward whatever became ready.
+                        var until = Stopwatch.GetTimestamp() + (long)(waitMs * Stopwatch.Frequency / 1000.0);
+                        var stopped = false;
+                        while (Stopwatch.GetTimestamp() < until)
+                        {
+                            if (stop.Token.WaitHandle.WaitOne(1)) { stopped = true; break; }
+                            SendEncoded(encoder.Poll(), inputClocks, Stopwatch.GetTimestamp());
+                            if (!encoder.HasPending) { var rest = (until - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency; if (rest > 0 && stop.Token.WaitHandle.WaitOne((int)Math.Ceiling(rest))) stopped = true; break; }
+                        }
+                        if (stopped) break;
+                    }
+                    else if (stop.Token.WaitHandle.WaitOne((int)Math.Ceiling(waitMs))) break;
+                }
                 var captureStart = Stopwatch.GetTimestamp();
                 MappedBgraFrame? mapped = null;
                 byte[]? pixels = null;
@@ -402,23 +453,7 @@ public sealed partial class DemoSession : IDisposable
                 var encodedTick = Stopwatch.GetTimestamp();
                 Interlocked.Add(ref encodeTicks, encodedTick - encodeStart);
                 Interlocked.Increment(ref encodedFrames);
-                foreach (var packet in packets)
-                {
-                    var packetId = nextPacketId++;
-                    if (inputClocks.TryGetValue(packet.Pts, out var source))
-                    {
-                        frameClocks[packetId] = new(source.Started, source.Captured, encodedTick, AppliedGeneration);
-                        if (Volatile.Read(ref packetDiagnosticsEnabled) && diagnosticDestination == null)
-                            sender!.SendDiagnostic(FrameDiagnosticProtocol.Encode(new(AppliedGeneration, packetId, source.Started,
-                                source.Captured, encodedTick, Stopwatch.Frequency)), diagnosticDestination ?? new(IPAddress.Loopback, diagnosticsReceiver!.Port), stop.Token);
-                    }
-                    frameClocks.TryRemove(packetId - 4096, out _);
-                    sender!.Send(new(AppliedGeneration, packetId, packet.KeyFrame, packet.Data), stop.Token);
-                    if (diagnosticDestination != null && Volatile.Read(ref packetDiagnosticsEnabled) &&
-                        frameClocks.TryGetValue(packetId, out var sentClock) && Volatile.Read(ref sentClock.Sending) is { } sending)
-                        sender.SendDiagnostic(FrameDiagnosticProtocol.Encode(new(AppliedGeneration, packetId, sentClock.CaptureTick,
-                            sentClock.CapturedTick, sentClock.EncodedTick, Stopwatch.Frequency) { Sending = sending }), diagnosticDestination, stop.Token);
-                }
+                SendEncoded(packets, inputClocks, encodedTick);
                 next = Math.Max(next + Stopwatch.Frequency / config.FramesPerSecond, Stopwatch.GetTimestamp());
             }
         }
@@ -428,6 +463,27 @@ public sealed partial class DemoSession : IDisposable
         {
             encoder?.Dispose();
             while (commands.Reader.TryRead(out var command)) command.Completion.TrySetCanceled();
+        }
+    }
+
+    void SendEncoded(IReadOnlyList<CodecPacket> packets, Dictionary<long, (long Started, long Captured)> inputClocks, long encodedTick)
+    {
+        foreach (var packet in packets)
+        {
+            var packetId = nextPacketId++;
+            if (inputClocks.TryGetValue(packet.Pts, out var source))
+            {
+                frameClocks[packetId] = new(source.Started, source.Captured, encodedTick, AppliedGeneration);
+                if (Volatile.Read(ref packetDiagnosticsEnabled) && diagnosticDestination == null)
+                    sender!.SendDiagnostic(FrameDiagnosticProtocol.Encode(new(AppliedGeneration, packetId, source.Started,
+                        source.Captured, encodedTick, Stopwatch.Frequency)), diagnosticDestination ?? new(IPAddress.Loopback, diagnosticsReceiver!.Port), stop.Token);
+            }
+            frameClocks.TryRemove(packetId - 4096, out _);
+            sender!.Send(new(AppliedGeneration, packetId, packet.KeyFrame, packet.Data), stop.Token);
+            if (diagnosticDestination != null && Volatile.Read(ref packetDiagnosticsEnabled) &&
+                frameClocks.TryGetValue(packetId, out var sentClock) && Volatile.Read(ref sentClock.Sending) is { } sending)
+                sender.SendDiagnostic(FrameDiagnosticProtocol.Encode(new(AppliedGeneration, packetId, sentClock.CaptureTick,
+                    sentClock.CapturedTick, sentClock.EncodedTick, Stopwatch.Frequency) { Sending = sending }), diagnosticDestination, stop.Token);
         }
     }
 
@@ -599,7 +655,7 @@ public sealed partial class DemoSession : IDisposable
 
     public object GetReport() => new
     {
-        Backend = "FFmpeg " + FfmpegRuntime.Version, ManualOnly = true, ActivePreset = activePreset, AppliedLimitKbps = appliedLimit,
+        Backend = MfArguments.IsMediaFoundation(config.Presets[activePreset].EncoderArguments) ? "Media Foundation" : "FFmpeg " + FfmpegRuntime.Version, ManualOnly = true, ActivePreset = activePreset, AppliedLimitKbps = appliedLimit,
         AppliedGeneration, DecodedGeneration, RenderedGeneration, EncodedFrames = encodedFrames, DecodedFrames = decodedFrames,
         ConfirmedPresentedFrames = presentationCount, MeanCaptureToGpuCompleteMs = PresentationStatus().SessionMean,
         PresentedStageMeansMs = PresentationStatus().SessionAverages,
@@ -658,10 +714,7 @@ static class Program
                     .Cast<System.Reflection.AssemblyInformationalVersionAttribute>().Single().InformationalVersion);
                 return 0;
             }
-            if (args is ["--install-secure-helper"]) return SecureDesktopService.Install();
-            if (args is ["--install-secure-helper", var userSid]) return SecureDesktopService.Install(userSid);
-            if (args is ["--secure-service"]) return SecureDesktopService.RunService();
-            if (args is ["--secure-worker"]) { SecureDesktopService.RunWorker(); return 0; }
+            if (args.Length > 0 && args[0] == "--mf-regression") return MfRegression.Run(args);
             if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
                 return AutoCodecProbe.RunWorker(args);
             if (args.Length > 0 && args[0] is not ("--host" or "--connect" or "--codec-regression" or "--control-regression" or
@@ -670,6 +723,12 @@ static class Program
             var remoteOptions = args.Length > 0 && args[0] is "--host" or "--connect" ? RemoteLaunch.Parse(args) : null;
             var configPath = Path.Combine(AppContext.BaseDirectory, "codec-config.json");
             var config = AppConfiguration.Load(configPath);
+            if (args.Length == 0 || args[0] is "--host" or "--connect")
+            {
+                var usable = config.WithUsableInitialPreset(out var codecProblem);
+                if (usable == null) { Console.Error.WriteLine(codecProblem); return 2; }
+                config = usable;
+            }
             if (args.Length > 0 && args[0] == "--gpu-prereadback-regression")
                 return GpuPreReadbackRegression.Run(args.Length > 1 ? args[1] : "results/gpu-prereadback.json");
             if (args.Length > 0 && args[0] == "--gpu-quantized-encode-regression")
@@ -686,7 +745,7 @@ static class Program
                 var receiver = AutoCodecProbe.SelectReceiver(config, selected.Samples);
                 var output = args.Length > 1 ? args[1] : "results/auto-codec-probe.json";
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
-                File.WriteAllText(output, JsonSerializer.Serialize(new
+                File.WriteAllText(output, ReportJson.Serialize(new
                 {
                     SelectedPreset = selected.Configuration.InitialPreset,
                     ReceiverSelectedPreset = receiver.InitialPreset,
@@ -702,7 +761,6 @@ static class Program
             }
             if (args.Length > 0 && args[0] == "--codec-regression") { FfmpegRegression.Run(config, args.Length > 1 ? args[1] : "results/ffmpeg-regression"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--control-regression") { FfmpegRegression.RunControl(config, args.Length > 1 ? args[1] : "results/ffmpeg-control"); return Environment.ExitCode; }
-            if (args.Length > 0 && args[0] == "--presentation-regression") { FfmpegUi.RunPresentationRegression(config, args.Length > 1 ? args[1] : "results/ffmpeg-presentation.json"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--static-regression") { FfmpegRegression.RunStaticLowBandwidth(config, args.Length > 1 ? args[1] : "results/ffmpeg-static"); return Environment.ExitCode; }
             if (args.Length > 0 && args[0] == "--cpu-presets-regression")
             {
@@ -713,10 +771,10 @@ static class Program
             {
                 var seconds = args.Length > 1 ? int.Parse(args[1]) : 10;
                 var output = args.Length > 2 ? args[2] : "results/ffmpeg-demo.json";
-                FfmpegUi.Run(config, seconds, output); return Environment.ExitCode;
+                UiApp.RunController(config, seconds, output); return Environment.ExitCode;
             }
             config = AutoCodecProbe.SelectSender(config).Configuration;
-            FfmpegUi.Run(config); return Environment.ExitCode;
+            UiApp.RunController(config); return Environment.ExitCode;
         }
         catch (Exception ex)
         {

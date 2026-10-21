@@ -59,7 +59,7 @@ static class CpuPresetRegression
         }
         await session.StopAsync();
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(reportPath))!);
-        File.WriteAllText(reportPath, JsonSerializer.Serialize(new
+        File.WriteAllText(reportPath, ReportJson.Serialize(new
         {
             Passed = true, Capture = "DDA native-size staging Map; no application pixel row copy",
             CaptureSize = new { capture.SourceWidth, capture.SourceHeight },

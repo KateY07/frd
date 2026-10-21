@@ -14,7 +14,7 @@ public static class CursorWire
 {
     public static async Task WriteAsync(NetworkStream stream, CursorUpdate update, CancellationToken token)
     {
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(update);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(update, FrdJson.Plain);
         if (bytes.Length > 524288) throw new InvalidDataException("Cursor message too large.");
         var header = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(header, bytes.Length);
         await stream.WriteAsync(header, token); await stream.WriteAsync(bytes, token);
@@ -25,7 +25,7 @@ public static class CursorWire
         var length = BinaryPrimitives.ReadInt32LittleEndian(header);
         if (length is < 1 or > 524288) throw new InvalidDataException("Invalid cursor message length.");
         var bytes = new byte[length]; await stream.ReadExactlyAsync(bytes, token);
-        var update = JsonSerializer.Deserialize<CursorUpdate>(bytes) ?? throw new InvalidDataException("Empty cursor message.");
+        var update = JsonSerializer.Deserialize<CursorUpdate>(bytes, FrdJson.Plain) ?? throw new InvalidDataException("Empty cursor message.");
         if (update.Id < 0 || !double.IsFinite(update.X) || !double.IsFinite(update.Y)) throw new InvalidDataException("Invalid cursor state.");
         if (update.Shape != null) NativeCursor.Validate(update.Shape);
         return update;
@@ -50,7 +50,7 @@ public static class CursorWire
                 if (state.Handle != 0 && (previous == null || state.Handle != previousHandle))
                 {
                     shape = NativeCursor.ReadShape(state.Handle);
-                    var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape)));
+                    var fingerprint = Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(shape, FrdJson.Plain)));
                     if (known.TryGetValue(fingerprint, out id)) shape = null;
                     else
                     {
