@@ -37,6 +37,17 @@ if (-not $productVersion.StartsWith($version + '+') -and $productVersion -ne $ve
 foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $staging $required))) { throw "Missing release file: $required" }
 }
+# The SYSTEM helper service ships only as its own installer (frd-service-<version>-setup.exe, OneSetup), which embeds frd-wintools.exe;
+# FRD.exe's "install service" button starts it. The bare frd-wintools.exe is not part of the package.
+$onesetupTool = (Get-Command onesetup -ErrorAction SilentlyContinue).Source
+if (-not $onesetupTool -and (Test-Path -LiteralPath 'D:\1\onesetup\onesetup\publish\onesetup.exe')) { $onesetupTool = 'D:\1\onesetup\onesetup\publish\onesetup.exe' }
+if (-not $onesetupTool) { throw 'onesetup.exe is required to build the service installer.' }
+New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
+& (Join-Path $PSScriptRoot 'tools/ServiceSetup/Build-ServiceSetup.ps1') -Version $version -WintoolsPath (Join-Path $staging 'frd-wintools.exe') -OneSetup $onesetupTool -OutputDirectory $releaseRoot | Out-Null
+$serviceSetup = Join-Path $releaseRoot "frd-service-$version-setup.exe"
+if (-not (Test-Path -LiteralPath $serviceSetup)) { throw 'Service installer was not built.' }
+Copy-Item -LiteralPath $serviceSetup -Destination $staging
+Remove-Item -LiteralPath (Join-Path $staging 'frd-wintools.exe')
 if (Test-Path -LiteralPath (Join-Path $staging 'ffmpeg')) { throw 'The base package must not contain FFmpeg.' }
 if (Get-ChildItem -LiteralPath $staging -Filter '*.dll' -File) { throw 'The NativeAOT base package must be a single exe with no managed DLLs.' }
 if (Get-ChildItem -LiteralPath $staging -Filter '*.xml' -File) { throw 'Documentation XML files must not ship in the package.' }
@@ -98,6 +109,9 @@ $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerI
 $extensionHash = (Get-FileHash -LiteralPath $extensionArchive -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $releaseRoot 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archivePath))`n$extensionHash  $([IO.Path]::GetFileName($extensionArchive))`n")
 New-Item -ItemType Directory -Force -Path $localReleaseRoot | Out-Null
+foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter "frd-service-$version-setup.exe*" -File) {
+    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
+}
 Copy-Item -LiteralPath $archivePath -Destination $localArchive -ErrorAction Stop
 [IO.File]::WriteAllText($localHash, "$hash *$version.zip`n")
 # Single-file build (frd-<version>.exe): the same files packed with OneSetup (https://github.com/KateY07/onesetup) in --app mode.
@@ -108,7 +122,7 @@ $singleFile = $null
 if ($onesetup) {
     $singleStage = Join-Path $releaseRoot ('single-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $singleStage | Out-Null
-    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
+    foreach ($item in @('FRD.exe', "frd-service-$version-setup.exe", 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
         Copy-Item -LiteralPath (Join-Path $output $item) -Destination $singleStage -Recurse
     }
     $singleFile = Join-Path $releaseRoot "frd-$version.exe"
@@ -130,13 +144,6 @@ if ($onesetup) {
     & $buildSetup -OneSetup $onesetup -OutputDirectory $releaseRoot | Out-Null
     if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { throw 'FFmpeg setup package failed.' }
     foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter 'frd-ffmpeg-*-setup.exe*' -File) {
-        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
-    }
-}
-# Service helper installer (frd-service-<version>-setup.exe): installs, updates or removes the SYSTEM helper service, UAC confirmed by the user.
-if ($onesetup) {
-    & (Join-Path $PSScriptRoot 'tools/ServiceSetup/Build-ServiceSetup.ps1') -Version $version -WintoolsPath (Join-Path $output 'frd-wintools.exe') -OneSetup $onesetup -OutputDirectory $releaseRoot | Out-Null
-    foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter "frd-service-$version-setup.exe*" -File) {
         Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
     }
 }

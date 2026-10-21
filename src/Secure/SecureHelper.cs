@@ -48,6 +48,19 @@ internal static class SecureDesktopService
 
     internal static async Task InstallViaUacAsync()
     {
+        // The service ships as its own installer (frd-service-<version>-setup.exe): the user picks install/overwrite or uninstall there and confirms UAC.
+        var setup = Directory.EnumerateFiles(AppContext.BaseDirectory, "frd-service-*-setup.exe").OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
+        if (setup != null)
+        {
+            SessionTrace.Event("secure-helper", "setup-requested");
+            using var installer = Process.Start(new ProcessStartInfo(setup) { UseShellExecute = true, WorkingDirectory = AppContext.BaseDirectory })
+                ?? throw new InvalidOperationException("Could not start the FRD service installer.");
+            await installer.WaitForExitAsync();
+            SessionTrace.Event("secure-helper", $"setup-exited-{installer.ExitCode}");
+            var after = Status();
+            if (!after.Running) throw new InvalidOperationException(after.Message);
+            return;
+        }
         var tools = Path.Combine(AppContext.BaseDirectory, ToolsFileName);
         if (!File.Exists(tools)) throw new FileNotFoundException(Loc.F("找不到 {0}，请把它放在 FRD.exe 同一目录。", ToolsFileName), tools);
         // The elevated process may run as a different (administrator) account, so name the interactive user explicitly.

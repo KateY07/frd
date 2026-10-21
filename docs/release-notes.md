@@ -12,6 +12,7 @@ Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。与
 - 已装过辅助服务时再次安装，会因为先写日志冲掉了错误码，把“服务已存在”误判为失败。现在先读错误码再写日志，失败信息里带上错误码。
 
 **新增：辅助服务的独立安装包 `frd-service-v5.3-setup.exe`**（OneSetup）
+- 基础包和单文件版里不再放裸的 `frd-wintools.exe`，改放这个安装包（它内置 `frd-wintools.exe`）；被控端界面的“安装被控服务”按钮现在启动它，不再直接提权运行 `frd-wintools.exe`。
 - 双击后窗口里选择 **1 安装（覆盖）** 或 **2 卸载**，显示当前是否已安装；选择后弹出 UAC，由你亲自确认。完成后检查服务是否在运行、安装的文件是否与包内一致；卸载则检查服务和文件夹是否清除。
 - 服务装在 `%ProgramFiles%\FRD`，只放服务用的 `frd-wintools.exe`。被控端 FRD 正在运行时会占用 `%ProgramData%\FRD\SecureDesktopProbe\frames.map`，卸载会提示它将在下次重启时删除（先关闭 FRD 可彻底清理）。
 - 命令行：`frd-wintools.exe --uninstall-secure-helper`（管理员）可直接卸载；无人值守时设环境变量 `FRD_SERVICE_ACTION=install|uninstall` 运行安装包。

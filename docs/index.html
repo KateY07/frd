@@ -271,7 +271,7 @@
         <p>File copies show a progress bar on both sides (file n of m, percent, size). An optional overlay draws the host's pointer, position and shape, over the picture, even without input forwarding.</p></div>
       <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></div>
         <h3>Reaches UAC and the lock screen</h3>
-        <p>A separate <code>frd-wintools.exe</code> installs a SYSTEM helper once, enabling capture and input on the secure desktop. FRD never auto-clicks UAC.</p></div>
+        <p>A separate installer (<code>frd-service-&lt;version&gt;-setup.exe</code>, started from the host's install button) installs a SYSTEM helper once, enabling capture and input on the secure desktop. FRD never auto-clicks UAC.</p></div>
       <div class="glass card reveal"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg></div>
         <h3>Measurable latency</h3>
         <p>Capture, encode, transfer, decode and present are timed per stage, with GPU completion confirmed. A separate diagnostics stream measures cross-machine latency.</p></div>
@@ -300,7 +300,7 @@
       <table>
         <tr><th>Package</th><th>Contents</th><th>Size</th></tr>
         <tr><td><code>frd-vX-win-x64.zip</code><span class="tag must">required</span></td>
-            <td><code>FRD.exe</code> (NativeAOT)· <code>frd-wintools.exe</code> (secure-desktop helper)· <code>codec-config.json</code> · docs</td><td>≈ 6 MB</td></tr>
+            <td><code>FRD.exe</code> (NativeAOT)· <code>frd-service-&lt;version&gt;-setup.exe</code> (secure-desktop helper installer)· <code>codec-config.json</code> · docs</td><td>≈ 6 MB</td></tr>
         <tr><td><code>frd-vX.exe</code><span class="tag">single file</span></td><td>The base package as one 4 MB exe (packed with <a href="https://github.com/KateY07/onesetup">OneSetup</a>): same arguments and exit codes as <code>FRD.exe</code>; the first run unpacks to a per-user cache. Not code-signed.</td><td>&asymp; 4 MB</td></tr>
         <tr><td><code>frd-vX-ffmpeg-win-x64.zip</code><span class="tag">optional</span></td>
             <td>FFmpeg libraries and license; unzip into <code>ffmpeg\</code> beside FRD.exe, or into <code>%LOCALAPPDATA%\FRD\ffmpeg\&lt;version&gt;\</code>, or into <code>%LOCALAPPDATA%\FRD\ffmpeg\&lt;version&gt;\</code></td><td>≈ 38 MB</td></tr>
