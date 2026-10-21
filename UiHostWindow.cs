@@ -4,7 +4,7 @@ using System.Net;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Vortice.DXGI;
-using static Frd.UiNative;
+using static Glasspane.UiNative;
 
 namespace Frd;
 

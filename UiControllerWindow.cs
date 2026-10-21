@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Numerics;
 using System.Text.Json;
-using static Frd.UiNative;
+using static Glasspane.UiNative;
 
 namespace Frd;
 
@@ -266,7 +266,7 @@ sealed class UiControllerWindow : UiWindow
             }
             else session = new(config, remoteOptions);
             session.Failed += error => UiThread.Post(() => ReportError(error));
-            session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(frame); };
+            session.FrameReceived += frame => { Interlocked.Increment(ref receivedFrames); preview.Submit(new VideoFrame(frame.Bgra, frame.Width, frame.Height, frame.Pts)); };
             session.StatusChanged += status => { lock (receiveGate) pendingStatus = status; };
             await session.StartAsync();
             if (remoteOptions != null)

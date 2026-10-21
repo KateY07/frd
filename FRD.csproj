@@ -19,15 +19,13 @@
     <NoWarn>$(NoWarn);IL2026;IL3050;IL2067;IL2070;IL2072;IL2075;IL2087;IL2091</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="external\Glasspane\src\Glasspane\Glasspane.csproj" />
+    <Using Include="Glasspane" />
     <TrimmerRootAssembly Include="FRD" />
     <InternalsVisibleTo Include="MouseFollowDual" />
     <InternalsVisibleTo Include="PathSwitchResilience" />
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
-    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
-    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
-    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
-    <PackageReference Include="Vortice.DirectComposition" Version="3.8.3" />
     <Compile Include="Ffmpeg*.cs" />
     <Compile Include="Mf*.cs" />
     <Compile Include="Ui*.cs" />

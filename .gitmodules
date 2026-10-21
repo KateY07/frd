@@ -1,0 +1,3 @@
+[submodule "external/Glasspane"]
+	path = external/Glasspane
+	url = https://github.com/KateY07/Glasspane.git
