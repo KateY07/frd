@@ -39,6 +39,7 @@ foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe')) {
 }
 if (Test-Path -LiteralPath (Join-Path $staging 'ffmpeg')) { throw 'The base package must not contain FFmpeg.' }
 if (Get-ChildItem -LiteralPath $staging -Filter '*.dll' -File) { throw 'The NativeAOT base package must be a single exe with no managed DLLs.' }
+if (Get-ChildItem -LiteralPath $staging -Filter '*.xml' -File) { throw 'Documentation XML files must not ship in the package.' }
 if (Get-ChildItem -LiteralPath $staging -Filter '*Tests*' -Recurse) { throw 'Test executable leaked into release.' }
 if (Get-ChildItem -LiteralPath $staging -Filter 'startup-error.txt' -Recurse) { throw 'Runtime error log leaked into release.' }
 $workspace = [IO.Path]::GetFullPath($PSScriptRoot) + [IO.Path]::DirectorySeparatorChar

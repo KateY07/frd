@@ -7,6 +7,8 @@
     <Nullable>enable</Nullable>
     <PlatformTarget>x64</PlatformTarget>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Do not copy the referenced library's XML documentation file next to the exe. -->
+    <AllowedReferenceRelatedFileExtensions>.pdb</AllowedReferenceRelatedFileExtensions>
     <Authors>KateY07</Authors>
     <Copyright>Copyright (c) 2026 KateY07</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
