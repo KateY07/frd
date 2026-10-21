@@ -58,7 +58,11 @@
   .cta { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
   .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 12px; border: 1px solid var(--line); background: var(--glass); color: var(--fg); font-weight: 600; font-size: 15px; backdrop-filter: blur(10px); }
   .btn:hover { text-decoration: none; border-color: rgba(255,255,255,.3); transform: translateY(-1px); }
-  .btn.primary { background: linear-gradient(120deg, #4d74ff, #2fd2c0); border-color: transparent; color: #04101a; box-shadow: 0 10px 30px rgba(60,130,255,.35); }
+  /* No border at all on the gradient button: a transparent border lets the gradient tile into it and leaves a light rim on some screens. */
+  .btn.primary { background: linear-gradient(120deg, #4d74ff, #2fd2c0); background-origin: border-box; border: 0; padding: 12px 21px; color: #04101a; box-shadow: 0 10px 30px rgba(60,130,255,.35); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  .btn.primary:hover { border: 0; filter: brightness(1.06); }
+  .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; }
+  .btn:focus:not(:focus-visible) { outline: none; }
   .btn svg { width: 18px; height: 18px; }
   .meta { margin-top: 12px; color: var(--muted); font-size: 13px; min-height: 20px; }
 
