@@ -11,17 +11,17 @@ namespace Frd;
 /// <summary>The host's floating status card (permissions, who is connected, helper service, quit).</summary>
 sealed class UiHostPanel : UiGlassPanel
 {
-    public readonly UiLabel Status = new("等待主控", 13) { MaxWidth = 150 };
-    public readonly UiButton Input = new() { Label = "", Icon = "mouse", IsToggle = true, IsVisible = false, ToolTip = "键鼠：允许主控使用键盘和鼠标" };
-    public readonly UiButton Clipboard = new() { Label = "", Icon = "clipboard", IsToggle = true, IsVisible = false, ToolTip = "剪贴板：允许与主控同步" };
-    public readonly UiButton Annotate = new() { Label = "", Icon = "pen", IsToggle = true, IsVisible = false, ToolTip = "标注：允许主控在本机屏幕上画笔" };
-    public readonly UiButton Disconnect = new() { Icon = "power", IsDanger = true, IsVisible = false, ToolTip = "断开当前主控" };
-    public readonly UiButton More = new() { Icon = "sliders", IsToggle = true, ToolTip = "监听地址、会话时长与安全桌面服务" };
-    public readonly UiButton Collapse = new() { Icon = "chevrons", ToolTip = "收起为悬浮球（空闲 10 秒自动收起）" };
-    public readonly UiLabel ListenTitle = new("监听", 11) { Color = UiTheme.Subtle }, DurationTitle = new("会话时长", 11) { Color = UiTheme.Subtle }, ServiceTitle = new("安全桌面服务", 11) { Color = UiTheme.Subtle };
+    public readonly UiLabel Status = new(Loc.T("等待主控"), 13) { MaxWidth = 150 };
+    public readonly UiButton Input = new() { Label = "", Icon = "mouse", IsToggle = true, IsVisible = false, ToolTip = Loc.T("键鼠：允许主控使用键盘和鼠标") };
+    public readonly UiButton Clipboard = new() { Label = "", Icon = "clipboard", IsToggle = true, IsVisible = false, ToolTip = Loc.T("剪贴板：允许与主控同步") };
+    public readonly UiButton Annotate = new() { Label = "", Icon = "pen", IsToggle = true, IsVisible = false, ToolTip = Loc.T("标注：允许主控在本机屏幕上画笔") };
+    public readonly UiButton Disconnect = new() { Icon = "power", IsDanger = true, IsVisible = false, ToolTip = Loc.T("断开当前主控") };
+    public readonly UiButton More = new() { Icon = "sliders", IsToggle = true, ToolTip = Loc.T("监听地址、会话时长与安全桌面服务") };
+    public readonly UiButton Collapse = new() { Icon = "chevrons", ToolTip = Loc.T("收起为悬浮球（空闲 10 秒自动收起）") };
+    public readonly UiLabel ListenTitle = new(Loc.T("监听"), 11) { Color = UiTheme.Subtle }, DurationTitle = new(Loc.T("会话时长"), 11) { Color = UiTheme.Subtle }, ServiceTitle = new(Loc.T("安全桌面服务"), 11) { Color = UiTheme.Subtle };
     public readonly UiLabel ListenValue = new("", 12) { MaxWidth = 200 }, DurationValue = new("—", 12), ServiceValue = new("", 12);
-    public readonly UiButton Install = new() { Label = "安装安全桌面辅助服务", IsVisible = false };
-    public readonly UiButton Quit = new() { Label = "退出被控端", Icon = "power", IsDanger = true, ToolTip = "停止监听并退出被控端（正在被控制时会先断开）" };
+    public readonly UiButton Install = new() { Label = Loc.T("安装安全桌面辅助服务"), IsVisible = false };
+    public readonly UiButton Quit = new() { Label = Loc.T("退出被控端"), Icon = "power", IsDanger = true, ToolTip = Loc.T("停止监听并退出被控端（正在被控制时会先断开）") };
     readonly UiElement[] elements;
     readonly UiElement[] moreElements;
     float dotX, dotY;
@@ -132,10 +132,10 @@ sealed class UiHostWindow : UiWindow
     public UiHostWindow(AppConfiguration config, IPAddress[] addresses, int port, string token, CodecProbeSample[]? probeSamples)
     {
         IsMainWindow = true;
-        listening = $"{string.Join("、", addresses.Select(a => a.ToString()))}:{port}";
+        listening = Loc.F("{0}:{1}", string.Join(Loc.T("、"), addresses.Select(a => a.ToString())), port);
         var dpi = (int)UiNative.GetDpiForSystem();
         var scale = dpi / 96f;
-        CreateNative($"FRD 被控端 · TCP {port}", WS_POPUP, WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+        CreateNative(Loc.F("FRD 被控端 · TCP {0}", port), WS_POPUP, WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
             0, 0, (int)(WindowWidthDip * scale), (int)(WindowHeightDip * scale));
         devices = new UiDevices();
         text = new UiText(devices.DWrite);
@@ -189,7 +189,7 @@ sealed class UiHostWindow : UiWindow
         try
         {
             Dock();
-            if (!ExcludeFromCapture()) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "被控端提示窗口无法排除出屏幕捕获");
+            if (!ExcludeFromCapture()) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), Loc.T("被控端提示窗口无法排除出屏幕捕获"));
             // Never take keyboard focus: remote key events must not be able to operate this panel.
             SetWindowLongPtr(Handle, GWL_EXSTYLE, (nint)((ulong)GetWindowLongPtr(Handle, GWL_EXSTYLE) | WS_EX_NOACTIVATE));
             surface = new UiSurface(devices, Handle, true);
@@ -239,7 +239,7 @@ sealed class UiHostWindow : UiWindow
         lock (sceneGate)
         {
             panel.Controlled = controlled;
-            panel.Status.Text = controlled ? $"被 {address} 控制" : "等待主控";
+            panel.Status.Text = controlled ? Loc.F("被 {0} 控制", address) : Loc.T("等待主控");
             panel.StatusColor = controlled ? UiTheme.Good : UiTheme.Warn;
             if (!controlled) panel.DurationValue.Text = "—";
             UpdatePill();
@@ -286,12 +286,12 @@ sealed class UiHostWindow : UiWindow
         var helper = SecureDesktopService.Status();
         lock (sceneGate)
         {
-            panel.ServiceValue.Text = helper.Running ? "运行中" : helper.Installed ? "已安装，未运行" : "未安装";
+            panel.ServiceValue.Text = helper.Running ? Loc.T("运行中") : helper.Installed ? Loc.T("已安装，未运行") : Loc.T("未安装");
             panel.ServiceValue.Color = helper.Running ? UiTheme.Good : UiTheme.Warn;
             panel.ServiceValue.ToolTip = helper.Message;
             panel.SetInstallVisible(!helper.Running);
             panel.Install.IsEnabled = !helper.Running;
-            panel.Install.Label = helper.Installed ? "启动/修复安全桌面辅助服务" : "安装安全桌面辅助服务";
+            panel.Install.Label = helper.Installed ? Loc.T("启动/修复安全桌面辅助服务") : Loc.T("安装安全桌面辅助服务");
             panel.Install.ToolTip = helper.Message;
             panel.Relayout(text);
         }
@@ -300,13 +300,13 @@ sealed class UiHostWindow : UiWindow
 
     async void InstallHelper()
     {
-        panel.Install.IsEnabled = false; panel.Install.Label = "等待管理员确认…";
+        panel.Install.IsEnabled = false; panel.Install.Label = Loc.T("等待管理员确认…");
         try { await SecureDesktopService.InstallViaUacAsync(); SessionTrace.Event("secure-helper", "refresh-ui"); RefreshSecureHelper(); SessionTrace.Event("secure-helper", "refresh-ui-done"); }
         catch (Exception error)
         {
             SessionTrace.Error("secure-helper", error);
             Console.Error.WriteLine("[secure helper] Installation failed: " + error);
-            panel.Install.Label = "安装失败，点击重试";
+            panel.Install.Label = Loc.T("安装失败，点击重试");
             panel.Install.IsEnabled = true;
             panel.Install.ToolTip = error.Message;
             lock (sceneGate) panel.Relayout(text);

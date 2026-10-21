@@ -37,7 +37,7 @@ public sealed record SessionStatus(string ActivePreset, int AppliedLimitKbps, do
     public bool HostBusy { get; set; }
     public double DiagnosticMbps { get; set; }
     public TransferTimings? TransferDetails { get; set; }
-    public string TimingDescription { get; set; } = "同机单调时钟";
+    public string TimingDescription { get; set; } = Loc.T("同机单调时钟");
     public int SendBudgetKbps { get; set; }
     public int BurstBudgetWireBytes { get; set; }
     public double SimulatedCapacityMbps { get; set; }

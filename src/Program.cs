@@ -17,6 +17,7 @@ static class Program
     static int Main(string[] args)
     {
         CrashLog.Install();
+        args = Loc.Initialize(args);
         try
         {
             if (args is ["--help"] or ["--help-window"]) { RemoteLaunch.Help(args[0] == "--help-window"); return 0; }

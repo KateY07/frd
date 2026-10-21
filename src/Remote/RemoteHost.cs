@@ -89,7 +89,7 @@ sealed class RemoteHost : IAsyncDisposable
         var endpoints = string.Join(", ", listeners.Select(listener => listener.LocalEndpoint.ToString()));
         Console.Error.WriteLine($"Remote listener ready: TCP+UDP {endpoints}");
         Console.Error.WriteLine("[security] FRD authenticates connections (the token is never sent) and signs keyboard/mouse datagrams, but it does not encrypt content. It is designed to run over an already-encrypted link (VPN, tunnel or private network).");
-        Status?.Invoke($"被控端正在监听 TCP+UDP {endpoints}\n等待主控连接；关闭此窗口停止监听。");
+        Status?.Invoke(Loc.F("被控端正在监听 TCP+UDP {0}\n等待主控连接；关闭此窗口停止监听。", endpoints));
     }
 
     public void DisconnectActive()
@@ -162,7 +162,7 @@ sealed class RemoteHost : IAsyncDisposable
                     if (!RemoteAuth.VerifyClient(token, hostNonce, hello, out key, out clientNonce))
                     {
                         throttle.Failed(address);
-                        await RemoteWire.WriteAsync(stream, new RemoteReply(false, "连接口令错误。"), timeout.Token);
+                        await RemoteWire.WriteAsync(stream, new RemoteReply(false, Loc.T("连接口令错误。")), timeout.Token);
                         return;
                     }
                     throttle.Succeeded(address);
@@ -301,7 +301,7 @@ sealed class RemoteHost : IAsyncDisposable
                 string id;
                 lock (gate)
                 {
-                    if (activeStop != null) throw new InvalidOperationException("被控端已有主控连接。");
+                    if (activeStop != null) throw new InvalidOperationException(Loc.T("被控端已有主控连接。"));
                     activeStop = lifetime = CancellationTokenSource.CreateLinkedTokenSource(stop.Token);
                     hasInput = hasClipboard = hasCursor = hasAnnotate = false;
                     controller = address; sessionId = id = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
@@ -327,7 +327,7 @@ sealed class RemoteHost : IAsyncDisposable
                     await SendAsync(new(true, Welcome: welcome), received);
                     var udpPeer = await udpSession.WaitForRegistrationAsync(lifetime.Token);
                     session.StartSender(FindInputSocket(address), udpPeer, udpSession);
-                    Status?.Invoke($"主控已连接：{address}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。");
+                    Status?.Invoke(Loc.F("主控已连接：{0}\n真实屏幕 → FFmpeg → UDP；键鼠由主控手动启用。", address));
                     while (!lifetime.IsCancellationRequested)
                     {
                         var request = await RemoteWire.ReadAsync<RemoteRequest>(stream, lifetime.Token);
@@ -336,9 +336,9 @@ sealed class RemoteHost : IAsyncDisposable
                         {
                             var status = session.SenderStatus() with { HostBusy = LocalInputBusy?.Invoke() == true };
                             if (capture.WaitingForSecureTransition)
-                                status = status with { Message = "安全桌面切换中：正在等待捕获画面恢复；会话保持连接" };
+                                status = status with { Message = Loc.T("安全桌面切换中：正在等待捕获画面恢复；会话保持连接") };
                             else if (capture.SecureActive)
-                                status = status with { Message = "安全桌面画面已连接；键鼠通过 SYSTEM 辅助进程转发" };
+                                status = status with { Message = Loc.T("安全桌面画面已连接；键鼠通过 SYSTEM 辅助进程转发") };
                             await SendAsync(status, received);
                         }
                         else if (request.Kind == "control" && request.Command != null)
@@ -359,7 +359,7 @@ sealed class RemoteHost : IAsyncDisposable
                     lifetime.Dispose();
                     lock (gate) { activeStop = null; activeUdp = null; controller = null; sessionId = ""; }
                     ControllerChanged?.Invoke(null);
-                    Status?.Invoke("主控已断开；已停止捕获发送并释放输入。等待重新连接。");
+                    Status?.Invoke(Loc.T("主控已断开；已停止捕获发送并释放输入。等待重新连接。"));
                 }
             }
             catch (EndOfStreamException) { SessionTrace.Event("host-control-tcp", "eof"); Console.Error.WriteLine("Remote controller disconnected."); }

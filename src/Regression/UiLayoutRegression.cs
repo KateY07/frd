@@ -43,6 +43,9 @@ static class UiLayoutRegression
         var text = new UiText(devices.DWrite);
         var gate = new object();
 
+        foreach (var english in new[] { false, true })
+        {
+        Loc.English = english; var lang = english ? "en" : "zh";
         // ---- controller panel
         foreach (var width in new[] { 1280, 900, 680, 520 })
             foreach (var more in new[] { false, true })
@@ -52,9 +55,9 @@ static class UiLayoutRegression
                         if (listOpen && !more) continue;
                         var panel = new UiControlPanel(gate);
                         panel.StatusName.Text = "192.168.100.200"; panel.Latency.Text = "123.4 ms";
-                        panel.Operation.Text = "已连接：mf_h264 / 2.5 Mbps / 原始分辨率 2560×1440";
-                        panel.BitrateLabel.Text = "码率上限 · 2.5 Mbps";
-                        foreach (var name in new[] { "H.264 / Windows 内置 · 硬件优先", "H.264 / Windows 内置 · 软件", "H.264 / FFmpeg · libx264rgb 低延迟" })
+                        panel.Operation.Text = Loc.T("已连接：mf_h264 / 2.5 Mbps / 原始分辨率 2560×1440");
+                        panel.BitrateLabel.Text = Loc.T("码率上限 · 2.5 Mbps");
+                        foreach (var name in new[] { Loc.T("H.264 / Windows 内置 · 硬件优先"), Loc.T("H.264 / Windows 内置 · 软件"), Loc.T("H.264 / FFmpeg · libx264rgb 低延迟") })
                             panel.Presets.Items.Add(new UiChoiceItem(name, name, true, null));
                         panel.Presets.SelectedIndex = 0;
                         panel.Input.IsEnabled = panel.Clipboard.IsEnabled = panel.Annotate.IsEnabled = true;
@@ -62,7 +65,7 @@ static class UiLayoutRegression
                         panel.More.IsChecked = more; panel.Annotate.IsChecked = annotate; panel.Presets.IsOpen = listOpen;
                         panel.Layout(text, width, 800);
                         checks++;
-                        problems.AddRange(Check($"controller w={width} more={more} annotate={annotate} list={listOpen}", panel, panel.AllElements));
+                        problems.AddRange(Check($"{lang} controller w={width} more={more} annotate={annotate} list={listOpen}", panel, panel.AllElements));
                     }
 
         // ---- host panel
@@ -73,14 +76,16 @@ static class UiLayoutRegression
                     {
                         var panel = new UiHostPanel(gate) { PanelFraction = new(1, 1), OrbFraction = new(1, 1) };
                         panel.ListenValue.Text = "169.254.73.74:5204, [fe80::e3db:feec:10a2:bd9f]:5204";
-                        panel.Status.Text = controlled ? "被 169.254.73.74 控制" : "等待主控";
+                        panel.Status.Text = controlled ? Loc.T("被 169.254.73.74 控制") : Loc.T("等待主控");
                         panel.Controlled = controlled; panel.More.IsChecked = more;
                         panel.SetInstallVisible(install);
                         if (transfer) panel.Transfer = new ClipboardTransferProgress(false, 123_000_000, 400_000_000, 2, 3, "a-fairly-long-file-name.bin");
                         panel.Layout(text, 384, 300);
                         checks++;
-                        problems.AddRange(Check($"host controlled={controlled} more={more} install={install} transfer={transfer}", panel, panel.AllElements));
+                        problems.AddRange(Check($"{lang} host controlled={controlled} more={more} install={install} transfer={transfer}", panel, panel.AllElements));
                     }
+        }
+        Loc.English = false;
 
         var report = new StringBuilder();
         report.AppendLine($"{{\"Passed\": {(problems.Count == 0 ? "true" : "false")}, \"Scenarios\": {checks}, \"Problems\": {problems.Count}, \"Details\": [");

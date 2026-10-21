@@ -36,7 +36,7 @@ public sealed class WindowsClipboard(nint owner) : IClipboardAccess
             {
                 var handle = GetClipboardData(FileDrop);
                 var count = DragQueryFile(handle, uint.MaxValue, null, 0);
-                if (count > 128) throw new InvalidDataException("剪贴板最多支持 128 个顶层文件或目录。");
+                if (count > 128) throw new InvalidDataException(Loc.T("剪贴板最多支持 128 个顶层文件或目录。"));
                 var paths = new string[count];
                 for (uint i = 0; i < count; i++)
                 {
@@ -150,8 +150,8 @@ public sealed record ClipboardTransferProgress(bool Sending, long DoneBytes, lon
     /// <summary>For example "正在发送 2/5 · report.zip · 45% (12.3 MB / 27.5 MB)".</summary>
     public string Describe()
     {
-        var name = FileName.Length > 28 ? FileName[..25] + "…" : FileName;
-        return $"{(Sending ? "正在发送" : "正在接收")} {FileIndex}/{FileCount} · {name} · {Fraction * 100:0}% ({Size(DoneBytes)} / {Size(TotalBytes)})";
+        var name = FileName.Length > 28 ? FileName[..25] + Loc.T("…") : FileName;
+        return Loc.F("{0} {1}/{2} · {3} · {4:0}% ({5} / {6})", (Sending ? Loc.T("正在发送") : Loc.T("正在接收")), FileIndex, FileCount, name, Fraction * 100, Size(DoneBytes), Size(TotalBytes));
     }
 }
 
@@ -174,7 +174,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
     long sent, received, sentBytes, receivedBytes;
     int disposed;
     public event Action<ClipboardSyncStatus>? Status;
-    ClipboardSyncStatus snapshot = new(0, 0, 0, 0, "等待新复制的文本或文件", true);
+    ClipboardSyncStatus snapshot = new(0, 0, 0, 0, Loc.T("等待新复制的文本或文件"), true);
     public ClipboardSyncStatus Snapshot => Volatile.Read(ref snapshot);
     public Task Completion => work;
 
@@ -209,7 +209,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
         catch (Exception error)
         {
             Console.Error.WriteLine("[clipboard] " + error);
-            Publish(stop.IsCancellationRequested ? "剪贴板同步已关闭" : "剪贴板同步断开：" + error.Message, false);
+            Publish(stop.IsCancellationRequested ? Loc.T("剪贴板同步已关闭") : Loc.T("剪贴板同步断开：") + error.Message, false);
         }
         finally { stop.Cancel(); client.Dispose(); }
     }
@@ -230,7 +230,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                     }
                     catch (Win32Exception error) { Console.Error.WriteLine("[clipboard] Busy, will retry: " + error.Message); }
                     catch (InvalidDataException error)
-                    { lastSequence = sequence; Console.Error.WriteLine("[clipboard] " + error); Publish("复制未同步：" + error.Message); }
+                    { lastSequence = sequence; Console.Error.WriteLine("[clipboard] " + error); Publish(Loc.T("复制未同步：") + error.Message); }
                 }
             }
             await Task.Delay(150, stop.Token);
@@ -256,8 +256,8 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                 Validate(manifest);
             }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
-            { Console.Error.WriteLine("[clipboard] Copy rejected: " + error); Publish("复制未同步：" + error.Message); continue; }
-            Publish(manifest.Kind == "text" ? "正在同步文本" : $"正在同步 {manifest.Entries.Count(x => !x.Directory)} 个文件");
+            { Console.Error.WriteLine("[clipboard] Copy rejected: " + error); Publish(Loc.T("复制未同步：") + error.Message); continue; }
+            Publish(manifest.Kind == "text" ? Loc.T("正在同步文本") : Loc.F("正在同步 {0} 个文件", manifest.Entries.Count(x => !x.Directory)));
             var header = JsonSerializer.SerializeToUtf8Bytes(manifest, FrdJson.Plain);
             if (header.Length > 2 * 1024 * 1024) throw new InvalidDataException("Clipboard manifest is too large.");
             var prefix = new byte[4]; BinaryPrimitives.WriteInt32LittleEndian(prefix, header.Length);
@@ -274,7 +274,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                         var entry = sendEntries[index]; var number = index + 1; var shown = Path.GetFileName(entry.Path);
                         var path = files[entry.Path]; RejectReparse(path);
                         await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                        if (file.Length != entry.Length) throw new IOException("复制过程中源文件发生变化。");
+                        if (file.Length != entry.Length) throw new IOException(Loc.T("复制过程中源文件发生变化。"));
                         var hash = await TransferAsync(file, stream, entry.Length,
                             count => { sendDone += count; ReportProgress(new(true, sendDone, sendTotal, number, sendEntries.Length, shown)); });
                         await stream.WriteAsync(hash, stop.Token); Interlocked.Add(ref sentBytes, entry.Length);
@@ -282,7 +282,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                 }
                 finally { ReportProgress(null, true); }
             }
-            Interlocked.Increment(ref sent); Publish("剪贴板内容已发送");
+            Interlocked.Increment(ref sent); Publish(Loc.T("剪贴板内容已发送"));
         }
     }
 
@@ -315,7 +315,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                     Directory.CreateDirectory(cacheRoot); RejectReparse(cacheRoot);
                     var used = Directory.EnumerateFiles(cacheRoot, "*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint }).Sum(path => new FileInfo(path).Length);
                     var incoming = manifest.Entries.Sum(entry => entry.Length);
-                    if (used + incoming > MaximumFileBytes * 2) throw new IOException("剪贴板缓存超过 4 GiB，请在粘贴完成后清理 FRD/Clipboard 缓存。");
+                    if (used + incoming > MaximumFileBytes * 2) throw new IOException(Loc.T("剪贴板缓存超过 4 GiB，请在粘贴完成后清理 FRD/Clipboard 缓存。"));
                     directory = Path.Combine(cacheRoot, Guid.NewGuid().ToString("N"));
                     Directory.CreateDirectory(directory);
                     var receiveFiles = manifest.Entries.Count(entry => !entry.Directory);
@@ -334,7 +334,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                                 var actual = await TransferAsync(stream, file, entry.Length,
                                     count => { receiveDone += count; ReportProgress(new(false, receiveDone, receiveTotal, number, receiveFiles, shown)); });
                                 var expected = new byte[32]; await stream.ReadExactlyAsync(expected, stop.Token);
-                                if (!CryptographicOperations.FixedTimeEquals(actual, expected)) throw new InvalidDataException("剪贴板文件 SHA-256 校验失败。");
+                                if (!CryptographicOperations.FixedTimeEquals(actual, expected)) throw new InvalidDataException(Loc.T("剪贴板文件 SHA-256 校验失败。"));
                             }
                             Interlocked.Add(ref receivedBytes, entry.Length);
                         }
@@ -351,7 +351,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
                         Interlocked.Increment(ref received);
                     }
                 }
-                Publish(committed ? "已接收，可在本机粘贴" : "跳过旧传输：本机已有新的复制内容");
+                Publish(committed ? Loc.T("已接收，可在本机粘贴") : Loc.T("跳过旧传输：本机已有新的复制内容"));
             }
             finally
             {
@@ -383,7 +383,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
 
     static ClipboardManifest PrepareFiles(string[] paths, Dictionary<string, string> files)
     {
-        if (paths.Length is < 1 or > 128) throw new InvalidDataException("最多同步 128 个顶层文件或目录。");
+        if (paths.Length is < 1 or > 128) throw new InvalidDataException(Loc.T("最多同步 128 个顶层文件或目录。"));
         List<ClipboardEntry> entries = new(); List<string> roots = new();
         long total = 0;
         void Visit(string source, string relative)
@@ -392,7 +392,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
             var directory = Directory.Exists(source);
             var length = directory ? 0 : new FileInfo(source).Length;
             total = checked(total + length);
-            if (entries.Count >= MaximumEntries || total > MaximumFileBytes) throw new InvalidDataException("单次复制上限为 10000 项、2 GiB。");
+            if (entries.Count >= MaximumEntries || total > MaximumFileBytes) throw new InvalidDataException(Loc.T("单次复制上限为 10000 项、2 GiB。"));
             entries.Add(new(relative, directory, length));
             if (directory) foreach (var child in Directory.EnumerateFileSystemEntries(source)) Visit(child, relative + "/" + Path.GetFileName(child));
             else files.Add(relative, source);
@@ -401,7 +401,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
         {
             var full = Path.GetFullPath(paths[i]);
             var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(full));
-            if (string.IsNullOrEmpty(name)) throw new InvalidDataException("请复制文件或目录，不支持整个驱动器。");
+            if (string.IsNullOrEmpty(name)) throw new InvalidDataException(Loc.T("请复制文件或目录，不支持整个驱动器。"));
             var relative = $"item-{i:D3}/" + name;
             roots.Add(relative); Visit(full, relative);
         }
@@ -456,7 +456,7 @@ public sealed class ClipboardSyncSession : IAsyncDisposable
     static void RejectReparse(string path)
     {
         for (var current = Path.GetFullPath(path); !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
-            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new IOException("不自动跟随剪贴板文件中的符号链接或目录联接。");
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new IOException(Loc.T("不自动跟随剪贴板文件中的符号链接或目录联接。"));
     }
     void Publish(string message, bool connected = true)
     {

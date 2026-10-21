@@ -22,7 +22,7 @@ sealed class UiControllerWindow : UiWindow
     readonly UiDevices measureDevices;
     NativeInputSource? inputSource;
     readonly UiTimer refresh = new(100), debounce = new(150), autoClose = new(1000), idleTimer = new(500), animationTimer = new(16);
-    readonly UiLabel clipboardMessage = new("关闭；开启后同步两端新复制的内容");
+    readonly UiLabel clipboardMessage = new(Loc.T("关闭；开启后同步两端新复制的内容"));
     UiChoice presets => panel.Presets;
     UiSlider bitrate => panel.Bitrate;
     UiButton inputEnabled => panel.Input;
@@ -33,8 +33,8 @@ sealed class UiControllerWindow : UiWindow
     UiButton[] fpsButtons => panel.Fps;
     UiLabel bitrateLabel => panel.BitrateLabel;
     int selectedFps;
-    string[] infoLines = ["正在启动真实捕获与编解码…"];
-    string summary = "FRD · 真实屏幕", captureDetails = "", metricsText = "";
+    string[] infoLines = [Loc.T("正在启动真实捕获与编解码…")];
+    string summary = Loc.T("FRD · 真实屏幕"), captureDetails = "", metricsText = "";
     readonly string[] timings = new string[6];
     readonly object receiveGate = new();
     readonly object inputGate = new();
@@ -92,8 +92,8 @@ sealed class UiControllerWindow : UiWindow
         this.config = config; this.autoCloseSeconds = autoCloseSeconds; this.reportPath = reportPath;
         selectedFps = config.FramesPerSecond;
         IsMainWindow = true; MinWidth = 680; MinHeight = 460;
-        var title = autoCloseSeconds > 0 ? "FRD — 自动回归（完成后关闭）" : "FRD — 真实屏幕 / localhost UDP";
-        if (remote != null) title = $"FRD 主控端 — {remote.Host}:{remote.Port}";
+        var title = autoCloseSeconds > 0 ? Loc.T("FRD — 自动回归（完成后关闭）") : Loc.T("FRD — 真实屏幕 / localhost UDP");
+        if (remote != null) title = Loc.F("FRD 主控端 — {0}:{1}", remote.Host, remote.Port);
         CreateNative(title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 0, unchecked((int)0x80000000), unchecked((int)0x80000000), 1280, 860);
         SetClientSize((int)(1280 * Scale), (int)(860 * Scale));
         CenterOnScreen();
@@ -102,7 +102,7 @@ sealed class UiControllerWindow : UiWindow
         measureText = new UiText(measureDevices.DWrite);
         panel = new UiControlPanel(sceneGate);
         panel.Wire(() => preview?.Invalidate());
-        panel.StatusName.Text = remote?.Host ?? "本机演示";
+        panel.StatusName.Text = remote?.Host ?? Loc.T("本机演示");
         panel.Annotate.CheckedChanged += OnAnnotateChanged;
         foreach (var swatch in panel.Swatches)
         {
@@ -186,8 +186,8 @@ sealed class UiControllerWindow : UiWindow
         panel.FullScreen.Click += () => ToggleFullScreenWithState();
         panel.Disconnect.Click += () => Close();
         panel.Collapse.Click += () => AnimateChrome(true);
-        panel.Input.ToolTip = remote != null ? "转发到被控端；Ctrl+Alt 退出并释放按键。" : "转发鼠标移动、点击、拖动、滚轮和键盘；Ctrl+Alt 退出并释放按键。";
-        panel.Clipboard.ToolTip = "剪贴板同步（文本、文件、目录）";
+        panel.Input.ToolTip = remote != null ? Loc.T("转发到被控端；Ctrl+Alt 退出并释放按键。") : Loc.T("转发鼠标移动、点击、拖动、滚轮和键盘；Ctrl+Alt 退出并释放按键。");
+        panel.Clipboard.ToolTip = Loc.T("剪贴板同步（文本、文件、目录）");
 
         Closing += Shutdown;
         Closed += () =>
@@ -216,7 +216,7 @@ sealed class UiControllerWindow : UiWindow
         UpdateBitrateLabel();
     }
 
-    void UpdateBitrateLabel() => bitrateLabel.Text = HasSelectedBitrateCap() ? $"码率上限 · {bitrate.Value:0.0##} Mbps" : "无损模式 · 不限制码率";
+    void UpdateBitrateLabel() => bitrateLabel.Text = HasSelectedBitrateCap() ? Loc.F("码率上限 · {0:0.0##} Mbps", bitrate.Value) : Loc.T("无损模式 · 不限制码率");
 
     void ScheduleApply()
     {
@@ -234,9 +234,9 @@ sealed class UiControllerWindow : UiWindow
     void UpdateStatusDot()
     {
         var text = operation.Text ?? "";
-        var color = text.Contains("中断") || text.StartsWith("错误") || text.Contains("失败") ? UiTheme.Bad
-            : text.StartsWith("已连接") || text.StartsWith("已应用") || text.Contains("已启用") || text.Contains("已开启") ? UiTheme.Good : UiTheme.Warn;
-        if (text.StartsWith("正在", StringComparison.Ordinal) && panel.StatusColor != UiTheme.Warn) return;
+        var color = text.Contains(Loc.T("中断")) || text.StartsWith(Loc.T("错误")) || text.Contains(Loc.T("失败")) ? UiTheme.Bad
+            : text.StartsWith(Loc.T("已连接")) || text.StartsWith(Loc.T("已应用")) || text.Contains(Loc.T("已启用")) || text.Contains(Loc.T("已开启")) ? UiTheme.Good : UiTheme.Warn;
+        if (text.EndsWith("…", StringComparison.Ordinal) && panel.StatusColor != UiTheme.Warn) return;   // "Connecting…", "Closing…": keep the current colour
         panel.StatusColor = color;
     }
 
@@ -278,7 +278,7 @@ sealed class UiControllerWindow : UiWindow
         if (stopping) return;
         ToggleFullScreen();
         panel.FullScreen.Icon = State == UiWindowState.FullScreen ? "shrink" : "expand";
-        panel.FullScreen.ToolTip = State == UiWindowState.FullScreen ? "退出全屏（Ctrl+Alt+F11）" : "全屏（Ctrl+Alt+F11）";
+        panel.FullScreen.ToolTip = State == UiWindowState.FullScreen ? Loc.T("退出全屏（Ctrl+Alt+F11）") : Loc.T("全屏（Ctrl+Alt+F11）");
         lock (sceneGate) panel.Relayout(measureText);
         preview.Invalidate();
     }
@@ -334,7 +334,7 @@ sealed class UiControllerWindow : UiWindow
                 }), error => UiThread.Post(() =>
                 {
                     Console.Error.WriteLine("[cursor] Auxiliary channel failed; video session remains active: " + error);
-                    operation.Text = "远端光标同步中断；视频会话仍在运行。";
+                    operation.Text = Loc.T("远端光标同步中断；视频会话仍在运行。");
                 }), inputStop.Token);
             if (session.IsRemote)
             {
@@ -351,8 +351,8 @@ sealed class UiControllerWindow : UiWindow
             foreach (var button in fpsButtons) button.IsEnabled = true;
             inputEnabled.IsEnabled = packetDiagnostics.IsEnabled = true;
             clipboardEnabled.IsEnabled = session.IsRemote;
-            operation.Text = $"已连接：{config.InitialPreset} / {(HasSelectedBitrateCap() ? $"{config.InitialBitrateKbps / 1000d:0.###} Mbps" : "无损不限码率")} / 原始分辨率 {config.Width}×{config.Height}";
-            if (!session.IsRemote) clipboardMessage.Text = "localhost 共用剪贴板；双机连接后可开启";
+            operation.Text = Loc.F("已连接：{0} / {1} / 原始分辨率 {2}×{3}", config.InitialPreset, (HasSelectedBitrateCap() ? $"{config.InitialBitrateKbps / 1000d:0.###} Mbps" : Loc.T("无损不限码率")), config.Width, config.Height);
+            if (!session.IsRemote) clipboardMessage.Text = Loc.T("localhost 共用剪贴板；双机连接后可开启");
             if (session.IsRemote && autoCloseSeconds == 0)
             {
                 // Keyboard/mouse and clipboard sharing default to on wherever the connection supports them.
@@ -420,7 +420,7 @@ sealed class UiControllerWindow : UiWindow
                         if (!status.Connected && !stopping) clipboardEnabled.IsChecked = false;
                     });
                 }
-                clipboardMessage.Text = enabled ? "已开启；同步两端新复制的内容" : "已关闭剪贴板同步";
+                clipboardMessage.Text = enabled ? Loc.T("已开启；同步两端新复制的内容") : Loc.T("已关闭剪贴板同步");
             }
             finally { clipboardEnabled.IsEnabled = !stopping && session?.IsRemote == true; clipboardTransition.Release(); }
         }
@@ -434,7 +434,7 @@ sealed class UiControllerWindow : UiWindow
                 var enabled = packetDiagnostics.IsChecked == true;
                 var result = await session.SetPacketDiagnosticsAsync(enabled);
                 if (!result.Success) throw new InvalidOperationException(result.Message);
-                operation.Text = enabled ? "独立诊断 UDP 包已开启，开销计入实际流量；滑条只限制编码码率。" : "诊断包已关闭；本机分层计时仍然可用。";
+                operation.Text = enabled ? Loc.T("独立诊断 UDP 包已开启，开销计入实际流量；滑条只限制编码码率。") : Loc.T("诊断包已关闭；本机分层计时仍然可用。");
             }
             catch (Exception ex)
             {
@@ -461,14 +461,14 @@ sealed class UiControllerWindow : UiWindow
             {
                 enabled &= !stopping;
                 if (enabled && inputClient == null) await StartInputAsync();
-                if (inputClient == null) throw new InvalidOperationException("输入通道尚未连接");
+                if (inputClient == null) throw new InvalidOperationException(Loc.T("输入通道尚未连接"));
                 var result = await inputClient.SetEnabledAsync(enabled, token);
                 if (!result.Accepted) throw new InvalidOperationException(result.Message);
                 if (enabled && stopping) { await inputClient.SetEnabledAsync(false); enabled = false; }
                 SetPreviewInputEnabled(enabled);
                 updatingInput = true; inputEnabled.IsChecked = enabled; updatingInput = false;
-                operation.Text = enabled ? "键鼠转发已启用，按 Ctrl+Alt 退出并释放按键。"
-                    : "键鼠转发已关闭，按键已释放。";
+                operation.Text = enabled ? Loc.T("键鼠转发已启用，按 Ctrl+Alt 退出并释放按键。")
+                    : Loc.T("键鼠转发已关闭，按键已释放。");
             }
             catch
             {
@@ -494,7 +494,7 @@ sealed class UiControllerWindow : UiWindow
                 else
                 {
                     SetPreviewInputEnabled(false);
-                    var overflow = new InvalidOperationException("键鼠转发积压，已停止输入并释放按键；未继续累积事件。");
+                    var overflow = new InvalidOperationException(Loc.T("键鼠转发积压，已停止输入并释放按键；未继续累积事件。"));
                     if (session?.IsRemote == true) HandleInputFailure(inputClient!, overflow);
                     else ReportError(overflow);
                     return;
@@ -544,7 +544,7 @@ sealed class UiControllerWindow : UiWindow
                             lastInputMessage = result.Message;
                         }
                         Console.Error.WriteLine("[input rejected] " + result.Message);
-                        UiThread.Post(() => operation.Text = "输入未注入：" + result.Message);
+                        UiThread.Post(() => operation.Text = Loc.T("输入未注入：") + result.Message);
                     }
                 }
                 catch (OperationCanceledException) when (inputStop.IsCancellationRequested) { Console.Error.WriteLine("Input confirmation stopped."); }
@@ -569,7 +569,7 @@ sealed class UiControllerWindow : UiWindow
             SetPreviewInputEnabled(false);
             lock (inputGate) inputQueue.Clear();
             updatingInput = true; inputEnabled.IsChecked = false; updatingInput = false;
-            operation.Text = "键鼠通道已中断；视频仍在运行。重新勾选“键鼠”可建立新的输入通道。";
+            operation.Text = Loc.T("键鼠通道已中断；视频仍在运行。重新勾选“键鼠”可建立新的输入通道。");
         }
 
         async Task StopInputAsync()
@@ -595,15 +595,15 @@ sealed class UiControllerWindow : UiWindow
             if (presets.SelectedTag is not string presetId) return;
             applying = true;
             var limit = (int)Math.Round(bitrate.Value * 1000);
-            var rateText = HasSelectedBitrateCap() ? $"{limit / 1000d:0.###} Mbps" : "无损不限码率";
-            operation.Text = $"正在请求被控端应用 {presetId} / {rateText} / {selectedFps} FPS…";
+            var rateText = HasSelectedBitrateCap() ? $"{limit / 1000d:0.###} Mbps" : Loc.T("无损不限码率");
+            operation.Text = Loc.F("正在请求被控端应用 {0} / {1} / {2} FPS…", presetId, rateText, selectedFps);
             try
             {
                 var result = await session.ApplyAsync(presetId, limit, framesPerSecond: selectedFps);
                 config = session.Configuration;
                 if (result.Success) successfulChanges++;
                 if (!result.Success) { selectedFps = config.FramesPerSecond; UpdateFpsButtons(); }
-                operation.Text = result.Success ? $"已应用：{presetId} / {rateText} / {config.FramesPerSecond} FPS / {config.Width}×{config.Height}（会话 {result.Generation}）" : $"切换未生效，保留原会话：{result.Message}";
+                operation.Text = result.Success ? Loc.F("已应用：{0} / {1} / {2} FPS / {3}×{4}（会话 {5}）", presetId, rateText, config.FramesPerSecond, config.Width, config.Height, result.Generation) : Loc.F("切换未生效，保留原会话：{0}", result.Message);
                 if (!result.Success) Console.Error.WriteLine($"[UI control] {result.Message}");
             }
             catch (Exception ex) { ReportError(ex); }
@@ -623,7 +623,7 @@ sealed class UiControllerWindow : UiWindow
                 var start = new ProcessStartInfo(executable) { UseShellExecute = false };
                 foreach (var argument in new[] { "--connect", remoteOptions.Host, "--port", remoteOptions.Port.ToString(),
                     "--token", remoteOptions.Token }) start.ArgumentList.Add(argument);
-                using var launched = Process.Start(start) ?? throw new InvalidOperationException("未能启动新的主控进程。");
+                using var launched = Process.Start(start) ?? throw new InvalidOperationException(Loc.T("未能启动新的主控进程。"));
                 SessionTrace.Event("window", "user-requested-new-process-and-session");
             }
             catch (Exception error)
@@ -642,8 +642,8 @@ sealed class UiControllerWindow : UiWindow
             HandleInputFailure(failedInput, inputError);
         if (disconnected)
         {
-            summary = "原会话已断开 · 等待手动建立新会话";
-            metricsText = "查看控制栏中的断连原因；原 TCP 连接不会自动重新握手。";
+            summary = Loc.T("原会话已断开 · 等待手动建立新会话");
+            metricsText = Loc.T("查看控制栏中的断连原因；原 TCP 连接不会自动重新握手。");
             UpdateInfoLines();
             return;
         }
@@ -653,37 +653,37 @@ sealed class UiControllerWindow : UiWindow
         if (status is { } currentStatus)
         {
             string Mean(double value) => currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming ? $"{value:F2}" : "—";
-            var latency = currentStatus.HasRenderTiming ? $"最近 {currentStatus.CaptureToRenderMs:F1} / 近 1 秒平均 {Mean(currentStatus.MeanCaptureToRenderMs)} ms（{currentStatus.RenderTimingSamples} 帧）" : "等待首次 GPU 确认";
-            var cap = currentStatus.AppliedLimitKbps > 0 ? $"{currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps" : "无损不限码率";
-            summary = $"{currentStatus.ActivePreset} · {cap} · {currentStatus.RenderedFps:F1} FPS · 近 1 秒 {Mean(currentStatus.MeanCaptureToRenderMs)} ms";
-            metricsText = $"发送 {currentStatus.SentMbps:F3} / 接收 {currentStatus.ReceivedMbps:F3} Mbps  |  带宽估计 {currentStatus.EstimatedMbps:F3} Mbps（参考）\n诊断包：{(currentStatus.PacketDiagnosticsEnabled ? "开" : "关")}，开销 {currentStatus.DiagnosticMbps * 1000:F2} kbps（已计入流量）\n捕获 → GPU 完成：{latency}  |  绘制 {currentStatus.RenderedFps:F1} / 解码 {currentStatus.DecodedFps:F1} FPS\n网络延迟趋势 {currentStatus.DelayTrendMs:+0.00;-0.00;0.00} ms  |  丢包 {currentStatus.LossRate:P1}  |  {currentStatus.Message}";
+            var latency = currentStatus.HasRenderTiming ? Loc.F("最近 {0:F1} / 近 1 秒平均 {1} ms（{2} 帧）", currentStatus.CaptureToRenderMs, Mean(currentStatus.MeanCaptureToRenderMs), currentStatus.RenderTimingSamples) : Loc.T("等待首次 GPU 确认");
+            var cap = currentStatus.AppliedLimitKbps > 0 ? $"{currentStatus.AppliedLimitKbps / 1000d:0.###} Mbps" : Loc.T("无损不限码率");
+            summary = Loc.F("{0} · {1} · {2:F1} FPS · 近 1 秒 {3} ms", currentStatus.ActivePreset, cap, currentStatus.RenderedFps, Mean(currentStatus.MeanCaptureToRenderMs));
+            metricsText = Loc.F("发送 {0:F3} / 接收 {1:F3} Mbps  |  带宽估计 {2:F3} Mbps（参考）\n诊断包：{3}，开销 {4:F2} kbps（已计入流量）\n捕获 → GPU 完成：{5}  |  绘制 {6:F1} / 解码 {7:F1} FPS\n网络延迟趋势 {8:+0.00;-0.00;0.00} ms  |  丢包 {9:P1}  |  {10}", currentStatus.SentMbps, currentStatus.ReceivedMbps, currentStatus.EstimatedMbps, (currentStatus.PacketDiagnosticsEnabled ? Loc.T("开") : Loc.T("关")), currentStatus.DiagnosticMbps * 1000, latency, currentStatus.RenderedFps, currentStatus.DecodedFps, currentStatus.DelayTrendMs, currentStatus.LossRate, currentStatus.Message);
             var haveLatency = currentStatus.HasRenderTiming && currentStatus.HasRecentRenderTiming;
             var latencyText = haveLatency ? FormatMs(currentStatus.MeanTransferMs) : "— ms";
             panel.Latency.Text = latencyText; lock (sceneGate) panel.PillText = latencyText;
             panel.Latency.ToolTip = haveLatency
-                ? $"网络延迟（传输）{FormatMs(currentStatus.MeanTransferMs)} · 端到端 {FormatMs(currentStatus.MeanCaptureToRenderMs)} · 丢包 {currentStatus.LossRate:P1}"
-                : "等待诊断包计时；关闭“诊断包”后跨机延迟不可测";
+                ? Loc.F("网络延迟（传输）{0} · 端到端 {1} · 丢包 {2:P1}", FormatMs(currentStatus.MeanTransferMs), FormatMs(currentStatus.MeanCaptureToRenderMs), currentStatus.LossRate)
+                : Loc.T("等待诊断包计时；关闭“诊断包”后跨机延迟不可测");
             if (!changingDiagnostics) { updatingDiagnostics = true; packetDiagnostics.IsChecked = currentStatus.PacketDiagnosticsEnabled; updatingDiagnostics = false; }
             metricsText += "\n" + currentStatus.TimingDescription;
             metricsText += status.SimulatedCapacityMbps > 0
-                ? $" · 专项链路模拟 {status.SimulatedCapacityMbps:0.##} Mbps"
-                : " · UDP 即时发送，滑条仅限制编码码率";
+                ? Loc.F(" · 专项链路模拟 {0:0.##} Mbps", status.SimulatedCapacityMbps)
+                : Loc.T(" · UDP 即时发送，滑条仅限制编码码率");
             if (remoteWait >= 3)
             {
-                summary = $"网络路径暂停 {remoteWait:F0} 秒 · 等待原会话恢复";
-                metricsText = $"控制连接仍未被明确关闭；已等待 {remoteWait:F1} 秒。画面与统计可能暂时停留在上一状态。\n" + metricsText;
+                summary = Loc.F("网络路径暂停 {0:F0} 秒 · 等待原会话恢复", remoteWait);
+                metricsText = Loc.F("控制连接仍未被明确关闭；已等待 {0:F1} 秒。画面与统计可能暂时停留在上一状态。\n", remoteWait) + metricsText;
             }
-            timings[0] = $"捕获  {currentStatus.CaptureMs:F2} / {Mean(currentStatus.MeanCaptureMs)}";
-            timings[1] = $"编码  {currentStatus.EncodeMs:F2} / {Mean(currentStatus.MeanEncodeMs)}";
-            timings[2] = $"传输  {currentStatus.TransferMs:F2} / {Mean(currentStatus.MeanTransferMs)}";
-            timings[3] = $"解码  {currentStatus.DecodeMs:F2} / {Mean(currentStatus.MeanDecodeMs)}";
-            timings[4] = $"渲染  {currentStatus.RenderMs:F2} / {Mean(currentStatus.MeanRenderMs)}";
-            timings[5] = $"合计  {currentStatus.CaptureToRenderMs:F2} / {Mean(currentStatus.MeanCaptureToRenderMs)}";
+            timings[0] = Loc.F("捕获  {0:F2} / {1}", currentStatus.CaptureMs, Mean(currentStatus.MeanCaptureMs));
+            timings[1] = Loc.F("编码  {0:F2} / {1}", currentStatus.EncodeMs, Mean(currentStatus.MeanEncodeMs));
+            timings[2] = Loc.F("传输  {0:F2} / {1}", currentStatus.TransferMs, Mean(currentStatus.MeanTransferMs));
+            timings[3] = Loc.F("解码  {0:F2} / {1}", currentStatus.DecodeMs, Mean(currentStatus.MeanDecodeMs));
+            timings[4] = Loc.F("渲染  {0:F2} / {1}", currentStatus.RenderMs, Mean(currentStatus.MeanRenderMs));
+            timings[5] = Loc.F("合计  {0:F2} / {1}", currentStatus.CaptureToRenderMs, Mean(currentStatus.MeanCaptureToRenderMs));
             if (session?.IsRemote == true && !currentStatus.HasRenderTiming)
                 for (var i = 0; i < timings.Length; i++) timings[i] = (timings[i] ?? "").Split(' ')[0] + "  — / —";
             var stages = capture?.Statistics;
-            captureDetails = session?.IsRemote == true ? $"被控桌面 {session.RemoteSourceWidth}×{session.RemoteSourceHeight} → {session.Configuration.Width}×{session.Configuration.Height}；本机仅接收、解码、渲染" : stages == null ? $"捕获后端：{capture?.Backend ?? "启动中"}" :
-                $"DXGI 捕获最近一次（ms）：取帧 {stages.AcquireMs:F2} / 缩放提交 {stages.GpuScaleSubmitMs:F2} / 回读等待 {stages.MapWaitAndReadbackMs:F2} / 像素复制 {stages.CpuRowCopyMs:F2}";
+            captureDetails = session?.IsRemote == true ? Loc.F("被控桌面 {0}×{1} → {2}×{3}；本机仅接收、解码、渲染", session.RemoteSourceWidth, session.RemoteSourceHeight, session.Configuration.Width, session.Configuration.Height) : stages == null ? Loc.F("捕获后端：{0}", capture?.Backend ?? Loc.T("启动中")) :
+                Loc.F("DXGI 捕获最近一次（ms）：取帧 {0:F2} / 缩放提交 {1:F2} / 回读等待 {2:F2} / 像素复制 {3:F2}", stages.AcquireMs, stages.GpuScaleSubmitMs, stages.MapWaitAndReadbackMs, stages.CpuRowCopyMs);
         }
         panel.Clipboard.ToolTip = clipboardMessage.Text;
         UpdateInfoLines();
@@ -694,7 +694,7 @@ sealed class UiControllerWindow : UiWindow
         if (showInfo.IsChecked != true) return;
         var lines = new List<string> { summary };
         lines.AddRange(metricsText.Split('\n'));
-        lines.Add("分层耗时：最近 / 近 1 秒平均（ms）");
+        lines.Add(Loc.T("分层耗时：最近 / 近 1 秒平均（ms）"));
         lines.Add(string.Join("   ", timings.Where(t => t != null).Select(t => t.Split('\n')[0])));
         if (captureDetails.Length > 0) lines.Add(captureDetails);
         Volatile.Write(ref infoLines, lines.ToArray());
@@ -716,7 +716,7 @@ sealed class UiControllerWindow : UiWindow
         stopping = true; stoppingSince = DateTime.UtcNow; debounce.Stop(); autoClose.Stop();
         ShutdownGuard.Arm("controller", TimeSpan.FromSeconds(10));
         SessionTrace.Event("window", disconnected ? "closing-after-disconnect" : scheduledClose ? "closing-scheduled" : "closing-by-user-or-test");
-        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; panel.Annotate.IsEnabled = false; operation.Text = "正在关闭…（再次点击关闭可强制退出）";
+        presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; panel.Annotate.IsEnabled = false; operation.Text = Loc.T("正在关闭…（再次点击关闭可强制退出）");
         var sessionStopped = true;
         try { await ShutdownGuard.Bounded(() => SetClipboardAsync(false), "clipboard"); } catch (Exception ex) { ReportError(ex); }
         try { if (cursorClient != null) await ShutdownGuard.Bounded(() => cursorClient.DisposeAsync().AsTask(), "cursor"); } catch (Exception ex) { ReportError(ex); }
@@ -740,7 +740,7 @@ sealed class UiControllerWindow : UiWindow
     void ReportError(Exception ex)
     {
         SessionTrace.Error("controller-window", ex);
-        Console.Error.WriteLine(ex); errors.Add(ex.ToString()); operation.Text = "错误：" + ex.Message;
+        Console.Error.WriteLine(ex); errors.Add(ex.ToString()); operation.Text = Loc.T("错误：") + ex.Message;
         RegressionExitCode = 1;
         if (stopping) return;
         if (remoteOptions == null) { UiThread.Post(Close); return; }
@@ -749,7 +749,7 @@ sealed class UiControllerWindow : UiWindow
         presets.IsEnabled = bitrate.IsEnabled = packetDiagnostics.IsEnabled = inputEnabled.IsEnabled = clipboardEnabled.IsEnabled = false; panel.Annotate.IsEnabled = false;
         foreach (var button in fpsButtons) button.IsEnabled = false;
         panel.SetReconnectVisible(true); panel.More.IsChecked = true; UpdateOrbShape();
-        operation.Text = $"原连接已中断：{ex.Message}；点击“重新建立会话”将创建新连接。";
+        operation.Text = Loc.F("原连接已中断：{0}；点击“重新建立会话”将创建新连接。", ex.Message);
         SessionTrace.Event("window", "disconnected-awaiting-user");
     }
 
@@ -835,7 +835,7 @@ sealed class UiControllerWindow : UiWindow
         }
         if (inputForwarding && Volatile.Read(ref hostBusyShown))
         {
-            const string notice = "对方正在操作，请等待";
+            var notice = Loc.T("对方正在操作，请等待");
             var size = paint.Text.Measure(notice, 13);
             var banner = new RectangleF((width - size.X - 36) / 2, Math.Max(70, height * .12f), size.X + 36, size.Y + 18);
             paint.FillRounded(banner, 12, UiPaint.Hex(0xD0301A14));

@@ -60,7 +60,7 @@ sealed class DesktopStreamSource : IDisposable
     public bool WaitingForSecureTransition { get { lock (gate) return secureFailureStarted != 0; } }
     public bool SecureActive { get { lock (gate) return SecureUsable() && secure!.Active; } }
     public string Backend { get { lock (gate) return SecureUsable() && secure!.Active ? "SYSTEM Winlogon capture → loopback UDP" :
-        packedCapture == null ? capture?.Backend ?? "未初始化" : $"DXGI Desktop Duplication + {packedCapture.Path}"; } }
+        packedCapture == null ? capture?.Backend ?? Loc.T("未初始化") : $"DXGI Desktop Duplication + {packedCapture.Path}"; } }
     public DesktopStreamSource(double scale, bool secureDesktop = false)
     {
         var bounds = Win32InputInjector.ReadPrimaryMonitor();

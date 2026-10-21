@@ -14,7 +14,7 @@ namespace Frd;
 static partial class RemoteLaunch
 {
     internal static int hostExitCode;
-    public const string Usage = "FRD CLI\n安全：口令不会在网络上发送，键鼠包带签名；FRD 本身不加密内容，设计上依赖已加密的底层链路（VPN、隧道或专网）。\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口。\n无参数：localhost Demo。远程模式只使用 --port：被控端在该端口同时绑定 TCP/UDP；主控的全部 TCP 连接和 UDP 数据报均以该端口为目标。视频、反馈、诊断和键鼠复用同一个 UDP socket。";
+    public static string Usage => Loc.T("FRD CLI\n安全：口令不会在网络上发送，键鼠包带签名；FRD 本身不加密内容，设计上依赖已加密的底层链路（VPN、隧道或专网）。\n被控：FRD.exe --host --listen localhost --port 5000 --token 自定口令\n主控：FRD.exe --connect 被控IP或主机名 --port 5000 --token 相同口令\n每次启动被控端都必须显式指定 --listen、--port、--token；无默认监听地址或口令。\n--listen localhost：仅 IPv4/IPv6 回环；::：所有网卡双栈；也可指定具体 IPv4/IPv6 地址。\n--help：文本帮助；--version：版本；--help-window：帮助窗口；--lang en|zh：界面语言（默认随系统）。\n无参数：localhost Demo。远程模式只使用 --port：被控端在该端口同时绑定 TCP/UDP；主控的全部 TCP 连接和 UDP 数据报均以该端口为目标。视频、反馈、诊断和键鼠复用同一个 UDP socket。");
     public static void Help(bool window)
     {
         Console.WriteLine(Usage);
@@ -33,7 +33,7 @@ static partial class RemoteLaunch
                 throw new ArgumentException(Usage);
         }
         if (!values.TryGetValue("--token", out var token) || string.IsNullOrWhiteSpace(token))
-            throw new ArgumentException("必须每次通过命令行 --token 指定非空连接口令；没有默认口令，也不会从配置文件读取口令。\n" + Usage);
+            throw new ArgumentException(Loc.T("必须每次通过命令行 --token 指定非空连接口令；没有默认口令，也不会从配置文件读取口令。\n") + Usage);
         if (!values.TryGetValue("--port", out var portText) || !int.TryParse(portText, out var port) || port is < 1 or > 65535)
             throw new ArgumentException(Usage);
         if (!host)
@@ -44,7 +44,7 @@ static partial class RemoteLaunch
             return new(false, args[1], [], port, token, seconds, values.GetValueOrDefault("--report"), values.GetValueOrDefault("--interaction-script"));
         }
         if (!values.TryGetValue("--listen", out var listen) || string.IsNullOrWhiteSpace(listen))
-            throw new ArgumentException("被控端必须通过 --listen 明确指定 localhost 或 IPv4/IPv6 监听地址；不默认监听所有网卡。\n" + Usage);
+            throw new ArgumentException(Loc.T("被控端必须通过 --listen 明确指定 localhost 或 IPv4/IPv6 监听地址；不默认监听所有网卡。\n") + Usage);
         if (values.Keys.Any(key => key is "--test-seconds" or "--report" or "--interaction-script")) throw new ArgumentException(Usage);
         return new(true, null, FrdNetwork.ListenAddresses(listen), port, token, 0, null, null);
     }
@@ -60,6 +60,6 @@ static partial class RemoteLaunch
 
     static void ShowMessage(string text)
     {
-        UiNative.MessageBox(0, text, "FRD 命令行", 0x40 /* MB_ICONINFORMATION */);
+        UiNative.MessageBox(0, text, Loc.T("FRD 命令行"), 0x40 /* MB_ICONINFORMATION */);
     }
 }

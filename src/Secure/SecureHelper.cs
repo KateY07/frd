@@ -29,16 +29,16 @@ internal static class SecureDesktopService
             if (service == 0)
             {
                 var error = Marshal.GetLastWin32Error();
-                return error == 1060 ? new(false, false, "安全桌面辅助服务尚未安装") : new(false, false, new Win32Exception(error).Message);
+                return error == 1060 ? new(false, false, Loc.T("安全桌面辅助服务尚未安装")) : new(false, false, new Win32Exception(error).Message);
             }
             try
             {
                 var state = Query(service);
                 return state switch
                 {
-                    ServiceRunning => new(true, true, "安全桌面辅助服务正在运行"),
-                    ServiceStartPending => new(true, false, "安全桌面辅助服务正在启动"),
-                    _ => new(true, false, "安全桌面辅助服务未运行")
+                    ServiceRunning => new(true, true, Loc.T("安全桌面辅助服务正在运行")),
+                    ServiceStartPending => new(true, false, Loc.T("安全桌面辅助服务正在启动")),
+                    _ => new(true, false, Loc.T("安全桌面辅助服务未运行"))
                 };
             }
             finally { CloseServiceHandle(service); }
@@ -49,7 +49,7 @@ internal static class SecureDesktopService
     internal static async Task InstallViaUacAsync()
     {
         var tools = Path.Combine(AppContext.BaseDirectory, ToolsFileName);
-        if (!File.Exists(tools)) throw new FileNotFoundException($"找不到 {ToolsFileName}，请把它放在 FRD.exe 同一目录。", tools);
+        if (!File.Exists(tools)) throw new FileNotFoundException(Loc.F("找不到 {0}，请把它放在 FRD.exe 同一目录。", ToolsFileName), tools);
         // The elevated process may run as a different (administrator) account, so name the interactive user explicitly.
         var sid = WindowsIdentity.GetCurrent().User?.Value ?? throw new InvalidOperationException("Current user SID is unavailable.");
         SessionTrace.Event("secure-helper", "install-requested");
@@ -65,7 +65,7 @@ internal static class SecureDesktopService
         {
             string? reason = null;
             try { reason = File.ReadLines(InstallErrorPath).FirstOrDefault(); } catch (IOException) { } catch (UnauthorizedAccessException) { }
-            throw new InvalidOperationException($"安全桌面辅助服务安装失败，退出码 {process.ExitCode}。" + (reason == null ? "" : " " + reason));
+            throw new InvalidOperationException(Loc.F("安全桌面辅助服务安装失败，退出码 {0}。", process.ExitCode) + (reason == null ? "" : " " + reason));
         }
         var status = Status();
         SessionTrace.Event("secure-helper", status.Running ? "service-running" : "service-not-running");

@@ -608,7 +608,7 @@ sealed class GdiDesktopCapture : IDisposable
         {
             ObjectDisposedException.ThrowIf(disposed, this);
             int sourceWidth = GetSystemMetrics(0), sourceHeight = GetSystemMetrics(1);
-            if (sourceWidth <= 0 || sourceHeight <= 0) throw new InvalidOperationException("主屏幕尺寸不可用");
+            if (sourceWidth <= 0 || sourceHeight <= 0) throw new InvalidOperationException(Loc.T("主屏幕尺寸不可用"));
             if (!StretchBlt(memory, 0, 0, width, height, screen, 0, 0, sourceWidth, sourceHeight, 0x40CC0020)) Fail("StretchBlt");
             if (!GdiFlush()) Fail("GdiFlush");
             var frame = new byte[checked(width * height * 4)]; Marshal.Copy(pixels, frame, 0, frame.Length); return frame;
@@ -629,7 +629,7 @@ sealed class GdiDesktopCapture : IDisposable
         }
     }
 
-    static void Fail(string operation) => throw new Win32Exception(Marshal.GetLastWin32Error(), "屏幕捕获失败：" + operation);
+    static void Fail(string operation) => throw new Win32Exception(Marshal.GetLastWin32Error(), Loc.T("屏幕捕获失败：") + operation);
     static void LogCleanup(string operation) => Console.Error.WriteLine($"[capture cleanup] {operation}: {Marshal.GetLastWin32Error()}");
     [StructLayout(LayoutKind.Sequential)]
     struct BitmapInfoHeader

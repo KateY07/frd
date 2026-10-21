@@ -46,7 +46,7 @@ public sealed partial class DemoSession : IDisposable
     StreamWriter? requests;
     Task? serverTask, encodeTask, statusTask;
     Task? shutdown;
-    string activePreset = "", message = "初始化";
+    string activePreset = "", message = Loc.T("初始化");
     bool hostBusy;
     int requestedGeneration, appliedGeneration, appliedLimit, receiveGeneration, decodedGeneration, renderedGeneration;
     long nextFrameId, nextPacketId, lastReceivedId = -1, encodedFrames, decodedFrames, encodeTicks, captureTicks, decodeTicks, lastRecovery;
@@ -98,13 +98,13 @@ public sealed partial class DemoSession : IDisposable
     {
         if (remoteOptions != null) { await StartRemoteAsync(); return; }
         receiver = new();
-        receiver.Failed += error => ReportError("UDP 接收", error);
+        receiver.Failed += error => ReportError(Loc.T("UDP 接收"), error);
         receiver.VideoReceived += ReceiveVideo;
         diagnosticsReceiver = new();
-        diagnosticsReceiver.Failed += error => ReportError("UDP 诊断", error);
+        diagnosticsReceiver.Failed += error => ReportError(Loc.T("UDP 诊断"), error);
         diagnosticsReceiver.Received += ReceiveDiagnostic;
         sender = new(new(IPAddress.Loopback, receiver.Port), config.Simulation);
-        sender.Failed += error => ReportError("UDP 发送/反馈", error);
+        sender.Failed += error => ReportError(Loc.T("UDP 发送/反馈"), error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation)
@@ -125,11 +125,11 @@ public sealed partial class DemoSession : IDisposable
 
     public async Task<ControlResult> ApplyAsync(string presetId, int limitKbps, double? transmissionScale = null, int? framesPerSecond = null)
     {
-        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, "仅支持原始分辨率 1×。", AppliedGeneration);
-        if (framesPerSecond is { } fps && fps is not (10 or 20 or 25 or 30)) return new(false, "仅支持 10/20/25/30 FPS。", AppliedGeneration);
-        if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, $"码率范围为 0.1–{config.MaximumBitrateMbps:0.###} Mbps。", AppliedGeneration);
-        if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, "JSON 中没有此预设。", AppliedGeneration);
-        if (!preset.Enabled) return new(false, preset.UnavailableReason ?? "此预设不可用。", AppliedGeneration);
+        if (transmissionScale is { } scale && !TransmissionGeometry.IsValidScale(scale)) return new(false, Loc.T("仅支持原始分辨率 1×。"), AppliedGeneration);
+        if (framesPerSecond is { } fps && fps is not (10 or 20 or 25 or 30)) return new(false, Loc.T("仅支持 10/20/25/30 FPS。"), AppliedGeneration);
+        if (limitKbps < 100 || limitKbps > config.MaximumBitrateKbps) return new(false, Loc.F("码率范围为 0.1–{0:0.###} Mbps。", config.MaximumBitrateMbps), AppliedGeneration);
+        if (!config.Presets.TryGetValue(presetId, out var preset)) return new(false, Loc.T("JSON 中没有此预设。"), AppliedGeneration);
+        if (!preset.Enabled) return new(false, preset.UnavailableReason ?? Loc.T("此预设不可用。"), AppliedGeneration);
         await controlGate.WaitAsync(stop.Token);
         var generation = Interlocked.Increment(ref requestedGeneration);
         try
@@ -198,7 +198,7 @@ public sealed partial class DemoSession : IDisposable
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Control server stopped."); }
-        catch (Exception ex) { ReportError("控制通道", ex); }
+        catch (Exception ex) { ReportError(Loc.T("控制通道"), ex); }
     }
 
     void EncodeLoop()
@@ -216,11 +216,11 @@ public sealed partial class DemoSession : IDisposable
                     try
                     {
                         var cmd = pending.Command;
-                        if (cmd.Kind == "keyframe") { force = true; pending.Completion.TrySetResult(new(true, "已请求恢复帧", AppliedGeneration)); continue; }
+                        if (cmd.Kind == "keyframe") { force = true; pending.Completion.TrySetResult(new(true, Loc.T("已请求恢复帧"), AppliedGeneration)); continue; }
                         if (cmd.Kind == "diagnostics")
                         {
                             Volatile.Write(ref packetDiagnosticsEnabled, cmd.DiagnosticsEnabled);
-                            pending.Completion.TrySetResult(new(true, cmd.DiagnosticsEnabled ? "已开启独立诊断 UDP 包；视频包结构不变" : "已关闭诊断包；本机计时继续显示", AppliedGeneration));
+                            pending.Completion.TrySetResult(new(true, cmd.DiagnosticsEnabled ? Loc.T("已开启独立诊断 UDP 包；视频包结构不变") : Loc.T("已关闭诊断包；本机计时继续显示"), AppliedGeneration));
                             continue;
                         }
                         if (!config.Presets.TryGetValue(cmd.PresetId, out var preset) || !preset.Enabled) throw new InvalidDataException("Preset unavailable on sender.");
@@ -239,7 +239,7 @@ public sealed partial class DemoSession : IDisposable
                         if (!resize && fps == config.FramesPerSecond && encoder != null && activePreset == cmd.PresetId && encoder.SetBitrate(cmd.LimitKbps))
                         {
                             sender!.SetEncoderBitrateKbps(cmd.LimitKbps); Volatile.Write(ref appliedLimit, encoder.HasBitrateCap ? cmd.LimitKbps : 0);
-                            pending.Completion.TrySetResult(Applied("发送端已在原会话更新码率上限", AppliedGeneration));
+                            pending.Completion.TrySetResult(Applied(Loc.T("发送端已在原会话更新码率上限"), AppliedGeneration));
                             continue;
                         }
                         var pixelMode = CapturePixelModes.Parse(preset.InputPixelMode);
@@ -258,8 +258,8 @@ public sealed partial class DemoSession : IDisposable
                             FramesPerSecond = fps };
                         sender!.SetEncoderBitrateKbps(cmd.LimitKbps);
                         activePreset = cmd.PresetId; Volatile.Write(ref appliedLimit, replacement.HasBitrateCap ? cmd.LimitKbps : 0); Volatile.Write(ref appliedGeneration, cmd.Generation);
-                        force = true; next = Stopwatch.GetTimestamp(); message = "手动控制；带宽估计仅参考";
-                        pending.Completion.TrySetResult(Applied("发送端已应用；等待新预设首帧", cmd.Generation));
+                        force = true; next = Stopwatch.GetTimestamp(); message = Loc.T("手动控制；带宽估计仅参考");
+                        pending.Completion.TrySetResult(Applied(Loc.T("发送端已应用；等待新预设首帧"), cmd.Generation));
                     }
                     catch (Exception ex) { Console.Error.WriteLine(ex); pending.Completion.TrySetResult(new(false, ex.Message, AppliedGeneration)); }
                 }
@@ -330,7 +330,7 @@ public sealed partial class DemoSession : IDisposable
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Encoder loop stopped."); }
-        catch (Exception ex) { ReportError("捕获/编码/发送", ex); stop.Cancel(); }
+        catch (Exception ex) { ReportError(Loc.T("捕获/编码/发送"), ex); stop.Cancel(); }
         finally
         {
             encoder?.Dispose();
@@ -428,7 +428,7 @@ public sealed partial class DemoSession : IDisposable
             finally { controlGate.Release(); }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Recovery stopped."); }
-        catch (Exception ex) { ReportError("请求恢复帧", ex); }
+        catch (Exception ex) { ReportError(Loc.T("请求恢复帧"), ex); }
     }
 
     async Task StatusLoopAsync()
@@ -440,7 +440,7 @@ public sealed partial class DemoSession : IDisposable
                 var network = remote != null ? await ReadRemoteStatusAsync() : sender!.Snapshot;
                 var presentation = PresentationStatus();
                 StatusChanged?.Invoke(new(activePreset, appliedLimit, network.SentMbps, network.ReceivedMbps, network.EstimatedMbps,
-                    network.DelayTrendMs, network.LossRate, message + "；" + network.EstimateState)
+                    network.DelayTrendMs, network.LossRate, message + Loc.T("；") + network.EstimateState)
                 {
                     CaptureToRenderMs = presentation.Last, MeanCaptureToRenderMs = presentation.Mean,
                     RenderedFps = remote != null ? RemotePresentedFps() : presentation.Rendered, DecodedFps = presentation.Decoded,
@@ -454,7 +454,7 @@ public sealed partial class DemoSession : IDisposable
                     TransferDetails = presentation.Transfer,
                     HasRecentRenderTiming = presentation.Rendered > 0, RenderTimingSamples = presentation.Rendered,
                     HasRenderTiming = Interlocked.Read(ref presentationCount) > 0 && (remote == null || packetDiagnosticsEnabled),
-                    TimingDescription = remote != null ? RemoteTimingDescription : "同机单调时钟",
+                    TimingDescription = remote != null ? RemoteTimingDescription : Loc.T("同机单调时钟"),
                     SendBudgetKbps = network.SendBudgetKbps, BurstBudgetWireBytes = network.BurstBudgetWireBytes,
                     SimulatedCapacityMbps = network.SimulatedCapacityMbps
                 });
@@ -462,13 +462,13 @@ public sealed partial class DemoSession : IDisposable
             }
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { Console.Error.WriteLine("Status loop stopped."); }
-        catch (Exception ex) { ReportError("状态统计", ex); }
+        catch (Exception ex) { ReportError(Loc.T("状态统计"), ex); }
     }
 
     void ReportError(string stage, Exception ex)
     {
         SessionTrace.Error(stage, ex);
-        message = stage + "：" + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
+        message = stage + Loc.T("：") + ex.Message; Console.Error.WriteLine(stage + "\n" + ex);
         stop.Cancel();
         if (Interlocked.Exchange(ref failureReported, 1) == 0) Failed?.Invoke(ex);
     }

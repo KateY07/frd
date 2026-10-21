@@ -31,8 +31,8 @@ public sealed partial class DemoSession
     public int RemoteSourceWidth => welcome?.SourceWidth ?? config.Width;
     public int RemoteSourceHeight => welcome?.SourceHeight ?? config.Height;
     string RemoteTimingDescription => packetDiagnosticsEnabled
-        ? $"跨机估算，时钟采样不确定度 ±{remote!.Clock.UncertaintyMs:F2} ms（不含漂移）"
-        : "诊断关闭：跨机捕获到呈现耗时不可测；画面继续接收";
+        ? Loc.F("跨机估算，时钟采样不确定度 ±{0:F2} ms（不含漂移）", remote!.Clock.UncertaintyMs)
+        : Loc.T("诊断关闭：跨机捕获到呈现耗时不可测；画面继续接收");
 
     public DemoSession(AppConfiguration config, RemoteOptions options)
     {
@@ -44,7 +44,7 @@ public sealed partial class DemoSession
     {
         receiver = new(dualStack: true); receiver.VideoReceived += ReceiveVideo;
         receiver.DiagnosticReceived += ReceiveDiagnostic;
-        receiver.Failed += error => ReportError("UDP 接收", error);
+        receiver.Failed += error => ReportError(Loc.T("UDP 接收"), error);
         remote = await RemoteConnection.ConnectAsync(remoteOptions!, stop.Token);
         var reply = await remote.HelloAsync(remoteOptions!.Token, stop.Token, TimeSpan.FromSeconds(15));
         welcome = reply.Welcome ?? throw new InvalidDataException("Host did not return stream configuration.");
@@ -119,7 +119,7 @@ public sealed partial class DemoSession
         }
         activePreset = reply.Preset; appliedLimit = reply.LimitKbps; packetDiagnosticsEnabled = reply.Diagnostics;
         Volatile.Write(ref hostBusy, reply.HostBusy);
-        message = string.IsNullOrWhiteSpace(reply.Message) ? "远端发送；预设和码率完全手动" : reply.Message;
+        message = string.IsNullOrWhiteSpace(reply.Message) ? Loc.T("远端发送；预设和码率完全手动") : reply.Message;
         return remoteNetwork = reply.Network ?? throw new InvalidDataException("Missing sender network statistics.");
         }
         finally { controlGate.Release(); }
@@ -158,7 +158,7 @@ public sealed partial class DemoSession
     {
         diagnosticDestination = diagnostics;
         sender = new(video, config.Simulation); sender.SetEncoderBitrateKbps(config.InitialBitrateKbps);
-        sender.Failed += error => ReportError("UDP 发送/反馈", error);
+        sender.Failed += error => ReportError(Loc.T("UDP 发送/反馈"), error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);
@@ -170,7 +170,7 @@ public sealed partial class DemoSession
     {
         diagnosticDestination = destination;
         sender = new(socket, destination, config.Simulation); sender.SetEncoderBitrateKbps(config.InitialBitrateKbps);
-        sender.Failed += error => ReportError("UDP 发送/反馈", error);
+        sender.Failed += error => ReportError(Loc.T("UDP 发送/反馈"), error);
         sender.FrameSending += (generation, id, timing) =>
         {
             if (frameClocks.TryGetValue(id, out var clock) && clock.Generation == generation) Volatile.Write(ref clock.Sending, timing);

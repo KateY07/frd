@@ -75,11 +75,11 @@ public sealed record AppConfiguration
             if (!preset.Enabled) return preset;
             if (MfArguments.IsMediaFoundation(preset.EncoderArguments))
             {
-                if (!mfEncoder) return preset with { Enabled = false, UnavailableReason = "此系统缺少 Media Foundation H.264 编码器（N 版 Windows 需安装媒体功能包）" };
-                if (!mfDecoder) return preset with { Enabled = false, UnavailableReason = "此系统缺少 Media Foundation H.264 解码器" };
+                if (!mfEncoder) return preset with { Enabled = false, UnavailableReason = Loc.T("此系统缺少 Media Foundation H.264 编码器（N 版 Windows 需安装媒体功能包）") };
+                if (!mfDecoder) return preset with { Enabled = false, UnavailableReason = Loc.T("此系统缺少 Media Foundation H.264 解码器") };
                 return preset;
             }
-            return FfmpegRuntime.IsAvailable ? preset : preset with { Enabled = false, UnavailableReason = "需要 FFmpeg 扩展包（把其中的 ffmpeg 文件夹解压到 FRD.exe 旁）" };
+            return FfmpegRuntime.IsAvailable ? preset : preset with { Enabled = false, UnavailableReason = Loc.T("需要 FFmpeg 扩展包（把其中的 ffmpeg 文件夹解压到 FRD.exe 旁）") };
         });
         return this with { Presets = presets };
     }
@@ -95,7 +95,7 @@ public sealed record AppConfiguration
             Console.Error.WriteLine($"Initial preset \"{InitialPreset}\" is unavailable ({Presets.GetValueOrDefault(InitialPreset)?.UnavailableReason ?? "not defined"}); using \"{fallback.Key}\".");
             return this with { InitialPreset = fallback.Key };
         }
-        problem = "没有可用的 H.264 编解码器：请在 Windows 中安装“媒体功能包”（N 版/KN 版），或安装 FRD 的 FFmpeg 扩展包。";
+        problem = Loc.T("没有可用的 H.264 编解码器：请在 Windows 中安装“媒体功能包”（N 版/KN 版），或安装 FRD 的 FFmpeg 扩展包。");
         return null;
     }
 

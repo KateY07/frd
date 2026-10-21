@@ -9,40 +9,40 @@ sealed class UiControlPanel : UiGlassPanel
 {
     public readonly UiLabel StatusName = new("", 12) { MaxWidth = 90, Color = UiTheme.Subtle };
     public readonly UiLabel Latency = new("— ms", 12) { Color = UiTheme.Subtle };
-    public readonly UiButton Input = new() { Label = "键鼠", Icon = "mouse", IsToggle = true, IsEnabled = false };
-    public readonly UiButton Clipboard = new() { Label = "剪贴板", Icon = "clipboard", IsToggle = true, IsEnabled = false };
+    public readonly UiButton Input = new() { Label = Loc.T("键鼠"), Icon = "mouse", IsToggle = true, IsEnabled = false };
+    public readonly UiButton Clipboard = new() { Label = Loc.T("剪贴板"), Icon = "clipboard", IsToggle = true, IsEnabled = false };
     public readonly UiButton FullScreen = new() { Icon = "expand" };
     public readonly UiButton More = new() { Icon = "sliders", IsToggle = true };
     public readonly UiButton Disconnect = new() { Icon = "power", IsDanger = true };
     public readonly UiButton Collapse = new() { Icon = "chevrons" };
-    public readonly UiButton Annotate = new() { Icon = "pen", IsToggle = true, IsEnabled = false, ToolTip = "标注：在画面上画涂鸦、矩形、文字，被控端屏幕同步显示（Esc 退出，Ctrl+Z 撤销）" };
+    public readonly UiButton Annotate = new() { Icon = "pen", IsToggle = true, IsEnabled = false, ToolTip = Loc.T("标注：在画面上画涂鸦、矩形、文字，被控端屏幕同步显示（Esc 退出，Ctrl+Z 撤销）") };
     public readonly UiSwatch[] Swatches =
     [
-        new() { Fill = UiPaint.Hex(0xFFFF4D4F), IsSelected = true, ToolTip = "红色" }, new() { Fill = UiPaint.Hex(0xFFFFC53D), ToolTip = "黄色" },
-        new() { Fill = UiPaint.Hex(0xFF3DD68C), ToolTip = "绿色" }, new() { Fill = UiPaint.Hex(0xFFFFFFFF), ToolTip = "白色" }
+        new() { Fill = UiPaint.Hex(0xFFFF4D4F), IsSelected = true, ToolTip = Loc.T("红色") }, new() { Fill = UiPaint.Hex(0xFFFFC53D), ToolTip = Loc.T("黄色") },
+        new() { Fill = UiPaint.Hex(0xFF3DD68C), ToolTip = Loc.T("绿色") }, new() { Fill = UiPaint.Hex(0xFFFFFFFF), ToolTip = Loc.T("白色") }
     ];
-    public readonly UiButton ToolPen = new() { Icon = "pen", IsToggle = true, IsChecked = true, ToolTip = "涂鸦（自由画笔）" };
-    public readonly UiButton ToolRect = new() { Icon = "rect", IsToggle = true, ToolTip = "矩形" };
-    public readonly UiButton ToolText = new() { Icon = "text", IsToggle = true, ToolTip = "文字：点一下画面，输入后按 Enter 确认，Esc 取消" };
-    public readonly UiButton Thick = new() { Label = "粗", IsToggle = true, FixedWidth = 34, ToolTip = "粗笔" };
-    public readonly UiButton Undo = new() { Label = "撤销", ToolTip = "撤销上一笔（Ctrl+Z）" };
-    public readonly UiButton ClearBoard = new() { Label = "清除", ToolTip = "清除所有标注" };
+    public readonly UiButton ToolPen = new() { Icon = "pen", IsToggle = true, IsChecked = true, ToolTip = Loc.T("涂鸦（自由画笔）") };
+    public readonly UiButton ToolRect = new() { Icon = "rect", IsToggle = true, ToolTip = Loc.T("矩形") };
+    public readonly UiButton ToolText = new() { Icon = "text", IsToggle = true, ToolTip = Loc.T("文字：点一下画面，输入后按 Enter 确认，Esc 取消") };
+    public readonly UiButton Thick = new() { Label = Loc.T("粗"), IsToggle = true, FixedWidth = 34, ToolTip = Loc.T("粗笔") };
+    public readonly UiButton Undo = new() { Label = Loc.T("撤销"), ToolTip = Loc.T("撤销上一笔（Ctrl+Z）") };
+    public readonly UiButton ClearBoard = new() { Label = Loc.T("清除"), ToolTip = Loc.T("清除所有标注") };
     readonly UiElement[] annotateElements;
     RectangleF annotateRow;
     public bool AnnotateOn => Annotate.IsChecked == true;
     const float AnnotateRowHeight = 36;
 
-    public readonly UiLabel EncoderTitle = new("编码预设", 11) { Color = UiTheme.Subtle };
+    public readonly UiLabel EncoderTitle = new(Loc.T("编码预设"), 11) { Color = UiTheme.Subtle };
     public readonly UiLabel BitrateLabel = new("", 11) { Color = UiTheme.Subtle };
     public readonly UiChoice Presets = new() { IsEnabled = false };
     public readonly UiSlider Bitrate = new() { IsEnabled = false, Minimum = .1, Maximum = 100, Step = .1, Tag = "bitrate" };
-    public readonly UiLabel FpsTitle = new("帧率", 12) { Color = UiTheme.Subtle };
+    public readonly UiLabel FpsTitle = new(Loc.T("帧率"), 12) { Color = UiTheme.Subtle };
     public readonly UiButton[] Fps = new[] { 10, 20, 25, 30 }.Select(value => new UiButton { Label = value.ToString(), Tag = value, IsEnabled = false, FixedWidth = 36 }).ToArray();
-    public readonly UiButton PacketDiagnostics = new() { Label = "诊断包", Icon = "pulse", IsToggle = true, IsEnabled = false };
-    public readonly UiButton ShowInfo = new() { Label = "诊断信息", Icon = "activity", IsToggle = true };
-    public readonly UiButton ShowRemoteCursor = new() { Label = "远程光标", Icon = "cursor", IsToggle = true };
-    public readonly UiLabel Operation = new("正在连接…", 11) { Color = UiTheme.Subtle };
-    public readonly UiButton Reconnect = new() { Label = "重新建立会话", IsVisible = false };
+    public readonly UiButton PacketDiagnostics = new() { Label = Loc.T("诊断包"), Icon = "pulse", IsToggle = true, IsEnabled = false };
+    public readonly UiButton ShowInfo = new() { Label = Loc.T("诊断信息"), Icon = "activity", IsToggle = true };
+    public readonly UiButton ShowRemoteCursor = new() { Label = Loc.T("远程光标"), Icon = "cursor", IsToggle = true };
+    public readonly UiLabel Operation = new(Loc.T("正在连接…"), 11) { Color = UiTheme.Subtle };
+    public readonly UiButton Reconnect = new() { Label = Loc.T("重新建立会话"), IsVisible = false };
 
     float dotX, dotY;
     public Color DotColor => StatusColor;
@@ -60,15 +60,15 @@ sealed class UiControlPanel : UiGlassPanel
 
     void ToolTipDefaults()
     {
-        Input.ToolTip = "键鼠转发（Ctrl+Alt 退出并释放按键）";
-        Clipboard.ToolTip = "剪贴板同步（文本、文件、目录）";
-        FullScreen.ToolTip = "全屏（Ctrl+Alt+F11）";
-        More.ToolTip = "编码预设、码率、帧率与诊断";
-        Disconnect.ToolTip = "断开并关闭窗口";
-        Collapse.ToolTip = "收起为悬浮球（空闲 10 秒自动收起）";
-        PacketDiagnostics.ToolTip = "主控切换独立诊断包；关闭后跨机延迟不可测";
-        ShowRemoteCursor.ToolTip = "在画面上叠加显示被控端的鼠标指针（位置和形状），不需要开启键鼠转发";
-        ShowInfo.ToolTip = "在画面左下角显示延迟与流量；只隐藏显示，不改变诊断包或统计";
+        Input.ToolTip = Loc.T("键鼠转发（Ctrl+Alt 退出并释放按键）");
+        Clipboard.ToolTip = Loc.T("剪贴板同步（文本、文件、目录）");
+        FullScreen.ToolTip = Loc.T("全屏（Ctrl+Alt+F11）");
+        More.ToolTip = Loc.T("编码预设、码率、帧率与诊断");
+        Disconnect.ToolTip = Loc.T("断开并关闭窗口");
+        Collapse.ToolTip = Loc.T("收起为悬浮球（空闲 10 秒自动收起）");
+        PacketDiagnostics.ToolTip = Loc.T("主控切换独立诊断包；关闭后跨机延迟不可测");
+        ShowRemoteCursor.ToolTip = Loc.T("在画面上叠加显示被控端的鼠标指针（位置和形状），不需要开启键鼠转发");
+        ShowInfo.ToolTip = Loc.T("在画面左下角显示延迟与流量；只隐藏显示，不改变诊断包或统计");
     }
 
     public IEnumerable<UiElement> AllElements => elements;
@@ -106,7 +106,7 @@ sealed class UiControlPanel : UiGlassPanel
         var latencyWidth = Math.Max(40, latencySize.X);
         // The two labelled toggles drop their text (icon only, tooltip stays) when the bar would otherwise run out of room.
         const float MinimumName = 56;
-        Input.Label = "键鼠"; Clipboard.Label = "剪贴板";
+        Input.Label = Loc.T("键鼠"); Clipboard.Label = Loc.T("剪贴板");
         var sizes = buttons.Select(button => button.Measure(text, 0)).ToArray();
         var buttonsWidth = sizes.Sum(size => size.X) + 2 * (buttons.Length - 1);
         if (buttonsWidth + 23 + MinimumName + 8 + latencyWidth + 8 > width)
