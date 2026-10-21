@@ -15,8 +15,8 @@
     <PackageProjectUrl>https://github.com/KateY07/frd</PackageProjectUrl>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>5.1.0</Version>
-    <InformationalVersion>v5.1</InformationalVersion>
+    <Version>5.2.0</Version>
+    <InformationalVersion>v5.2</InformationalVersion>
     <!-- NativeAOT: one native exe, no .NET runtime to install. JSON stays reflection-based (rooted below), reports use anonymous types. -->
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>

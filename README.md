@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v5.1）
+# FRD · 远程桌面 CLI（v5.2）
+
+v5.2：修复主控窗口画面四周黑边里的鼠标事件被转发到远端（拖拽期间仍照常转发）。
 
 v5.1：FFmpeg 扩展安装器改为装到 `%LOCALAPPDATA%\FRD\ffmpeg\<版本>\`，FRD 自动查找（`FRD_FFMPEG_DIR` → `FRD.exe` 旁 → 用户目录），所有版本和单文件版共用。
 

@@ -578,8 +578,9 @@ public sealed class NativeInputSource : IDisposable
                     if (message == 0x020A && !ScreenToClient(hwnd, ref point)) throw new Win32Exception(Marshal.GetLastWin32Error());
                     // A held button keeps forwarding even when the pointer drifts over local UI; otherwise local UI wins.
                     // A release with nothing held was pressed on local UI, so the local UI must see it to finish its own click or drag.
-                    if (heldButtons == 0 && (message is 0x0202 or 0x0205 or 0x0208 || PointerIsLocal?.Invoke(point.X, point.Y) == true)) return false;
                     var area = VideoArea?.Invoke() ?? (0, 0, rect.Right - rect.Left, rect.Bottom - rect.Top);
+                    // The black bars around the video are not part of the remote screen: with nothing held they stay local.
+                    if (heldButtons == 0 && (message is 0x0202 or 0x0205 or 0x0208 || IsLocalPoint(point.X, point.Y, area))) return false;
                     var normalized = InputCoordinates.Normalize(point.X - area.X, point.Y - area.Y, area.Width, area.Height);
                     var kind = message switch
                     {
@@ -618,9 +619,15 @@ public sealed class NativeInputSource : IDisposable
 
     bool CursorOverLocalUi()
     {
-        if (PointerIsLocal == null || !GetCursorPos(out var position)) return false;
+        if (!GetCursorPos(out var position)) return false;
         var point = new NativePoint { X = position.X, Y = position.Y };
-        return ScreenToClient(hwnd, ref point) && PointerIsLocal(point.X, point.Y);
+        return ScreenToClient(hwnd, ref point) && IsLocalPoint(point.X, point.Y, VideoArea?.Invoke());
+    }
+
+    bool IsLocalPoint(int x, int y, (int X, int Y, int Width, int Height)? area)
+    {
+        if (PointerIsLocal?.Invoke(x, y) == true) return true;
+        return area is { } a && a.Width > 0 && a.Height > 0 && (x < a.X || y < a.Y || x >= a.X + a.Width || y >= a.Y + a.Height);
     }
 
     public void Dispose()
