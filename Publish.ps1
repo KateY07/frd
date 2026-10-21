@@ -122,6 +122,17 @@ if ($onesetup) {
     Copy-Item -LiteralPath "$singleFile.sha256" -Destination (Join-Path $localReleaseRoot "frd-$version.exe.sha256") -ErrorAction Stop
 }
 else { Write-Warning 'onesetup.exe not found; the single-file frd-<version>.exe was not built.' }
+
+# FFmpeg extension installer (frd-ffmpeg-<ffmpeg version>-setup.exe), also built with OneSetup; the zip stays the scriptable alternative.
+$ffmpegSetup = $null
+if ($onesetup) {
+    $buildSetup = Join-Path $PSScriptRoot 'tools/FfmpegSetup/Build-FfmpegSetup.ps1'
+    & $buildSetup -OneSetup $onesetup -OutputDirectory $releaseRoot | Out-Null
+    if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { throw 'FFmpeg setup package failed.' }
+    foreach ($file in Get-ChildItem -LiteralPath $releaseRoot -Filter 'frd-ffmpeg-*-setup.exe*' -File) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $localReleaseRoot $file.Name) -Force -ErrorAction Stop
+    }
+}
 $localExtension = Join-Path $localReleaseRoot "$version-ffmpeg.zip"
 if (Test-Path -LiteralPath $localExtension) { throw "Local FFmpeg extension already exists: $localExtension" }
 Copy-Item -LiteralPath $extensionArchive -Destination $localExtension -ErrorAction Stop
