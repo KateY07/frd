@@ -48,12 +48,13 @@ internal static class SecureDesktopService
 
     internal static async Task InstallViaUacAsync()
     {
-        // The service ships as its own installer (frd-service-<version>-setup.exe): the user picks install/overwrite or uninstall there and confirms UAC.
+        // The service ships as its own installer (frd-service-<version>-setup.exe). The button means "install/repair", so the action is passed in and the
+        // installer skips its install/uninstall question; it still shows the UAC prompt, which only the user can confirm. Double-clicking the installer asks.
         var setup = Directory.EnumerateFiles(AppContext.BaseDirectory, "frd-service-*-setup.exe").OrderByDescending(path => path, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
         if (setup != null)
         {
             SessionTrace.Event("secure-helper", "setup-requested");
-            using var installer = Process.Start(new ProcessStartInfo(setup) { UseShellExecute = true, WorkingDirectory = AppContext.BaseDirectory })
+            using var installer = Process.Start(new ProcessStartInfo(setup) { UseShellExecute = false, WorkingDirectory = AppContext.BaseDirectory, Environment = { ["FRD_SERVICE_ACTION"] = "install" } })
                 ?? throw new InvalidOperationException("Could not start the FRD service installer.");
             await installer.WaitForExitAsync();
             SessionTrace.Event("secure-helper", $"setup-exited-{installer.ExitCode}");
