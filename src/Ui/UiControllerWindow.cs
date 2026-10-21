@@ -196,7 +196,8 @@ sealed class UiControllerWindow : UiWindow
                 "closed-after-disconnect" : scheduledClose ? "scheduled-close" : "user-or-test-close");
             if (restartRequested) LaunchNewSession();
         };
-        ExcludeFromCapture();
+        // Only the same-machine demo must hide this window (it would capture itself); a remote controller can be screenshotted and recorded (PrtSc, Snipping Tool, game bar).
+        if (remote == null) ExcludeFromCapture();
         preview.Start();
         lock (sceneGate) { panel.Layout(measureText, ClientWidth, ClientHeight); }
         Show(SW_SHOWNORMAL);

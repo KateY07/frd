@@ -195,6 +195,7 @@ static class LocEnglish
         ["已安装，未运行"] = "Installed, not running",
         ["运行中"] = "Running",
         ["启动/修复安全桌面辅助服务"] = "Start/repair the secure-desktop helper service",
+        ["修复/重新安装安全桌面辅助服务"] = "Repair/reinstall the secure-desktop helper service",
         ["等待管理员确认…"] = "Waiting for administrator confirmation…",
         ["安装失败，点击重试"] = "Install failed, click to retry",
     };

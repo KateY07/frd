@@ -289,9 +289,10 @@ sealed class UiHostWindow : UiWindow
             panel.ServiceValue.Text = helper.Running ? Loc.T("运行中") : helper.Installed ? Loc.T("已安装，未运行") : Loc.T("未安装");
             panel.ServiceValue.Color = helper.Running ? UiTheme.Good : UiTheme.Warn;
             panel.ServiceValue.ToolTip = helper.Message;
-            panel.SetInstallVisible(!helper.Running);
-            panel.Install.IsEnabled = !helper.Running;
-            panel.Install.Label = helper.Installed ? Loc.T("启动/修复安全桌面辅助服务") : Loc.T("安装安全桌面辅助服务");
+            // Always available: a running service can still be out of date or broken, so it can be reinstalled (the installer offers install/overwrite or uninstall).
+            panel.SetInstallVisible(true);
+            panel.Install.IsEnabled = true;
+            panel.Install.Label = helper.Running ? Loc.T("修复/重新安装安全桌面辅助服务") : helper.Installed ? Loc.T("启动/修复安全桌面辅助服务") : Loc.T("安装安全桌面辅助服务");
             panel.Install.ToolTip = helper.Message;
             panel.Relayout(text);
         }

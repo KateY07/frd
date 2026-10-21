@@ -57,9 +57,7 @@ internal static class SecureDesktopService
                 ?? throw new InvalidOperationException("Could not start the FRD service installer.");
             await installer.WaitForExitAsync();
             SessionTrace.Event("secure-helper", $"setup-exited-{installer.ExitCode}");
-            var after = Status();
-            if (!after.Running) throw new InvalidOperationException(after.Message);
-            return;
+            return;   // the caller refreshes the status: the user may have chosen uninstall or closed the installer
         }
         var tools = Path.Combine(AppContext.BaseDirectory, ToolsFileName);
         if (!File.Exists(tools)) throw new FileNotFoundException(Loc.F("找不到 {0}，请把它放在 FRD.exe 同一目录。", ToolsFileName), tools);
