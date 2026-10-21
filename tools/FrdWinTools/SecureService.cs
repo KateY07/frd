@@ -68,18 +68,42 @@ internal static class SecureDesktopService
         }
     }
 
+    /// <summary>
+    /// The service runs as SYSTEM, so the file it starts must live where only administrators can write. The tools are copied to
+    /// %ProgramFiles%\FRD (access: SYSTEM and Administrators full, Users read and execute) and the service points at that copy,
+    /// never at the folder the tools were unzipped to, which an ordinary user can usually modify.
+    /// </summary>
     static int InstallCore(string? userSid)
     {
         if (userSid != null && !System.Text.RegularExpressions.Regex.IsMatch(userSid, @"^S-1-\d+(-\d+)+$"))
             throw new ArgumentException("Invalid user SID.");
-        var executable = Environment.ProcessPath ?? throw new InvalidOperationException("FRD executable path is unavailable.");
+        var source = Environment.ProcessPath ?? throw new InvalidOperationException("frd-wintools executable path is unavailable.");
         PrepareStorage(userSid);
         var manager = OpenSCManager(null, null, ScManagerConnect | ScManagerCreateService);
         if (manager == 0) throw Win32("OpenSCManager");
         try
         {
+            var service = OpenService(manager, Name, ServiceAllAccess);
+            if (service == 0)
+            {
+                if (Marshal.GetLastWin32Error() != 1060 /* ERROR_SERVICE_DOES_NOT_EXIST */) throw Win32("OpenService");
+            }
+            else
+            {
+                // An upgrade: stop the old service first so its file can be replaced.
+                try
+                {
+                    if (Query(service).CurrentState is ServiceRunning or ServiceStartPending)
+                    {
+                        if (!ControlService(service, ServiceControlStop, out _)) throw Win32("ControlService(stop)");
+                        WaitForState(service, ServiceStopped, TimeSpan.FromSeconds(15));
+                    }
+                }
+                finally { CloseServiceHandle(service); }
+            }
+            var executable = InstallBinary(source);
             var command = $"\"{executable}\" --secure-service";
-            var service = CreateService(manager, Name, "FRD secure-desktop capture", ServiceAllAccess,
+            service = CreateService(manager, Name, "FRD secure-desktop capture", ServiceAllAccess,
                 ServiceWin32OwnProcess, ServiceDemandStart, ServiceErrorNormal, command, null, 0, null, null, null);
             if (service == 0)
             {
@@ -89,12 +113,6 @@ internal static class SecureDesktopService
             }
             try
             {
-                var current = Query(service).CurrentState;
-                if (current is ServiceRunning or ServiceStartPending)
-                {
-                    if (!ControlService(service, ServiceControlStop, out _)) throw Win32("ControlService(stop)");
-                    WaitForState(service, ServiceStopped, TimeSpan.FromSeconds(15));
-                }
                 if (!ChangeServiceConfig(service, ServiceWin32OwnProcess, ServiceDemandStart, ServiceErrorNormal, command,
                     null, 0, null, null, null, "FRD secure-desktop capture")) throw Win32("ChangeServiceConfig");
                 if (!StartService(service, 0, null) && Marshal.GetLastWin32Error() != ErrorServiceAlreadyRunning) throw Win32("StartService");
@@ -105,6 +123,42 @@ internal static class SecureDesktopService
             finally { CloseServiceHandle(service); }
         }
         finally { CloseServiceHandle(manager); }
+    }
+
+    /// <summary>Copies the running tools into the protected install folder and returns the copy's path. The source stays open (no writers) while it is hashed and copied.</summary>
+    static string InstallBinary(string source)
+    {
+        var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "FRD");
+        var target = Path.Combine(directory, "frd-wintools.exe");
+        if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase)) return target;   // already installed there
+        Directory.CreateDirectory(directory);
+        Protect(directory);
+        string sourceHash;
+        using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            sourceHash = Convert.ToHexString(SHA256.HashData(input));
+            input.Position = 0;
+            var temporary = target + ".new";
+            using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None)) input.CopyTo(output);
+            if (Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(temporary))) != sourceHash)
+            {
+                File.Delete(temporary);
+                throw new InvalidDataException("The copied helper does not match its source (SHA-256 mismatch).");
+            }
+            File.Move(temporary, target, overwrite: true);
+        }
+        Console.Error.WriteLine($"[secure helper] Installed {target} (SHA-256 {sourceHash}).");
+        return target;
+    }
+
+    /// <summary>SYSTEM and Administrators: full control; Users: read and execute; no inheritance from the parent.</summary>
+    static void Protect(string directory)
+    {
+        using var process = Process.Start(new ProcessStartInfo("icacls.exe",
+            $"\"{directory}\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" \"*S-1-5-32-544:(OI)(CI)F\" \"*S-1-5-32-545:(OI)(CI)RX\"")
+        { UseShellExecute = false, CreateNoWindow = true }) ?? throw new InvalidOperationException("Could not start icacls.");
+        process.WaitForExit();
+        if (process.ExitCode != 0) throw new InvalidOperationException($"Could not protect {directory} (icacls exit {process.ExitCode}).");
     }
 
     static void PrepareStorage(string? userSid)

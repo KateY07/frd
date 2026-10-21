@@ -54,7 +54,7 @@ sealed class MfH264Encoder : IDisposable
     IMFSample? outputSample;
     byte[]? sequenceHeader;
     bool asynchronous, providesSamples, disposed;
-    int pendingInputRequests, pendingOutputs;
+    int pendingInputRequests;
     int bitrateKbps;
     static readonly bool Trace = Environment.GetEnvironmentVariable("FRD_MF_TRACE") == "1";
     public string Name => "mf-h264";

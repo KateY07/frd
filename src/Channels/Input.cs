@@ -44,9 +44,14 @@ static class InputProtocol
 static class UdpInputProtocol
 {
     public const byte Version = 1;
-    public const int PacketSize = 56;
+    /// <summary>56 bytes of event followed by a 16-byte truncated HMAC-SHA256 over them, keyed per session; datagrams without a valid tag are dropped.</summary>
+    public const int BodySize = 56, MacSize = 16, PacketSize = BodySize + MacSize;
+    /// <summary>Key for loopback-only paths (local demo and tests) where there is no remote peer to authenticate.</summary>
+    public static readonly byte[] LocalKey = new byte[32];
 
-    public static void Write(Span<byte> packet, ReadOnlySpan<byte> session, long sequence, RemoteInputEvent input)
+    static void Sign(ReadOnlySpan<byte> key, Span<byte> packet) => HMACSHA256.HashData(key, packet[..BodySize])[..MacSize].CopyTo(packet[BodySize..]);
+
+    public static void Write(Span<byte> packet, ReadOnlySpan<byte> session, ReadOnlySpan<byte> macKey, long sequence, RemoteInputEvent input)
     {
         if (packet.Length != PacketSize) throw new ArgumentException($"UDP input packet must be {PacketSize} bytes.", nameof(packet));
         if (session.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(session));
@@ -61,13 +66,15 @@ static class UdpInputProtocol
         BinaryPrimitives.WriteInt32LittleEndian(packet[32..], input.ScanCode);
         BinaryPrimitives.WriteDoubleLittleEndian(packet[36..], input.X);
         BinaryPrimitives.WriteDoubleLittleEndian(packet[44..], input.Y);
+        Sign(macKey, packet);
     }
 
-    public static bool TryRead(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> session, out long sequence, out RemoteInputEvent? input)
+    public static bool TryRead(ReadOnlySpan<byte> packet, ReadOnlySpan<byte> session, ReadOnlySpan<byte> macKey, out long sequence, out RemoteInputEvent? input)
     {
         sequence = 0; input = null;
         if (packet.Length != PacketSize || session.Length != 16 || packet[24] != Version ||
-            !CryptographicOperations.FixedTimeEquals(packet[..16], session)) return false;
+            !CryptographicOperations.FixedTimeEquals(packet[..16], session) ||
+            !CryptographicOperations.FixedTimeEquals(HMACSHA256.HashData(macKey, packet[..BodySize])[..MacSize], packet[BodySize..])) return false;
         var kind = (RemoteInputKind)packet[25];
         var button = (RemoteMouseButton)packet[26];
         if (!Enum.IsDefined(kind) || !Enum.IsDefined(button) || packet[27] > 1) return false;
@@ -200,6 +207,7 @@ public sealed class RemoteInputClient : IDisposable
     readonly bool ownsInputSocket;
     readonly IPEndPoint? inputEndpoint;
     readonly byte[]? inputSession;
+    readonly byte[] inputMacKey = UdpInputProtocol.LocalKey;
     readonly SemaphoreSlim writeGate = new(1, 1), slots = new(MaximumInFlight, MaximumInFlight);
     readonly CancellationTokenSource stop = new();
     readonly object pendingGate = new();
@@ -231,8 +239,9 @@ public sealed class RemoteInputClient : IDisposable
     }
 
     internal RemoteInputClient(TcpClient connection, IPEndPoint inputEndpoint, byte[] inputSession,
-        Action<byte[], IPEndPoint> sendDatagram)
+        Action<byte[], IPEndPoint> sendDatagram, byte[] macKey)
     {
+        inputMacKey = macKey;
         if (inputSession.Length != 16) throw new ArgumentException("UDP input session must be 16 bytes.", nameof(inputSession));
         this.connection = connection;
         this.inputEndpoint = inputEndpoint;
@@ -298,13 +307,13 @@ public sealed class RemoteInputClient : IDisposable
                 if (sendDatagram != null)
                 {
                     var packet = new byte[UdpInputProtocol.PacketSize];
-                    UdpInputProtocol.Write(packet, inputSession!, datagramSequence, input);
+                    UdpInputProtocol.Write(packet, inputSession!, inputMacKey, datagramSequence, input);
                     sendDatagram(packet, inputEndpoint!);
                 }
                 else
                 {
                     Span<byte> packet = stackalloc byte[UdpInputProtocol.PacketSize];
-                    UdpInputProtocol.Write(packet, inputSession!, datagramSequence, input);
+                    UdpInputProtocol.Write(packet, inputSession!, inputMacKey, datagramSequence, input);
                     inputSocket!.SendTo(packet, SocketFlags.None, inputEndpoint!);
                 }
                 return Task.FromResult(new RemoteInputResult(true, "Input event sent over UDP."));

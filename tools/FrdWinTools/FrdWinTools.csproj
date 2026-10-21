@@ -13,8 +13,8 @@
     <Authors>KateY07</Authors>
     <Copyright>Copyright (c) 2026 KateY07</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <Version>3.0.0-pre4</Version>
-    <InformationalVersion>v3.pre4</InformationalVersion>
+    <Version>4.0.0-pre1</Version>
+    <InformationalVersion>v4.pre1</InformationalVersion>
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>
@@ -22,9 +22,9 @@
   <ItemGroup>
     <Compile Include="*.cs" />
     <!-- Shared with FRD.exe: wire format, key/shared-memory helpers and the input injector. -->
-    <Compile Include="..\..\FfmpegSecureShared.cs" Link="Shared\FfmpegSecureShared.cs" />
-    <Compile Include="..\..\FfmpegSecureDesktop.cs" Link="Shared\FfmpegSecureDesktop.cs" />
-    <Compile Include="..\..\FfmpegSecureInput.cs" Link="Shared\FfmpegSecureInput.cs" />
-    <Compile Include="..\..\FfmpegInputInjector.cs" Link="Shared\FfmpegInputInjector.cs" />
+    <Compile Include="..\..\src\Secure\SecureShared.cs" Link="Shared\FfmpegSecureShared.cs" />
+    <Compile Include="..\..\src\Secure\SecureDesktop.cs" Link="Shared\FfmpegSecureDesktop.cs" />
+    <Compile Include="..\..\src\Secure\SecureInput.cs" Link="Shared\FfmpegSecureInput.cs" />
+    <Compile Include="..\..\src\Channels\InputInjector.cs" Link="Shared\FfmpegInputInjector.cs" />
   </ItemGroup>
 </Project>

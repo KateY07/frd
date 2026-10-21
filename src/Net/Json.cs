@@ -15,6 +15,7 @@ namespace Frd;
 [JsonSerializable(typeof(InputReply))]
 [JsonSerializable(typeof(RemoteRequest))]
 [JsonSerializable(typeof(RemoteReply))]
+[JsonSerializable(typeof(RemoteChallenge))]
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(long))]

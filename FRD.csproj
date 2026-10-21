@@ -15,8 +15,8 @@
     <PackageProjectUrl>https://github.com/KateY07/frd</PackageProjectUrl>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>3.0.0-pre4</Version>
-    <InformationalVersion>v3.pre4</InformationalVersion>
+    <Version>4.0.0-pre1</Version>
+    <InformationalVersion>v4.pre1</InformationalVersion>
     <!-- NativeAOT: one native exe, no .NET runtime to install. JSON stays reflection-based (rooted below), reports use anonymous types. -->
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
@@ -32,9 +32,7 @@
     <InternalsVisibleTo Include="PathSwitchResilience" />
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
     <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
-    <Compile Include="Ffmpeg*.cs" />
-    <Compile Include="Mf*.cs" />
-    <Compile Include="Ui*.cs" />
+    <Compile Include="src/**/*.cs" />
     <Content Include="codec-config.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- Only the libraries FRD actually calls (avcodec, avutil, swscale) plus avcodec own dependency swresample. -->
     <FfmpegRuntimeFile Condition="'$(IncludeFfmpegRuntime)' != 'false'" Include="third_party\ffmpeg\runtime\avcodec-62.dll;third_party\ffmpeg\runtime\avutil-60.dll;third_party\ffmpeg\runtime\swscale-9.dll;third_party\ffmpeg\runtime\swresample-6.dll;third_party\ffmpeg\runtime\LICENSE.txt" />

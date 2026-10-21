@@ -86,7 +86,7 @@ sealed class UiControllerWindow : UiWindow
         panel = new UiControlPanel(sceneGate);
         panel.Wire(() => preview?.Invalidate());
         panel.StatusName.Text = remote?.Host ?? "本机演示";
-        panel.Backdrop = (paint, rect, radius, _) => preview.DrawGlass(paint, rect, radius);
+        panel.Backdrop = (paint, rect, radius, _) => preview!.DrawGlass(paint, rect, radius);   // preview is assigned right below, before the first draw
         panel.AnimationFinished += _ => { UiThread.Post(() => { UpdateOrbShape(); }); };
         panel.InteractionStarted = () => lastActivity = Environment.TickCount64;
 

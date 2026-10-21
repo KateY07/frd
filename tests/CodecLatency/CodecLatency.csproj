@@ -9,7 +9,7 @@
     <PublishAot>false</PublishAot>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="../../FfmpegBackend.cs" Link="FfmpegBackend.cs" />
+    <Compile Include="../../src/Codec/FfmpegBackend.cs" Link="FfmpegBackend.cs" />
     <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
   </ItemGroup>
 </Project>
