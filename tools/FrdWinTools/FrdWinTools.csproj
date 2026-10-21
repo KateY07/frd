@@ -13,8 +13,8 @@
     <Authors>KateY07</Authors>
     <Copyright>Copyright (c) 2026 KateY07</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <Version>3.0.0-pre3</Version>
-    <InformationalVersion>v3.pre3</InformationalVersion>
+    <Version>3.0.0-pre4</Version>
+    <InformationalVersion>v3.pre4</InformationalVersion>
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>

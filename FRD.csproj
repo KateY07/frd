@@ -13,8 +13,8 @@
     <PackageProjectUrl>https://github.com/KateY07/frd</PackageProjectUrl>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject>Frd.Program</StartupObject>
-    <Version>3.0.0-pre3</Version>
-    <InformationalVersion>v3.pre3</InformationalVersion>
+    <Version>3.0.0-pre4</Version>
+    <InformationalVersion>v3.pre4</InformationalVersion>
     <!-- NativeAOT: one native exe, no .NET runtime to install. JSON stays reflection-based (rooted below), reports use anonymous types. -->
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>

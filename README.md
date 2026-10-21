@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v3.pre3）
+# FRD · 远程桌面 CLI（v3.pre4）
+
+v3.pre4：新增 MIT 许可证与第三方声明，随包分发。
 
 v3.pre3：新增项目主页 https://katey07.github.io/frd/ ；入门改为无需运行时。
 
