@@ -1,17 +1,30 @@
-# FRD v4.pre3
+# FRD v5.0
 
-Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。与 v4.pre1/pre2 可互连，与 v3 不互通。
+Windows x64，Native AOT 单文件 `FRD.exe`，无需安装 .NET 运行时。这是第一个正式版：把 v3、v4 系列的改动汇总为稳定版本，**代码和协议与 v4.pre3 相同**，可与 v4.pre1 及以后的版本互连；与 v3 不互通。
 
-**新功能：中英文界面**
-- 界面、提示、错误信息和命令行帮助都有中文和英文两套，共 190 多条文字。
-- 用命令行参数选择：`FRD.exe … --lang en` 或 `--lang zh`（可加在任何调用上，包括 `--host`、`--connect`、`--help`）；也可以设环境变量 `FRD_LANG`。
-- 不指定时跟随 Windows 显示语言：中文系统显示中文，其他显示英文。
-- 控制端和被控端各自按自己的语言显示；被控端通过网络发来的状态文字按被控端的语言显示。
-- 命令行参数 `--lang` 是新增的可选参数，原有参数和退出码不变。
+**这个版本是什么**
+- **一个 4 MB 的程序**：基础包约 6 MB，还有单文件版 `frd-v5.0.exe`（约 4 MB）。`FRD.exe` 同时是被控端和主控端，对外接口是命令行。
+- **默认用 Windows 内置的 Media Foundation H.264**（硬件优先，软件回退）；FFmpeg 是可选扩展，提供 zip 和双击安装器。
+- **原生界面**（Direct3D 11 + Direct2D，界面层已开源为 [Glasspane](https://github.com/KateY07/Glasspane)）：深色毛玻璃悬浮面板、可拖动、可收起为悬浮球，延迟始终可见；被控端有同风格的状态卡片。
+- **中英文界面**：`--lang en|zh`，默认跟随 Windows 显示语言。
+- **画面 25 FPS 默认**（10/20/25/30），只按原始分辨率传输。
 
-**验证**：布局回归 `--ui-layout-regression` 在中英文下共 80 种尺寸与状态，控件无重叠、无越界；两种语言的本机回环远程会话都通过；英文翻译的占位符与中文逐条核对一致。
-**说明**：只翻译了 FRD.exe 的界面文字；README 和发布说明仍是中文，主页是英文。
+**控制与协作**
+- 键鼠转发、鼠标形状同步、文本/文件/目录双向剪贴板（传输时两端显示进度）。
+- **本地键鼠优先**：被控端的实体键鼠在用时，远程输入暂停，主控端提示“对方正在操作，请等待”。
+- **共享标注**：主控端在画面上画涂鸦、矩形、文字，被控端屏幕同步显示（点击穿透、不被捕获，可随时禁止）。
+- **远程光标叠加**（可选）。
+- **UAC 与锁屏**：独立的 `frd-wintools.exe` 安装一次 SYSTEM 辅助服务（装到 `%ProgramFiles%\FRD\`，仅管理员可写）。
 
-**单文件版 `frd-v4.pre3.exe`（4.3 MB）**：把 `FRD.exe`、`frd-wintools.exe`、`codec-config.json` 和许可证打成一个 exe（由 [OneSetup](https://github.com/KateY07/onesetup) 的 `--app` 模式打包）。用法与 `FRD.exe` 完全一样，参数、工作目录、控制台和退出码原样传递，例如 `frd-v4.pre3.exe --connect HOST --port 5000 --token ...`。第一次运行解压到 `%LOCALAPPDATA%\OneSetuppps\<内容哈希>`（约 3 秒），之后每次只多约 0.07 秒；环境变量 `ONESETUP_CACHE` 可改位置。没有代码签名，SmartScreen 可能提示。需要 FFmpeg 预设时仍用扩展包，解压到缓存目录里的 `FRD.exe` 旁，或改用 zip 版。校验见 `frd-v4.pre3.exe.sha256`。
+**安全**
+- 口令不上网：挑战-应答（PBKDF2-SHA256）双向认证，嗅探到的握手无法重放。
+- 键鼠 UDP 包带会话密钥签名；认证失败按来源地址指数退避，并限制并发握手。
+- 日志不记录口令，只保留最近 20 个。
+- **FRD 不加密内容**（画面、剪贴板、光标、控制消息），这是有意的设计：它假定运行在已加密的底层链路（VPN、隧道、专网）上，避免额外的包大小和延迟。直接暴露在不可信网络前请先建立加密隧道。
 
-**FFmpeg 扩展安装器 `frd-ffmpeg-8.1.2-setup.exe`（26 MB）**：双击安装 FFmpeg 扩展（OneSetup 打包）。自动查找 FRD（安装器所在目录、正在运行的 FRD、`%LOCALAPPDATA%\Programs\FRD\*`），让你确认或选择目录，把 `ffmpeg\` 复制到 `FRD.exe` 旁并逐个文件校验；无人值守安装用 `-y` 并设置环境变量 `FRD_DIR`（不设置时拒绝执行，不会猜目标）。内容与 `frd-v4.pre3-ffmpeg-win-x64.zip` 相同，校验见 `frd-ffmpeg-8.1.2-setup.exe.sha256`；没有代码签名，SmartScreen 可能提示。
+**发布内容**：`frd-v5.0-win-x64.zip`（基础包）、`frd-v5.0.exe`（单文件版）、`frd-v5.0-ffmpeg-win-x64.zip` 与 `frd-ffmpeg-8.1.2-setup.exe`（FFmpeg 扩展）、各自的 SHA-256。许可证 MIT；FFmpeg 扩展是 GPL-3.0，见 `THIRD-PARTY-NOTICES.md`。没有代码签名，SmartScreen 可能提示。
+
+**已知限制与未验证项**
+- 内容未加密（见上）；单主控、可信网络、无 NAT 穿透。
+- 键鼠签名在真实键鼠转发下的端到端效果、主程序其余 P/Invoke 里是否还有“32 位参数承载指针”的同类问题，没有做过全量审计，计划在后续版本处理。
+- 被控端通过网络发来的状态文字按被控端的语言显示。

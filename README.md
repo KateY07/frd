@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v4.pre3）
+# FRD · 远程桌面 CLI（v5.0）
+
+v5.0：第一个正式版，汇总 v3、v4 系列：Native AOT 单文件、Media Foundation 默认编码、原生界面（Glasspane）、口令认证与键鼠签名、本地键鼠优先、共享标注、中英文界面。代码和协议与 v4.pre3 相同。
 
 v4.pre3：新增中英文界面（`--lang en|zh`，默认跟随 Windows 显示语言）。
 

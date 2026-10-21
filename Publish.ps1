@@ -2,7 +2,7 @@
 $project = Join-Path $PSScriptRoot 'FRD.csproj'
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $version = ([xml](Get-Content -LiteralPath $project -Raw)).Project.PropertyGroup.InformationalVersion
-if ($version -notmatch '^v\d+\.pre\d+$') { throw 'Invalid release version.' }
+if ($version -notmatch '^v\d+\.(pre\d+|\d+)$') { throw 'Invalid release version.' }
 $localReleaseRoot = 'D:\pub\FRD'
 $localArchive = Join-Path $localReleaseRoot "$version.zip"
 $localHash = "$localArchive.sha256"
