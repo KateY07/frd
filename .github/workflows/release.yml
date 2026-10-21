@@ -1,9 +1,8 @@
 name: Build and publish release
 
+# Releases are built and uploaded from the maintainer machine (Publish.ps1 + gh release create); run this only on demand.
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
