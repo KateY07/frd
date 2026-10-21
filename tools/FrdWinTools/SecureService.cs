@@ -62,6 +62,59 @@ internal static class SecureDesktopService
         try { File.AppendAllText(InstallTracePath, $"{DateTimeOffset.Now:O} {step}{Environment.NewLine}"); } catch (Exception) { }
     }
 
+    /// <summary>
+    /// Elevated entry point: stops and deletes the service (which also ends its worker), then removes the protected program folder and the
+    /// key and frame files. A copy of frd-wintools.exe still running from that folder cannot delete itself; the result says so.
+    /// </summary>
+    internal static int Uninstall()
+    {
+        var manager = OpenSCManager(null, null, ScManagerConnect);
+        if (manager == 0) throw Win32("OpenSCManager");
+        try
+        {
+            var service = OpenService(manager, Name, ServiceAllAccess);
+            if (service == 0)
+            {
+                if (Marshal.GetLastWin32Error() != 1060 /* ERROR_SERVICE_DOES_NOT_EXIST */) throw Win32("OpenService");
+                Console.Error.WriteLine("[secure helper] The service is not installed.");
+            }
+            else
+            {
+                try
+                {
+                    if (Query(service).CurrentState is ServiceRunning or ServiceStartPending)
+                    {
+                        if (!ControlService(service, ServiceControlStop, out _)) throw Win32("ControlService(stop)");
+                        WaitForState(service, ServiceStopped, TimeSpan.FromSeconds(15));
+                    }
+                    if (!DeleteService(service) && Marshal.GetLastWin32Error() != 1072 /* ERROR_SERVICE_MARKED_FOR_DELETE */) throw Win32("DeleteService");
+                    Console.Error.WriteLine("[secure helper] Service removed.");
+                }
+                finally { CloseServiceHandle(service); }
+            }
+        }
+        finally { CloseServiceHandle(manager); }
+        var leftovers = new List<string>();
+        foreach (var directory in new[] { Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "FRD"), DataDirectory })
+        {
+            try { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+            catch (Exception error) { leftovers.Add($"{directory} ({error.Message})"); }
+        }
+        try
+        {
+            var data = Path.GetDirectoryName(DataDirectory)!;
+            if (Directory.Exists(data) && !Directory.EnumerateFileSystemEntries(data).Any()) Directory.Delete(data);
+        }
+        catch (Exception) { /* an empty parent folder is harmless */ }
+        if (leftovers.Count > 0)
+        {
+            Console.Error.WriteLine("[secure helper] Service removed, but could not delete: " + string.Join("; ", leftovers) + ". Delete them manually.");
+            return 2;
+        }
+        Console.Error.WriteLine("[secure helper] Uninstalled.");
+        return 0;
+    }
+
     static string InstallErrorPath => Path.Combine(DataDirectory, "install-error.txt");
 
     /// <summary>Elevated entry point. <paramref name="userSid"/> is the interactive user who should read the capture key.</summary>
@@ -119,10 +172,11 @@ internal static class SecureDesktopService
             var command = $"\"{executable}\" --secure-service";
             service = CreateService(manager, Name, "FRD secure-desktop capture", ServiceAllAccess,
                 ServiceWin32OwnProcess, ServiceDemandStart, ServiceErrorNormal, command, null, 0, null, null, null);
-            Trace("CreateService returned");
+            var createError = Marshal.GetLastWin32Error();   // read before Trace(): file I/O overwrites the last error
+            Trace($"CreateService returned {(service == 0 ? createError : 0)}");
             if (service == 0)
             {
-                if (Marshal.GetLastWin32Error() != ErrorServiceExists) throw Win32("CreateService");
+                if (createError != ErrorServiceExists) throw new Win32Exception(createError, $"CreateService failed ({createError}).");
                 service = OpenService(manager, Name, ServiceAllAccess);
                 if (service == 0) throw Win32("OpenService");
             }
@@ -164,6 +218,12 @@ internal static class SecureDesktopService
                 throw new InvalidDataException("The copied helper does not match its source (SHA-256 mismatch).");
             }
             File.Move(temporary, target, overwrite: true);
+        }
+        // The folder belongs to the service alone, so it also gets the scripts that remove the service again.
+        foreach (var script in new[] { "uninstall-frd-wintools.bat", "install-frd-wintools.bat" })
+        {
+            var from = Path.Combine(Path.GetDirectoryName(source)!, script);
+            if (File.Exists(from)) File.Copy(from, Path.Combine(directory, script), overwrite: true);
         }
         Console.Error.WriteLine($"[secure helper] Installed {target} (SHA-256 {sourceHash}).");
         return target;
@@ -280,6 +340,7 @@ internal static class SecureDesktopService
         using var shared = SecureDesktopShared.TryOpen(writer: true) ?? throw new InvalidOperationException("Secure frame buffer is unavailable.");
         using var udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         new Thread(() => RunInputWorker(key)) { IsBackground = true, Name = "FRD secure input" }.Start();
+        new Thread(() => RunUserInputWorker(key)) { IsBackground = true, Name = "FRD elevated input" }.Start();
         uint frameId = BitConverter.ToUInt32(RandomNumberGenerator.GetBytes(4));
         string? previousDesktop = null, lastHash = null;
         while (true)
@@ -325,6 +386,25 @@ internal static class SecureDesktopService
             finally { CloseDesktop(desktop); }
         }
         catch (Exception error) { Console.Error.WriteLine("[secure helper] Input worker failed: " + error); }
+    }
+
+    /// <summary>Injects as SYSTEM on the user's desktop, for targets the unelevated host cannot reach (Task Manager, admin consoles).</summary>
+    static void RunUserInputWorker(byte[] key)
+    {
+        try
+        {
+            var desktop = OpenDesktop("Default", 0, false, 0x01FF);
+            if (desktop == 0) throw Win32("OpenDesktop(Default)");
+            try
+            {
+                if (!SetThreadDesktop(desktop)) throw Win32("SetThreadDesktop(Default)");
+                using var injector = new Win32InputInjector();
+                SecureDesktopInputWorker.Run(key, injector, () => !IsWinlogonActive(), message => Console.Error.WriteLine("[elevated helper] " + message),
+                    CancellationToken.None, SecureInputWire.UserPort);
+            }
+            finally { CloseDesktop(desktop); }
+        }
+        catch (Exception error) { Console.Error.WriteLine("[elevated helper] Input worker failed: " + error); }
     }
 
     static bool IsWinlogonActive()
@@ -422,6 +502,7 @@ internal static class SecureDesktopService
     [StructLayout(LayoutKind.Sequential)] struct BitmapInfoHeader { public uint Size; public int Width, Height; public ushort Planes, BitCount; public uint Compression, SizeImage; public int XPelsPerMeter, YPelsPerMeter; public uint ClrUsed, ClrImportant; }
 
     [DllImport("advapi32.dll", EntryPoint = "OpenSCManagerW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenSCManager(string? machine, string? database, uint access);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool DeleteService(nint service);
     [DllImport("advapi32.dll", EntryPoint = "OpenServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint OpenService(nint manager, string name, uint access);
     [DllImport("advapi32.dll", EntryPoint = "CreateServiceW", CharSet = CharSet.Unicode, SetLastError = true)] static extern nint CreateService(nint manager, string name, string display, uint access, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password);   // tag is an LPDWORD (pointer-sized): a 32-bit parameter leaves garbage in the upper half under NativeAOT and crashes RPCRT4
     [DllImport("advapi32.dll", EntryPoint = "ChangeServiceConfigW", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool ChangeServiceConfig(nint service, uint type, uint start, uint error, string binary, string? group, nint tag, string? dependencies, string? account, string? password, string display);

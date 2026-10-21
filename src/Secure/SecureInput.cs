@@ -8,7 +8,7 @@ namespace Frd;
 
 static class SecureInputWire
 {
-    public const int Port = 59874, PacketSize = 80, AckSize = 48;
+    public const int Port = 59874, UserPort = 59875, PacketSize = 80, AckSize = 48;
     const uint Magic = 0x4652494E, AckMagic = 0x46524941;
 
     public static void Write(Span<byte> packet, ReadOnlySpan<byte> key, ReadOnlySpan<byte> session, long sequence,
@@ -132,11 +132,11 @@ sealed class SecureDesktopInputClient : IDisposable
 sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
 {
     readonly Win32InputInjector ordinary;
-    readonly SecureDesktopInputClient? secure;
+    readonly SecureDesktopInputClient? secure, elevated;
     readonly Func<bool> secureActive;
     readonly Timer heartbeat;
     readonly object gate = new();
-    bool enabled, previousSecure;
+    bool enabled, previousSecure, previousElevated;
 
     public SecureDesktopInputRouter(Win32InputInjector ordinary, Func<bool> secureActive)
     {
@@ -144,6 +144,7 @@ sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
         this.secureActive = secureActive;
         if (File.Exists(SecureDesktopUdp.KeyPath) && SecureDesktopUdp.TryReadKey("secure input") is { } key) secure = new(key);
         else Console.Error.WriteLine("[secure input] SYSTEM helper key absent; ordinary desktop input remains available.");
+        if (secure != null && SecureDesktopUdp.TryReadKey("elevated input") is { } elevatedKey) elevated = new(elevatedKey, SecureInputWire.UserPort);
         heartbeat = new(_ => Heartbeat(), null, Timeout.Infinite, Timeout.Infinite);
     }
 
@@ -168,7 +169,16 @@ sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
                 if (!released.Accepted) Console.Error.WriteLine("[secure input] Desktop transition release: " + released.Message);
                 previousSecure = active;
             }
-            return active ? secure?.Send(input) ?? new(false, "Secure desktop input worker is unavailable.") : ordinary.Inject(input);
+            if (active) return secure?.Send(input) ?? new(false, "Secure desktop input worker is unavailable.");
+            // Windows silently drops injected input aimed at an elevated window (Task Manager, an admin console); the SYSTEM helper can reach it.
+            var useElevated = input.Kind == RemoteInputKind.ReleaseAll ? previousElevated : elevated != null && ordinary.TargetIsElevated(input);
+            if (useElevated != previousElevated)
+            {
+                var released = useElevated ? ordinary.ReleaseAll() : elevated!.Send(new(RemoteInputKind.ReleaseAll));
+                if (!released.Accepted) Console.Error.WriteLine("[secure input] Elevated route release: " + released.Message);
+                previousElevated = useElevated;
+            }
+            return useElevated ? elevated!.Send(input) : ordinary.Inject(input);
         }
     }
 
@@ -178,7 +188,9 @@ sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
     {
         var ordinaryResult = ordinary.ReleaseAll();
         var secureResult = secure?.Send(new(RemoteInputKind.ReleaseAll)) ?? new(true, "No secure worker.");
-        return !ordinaryResult.Accepted ? ordinaryResult : secureResult;
+        var elevatedResult = elevated?.Send(new(RemoteInputKind.ReleaseAll)) ?? new(true, "No elevated route.");
+        previousElevated = false;
+        return !ordinaryResult.Accepted ? ordinaryResult : !secureResult.Accepted ? secureResult : elevatedResult;
     }
 
     void Heartbeat()
@@ -196,7 +208,7 @@ sealed class SecureDesktopInputRouter : IRemoteInputInjector, IDisposable
         heartbeat.Dispose();
         var result = ReleaseAll();
         if (!result.Accepted) Console.Error.WriteLine("[secure input] Release failed: " + result.Message);
-        secure?.Dispose(); ordinary.Dispose();
+        secure?.Dispose(); elevated?.Dispose(); ordinary.Dispose();
     }
 }
 

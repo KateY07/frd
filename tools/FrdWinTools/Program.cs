@@ -19,9 +19,10 @@ static class Program
             }
             if (args is ["--install-secure-helper"]) return SecureDesktopService.Install();
             if (args is ["--install-secure-helper", var userSid]) return SecureDesktopService.Install(userSid);
+            if (args is ["--uninstall-secure-helper"]) return SecureDesktopService.Uninstall();
             if (args is ["--secure-service"]) return SecureDesktopService.RunService();
             if (args is ["--secure-worker"]) { SecureDesktopService.RunWorker(); return 0; }
-            Console.Error.WriteLine("frd-wintools.exe --install-secure-helper [用户SID] | --secure-service | --secure-worker | --version");
+            Console.Error.WriteLine("frd-wintools.exe --install-secure-helper [用户SID] | --uninstall-secure-helper | --secure-service | --secure-worker | --version");
             return 1;
         }
         catch (Exception error)

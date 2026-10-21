@@ -32,9 +32,12 @@ foreach ($document in $documents) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $document) -Destination $destination
 }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs/使用.md') -Destination $staging
+foreach ($script in @('install-frd-wintools.bat', 'uninstall-frd-wintools.bat')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "tools/FrdWinTools/$script") -Destination $staging -ErrorAction Stop
+}
 $productVersion = (Get-Item -LiteralPath (Join-Path $staging 'FRD.exe')).VersionInfo.ProductVersion
 if (-not $productVersion.StartsWith($version + '+') -and $productVersion -ne $version) { throw 'Published binary version mismatch.' }
-foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe')) {
+foreach ($required in @('codec-config.json', 'FRD.exe', 'frd-wintools.exe', 'install-frd-wintools.bat', 'uninstall-frd-wintools.bat')) {
     if (-not (Test-Path -LiteralPath (Join-Path $staging $required))) { throw "Missing release file: $required" }
 }
 if (Test-Path -LiteralPath (Join-Path $staging 'ffmpeg')) { throw 'The base package must not contain FFmpeg.' }
@@ -108,7 +111,7 @@ $singleFile = $null
 if ($onesetup) {
     $singleStage = Join-Path $releaseRoot ('single-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $singleStage | Out-Null
-    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
+    foreach ($item in @('FRD.exe', 'frd-wintools.exe', 'install-frd-wintools.bat', 'uninstall-frd-wintools.bat', 'codec-config.json', 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses')) {
         Copy-Item -LiteralPath (Join-Path $output $item) -Destination $singleStage -Recurse
     }
     $singleFile = Join-Path $releaseRoot "frd-$version.exe"

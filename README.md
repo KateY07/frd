@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v5.2）
+# FRD · 远程桌面 CLI（v5.3）
+
+v5.3：被控端打开任务管理器等管理员窗口时键鼠仍可转发（经 SYSTEM 辅助服务注入，需重装一次辅助服务）；修复辅助服务重装失败；新增 `install-frd-wintools.bat` / `uninstall-frd-wintools.bat` 与 `--uninstall-secure-helper`。
 
 v5.2：修复主控窗口画面四周黑边里的鼠标事件被转发到远端（拖拽期间仍照常转发）。
 

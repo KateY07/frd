@@ -135,6 +135,64 @@ public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
             (hwnd == controller || root == controller || owner == controller || IsChild(controller, hwnd)));
     }
 
+    /// <summary>
+    /// True when this event must be injected by the SYSTEM helper: Windows drops SendInput without an error when the foreground window
+    /// (which owns keyboard focus and the active click) or the window under the pointer runs at a higher integrity level than this process.
+    /// While an elevated window such as Task Manager has focus, every event goes through the helper, including clicks on ordinary windows.
+    /// </summary>
+    public bool TargetIsElevated(RemoteInputEvent input)
+    {
+        try
+        {
+            if (input.Kind is RemoteInputKind.KeyDown or RemoteInputKind.KeyUp) return WindowIsElevated(GetForegroundWindow());
+            if (input.Kind is not (RemoteInputKind.MouseMove or RemoteInputKind.MouseDown or RemoteInputKind.MouseUp or RemoteInputKind.Wheel)) return false;
+            if (WindowIsElevated(GetForegroundWindow())) return true;
+            var point = InputCoordinates.Map(input.X, input.Y, sourceMonitor(), GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79));
+            return WindowIsElevated(WindowFromPoint(new() { X = point.X, Y = point.Y }));
+        }
+        catch (ArgumentOutOfRangeException) { return false; }
+    }
+
+    static bool WindowIsElevated(nint window)
+    {
+        if (window == 0) return false;
+        GetWindowThreadProcessId(window, out var processId);
+        if (processId == 0 || processId == Environment.ProcessId) return false;
+        var process = OpenProcess(0x1000, false, processId);
+        if (process == 0) return true;
+        try
+        {
+            var target = IntegrityLevel(process);
+            // An unreadable level is treated as higher: only a protected or SYSTEM process refuses a medium-integrity caller.
+            return target < 0 || target > OwnIntegrityLevel;
+        }
+        finally { CloseHandle(process); }
+    }
+
+    static readonly Lazy<int> ownIntegrity = new(() => IntegrityLevel(GetCurrentProcess()));
+    static int OwnIntegrityLevel => ownIntegrity.Value;
+
+    /// <summary>Mandatory integrity RID of the process (4096 low, 8192 medium, 12288 high, 16384 system), or -1 when it cannot be read.</summary>
+    static int IntegrityLevel(nint process)
+    {
+        if (!OpenProcessToken(process, 0x0008, out var token)) return -1;
+        try
+        {
+            GetTokenInformation(token, 25, 0, 0, out var size);
+            if (size == 0) return -1;
+            var buffer = Marshal.AllocHGlobal((int)size);
+            try
+            {
+                if (!GetTokenInformation(token, 25, buffer, size, out _)) return -1;
+                var sid = Marshal.ReadIntPtr(buffer);
+                var count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+                return count == 0 ? -1 : Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            }
+            finally { Marshal.FreeHGlobal(buffer); }
+        }
+        finally { CloseHandle(token); }
+    }
+
     public RemoteInputResult ReleaseAll()
     {
         lock (gate)
@@ -204,6 +262,14 @@ public sealed class Win32InputInjector : IRemoteInputInjector, IDisposable
     [StructLayout(LayoutKind.Sequential)] struct MonitorInformation { public uint Size; public Rectangle Monitor, Work; public uint Flags; }
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint count, NativeInput[] inputs, int size);
     [DllImport("user32.dll")] static extern nint GetForegroundWindow();
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(nint hwnd, out int processId);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern nint OpenProcess(uint access, [MarshalAs(UnmanagedType.Bool)] bool inherit, int processId);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool OpenProcessToken(nint process, uint access, out nint token);
+    [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] static extern bool CloseHandle(nint handle);
+    [DllImport("kernel32.dll")] static extern nint GetCurrentProcess();
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] static extern bool GetTokenInformation(nint token, int informationClass, nint information, uint length, out uint returnLength);
+    [DllImport("advapi32.dll")] static extern nint GetSidSubAuthorityCount(nint sid);
+    [DllImport("advapi32.dll")] static extern nint GetSidSubAuthority(nint sid, uint index);
     [DllImport("user32.dll")] static extern nint WindowFromPoint(Point point);
     [DllImport("user32.dll")] static extern nint GetAncestor(nint hwnd, uint flags);
     [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
