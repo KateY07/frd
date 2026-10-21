@@ -10,8 +10,8 @@
     <PlatformTarget>x64</PlatformTarget>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>3.0.0-pre1</Version>
-    <InformationalVersion>v3.pre1</InformationalVersion>
+    <Version>3.0.0-pre2</Version>
+    <InformationalVersion>v3.pre2</InformationalVersion>
     <PublishAot Condition="'$(PublishAot)' == ''">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <StripSymbols>true</StripSymbols>

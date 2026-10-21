@@ -1,4 +1,6 @@
-# FRD · 远程桌面 CLI（v3.pre1）
+# FRD · 远程桌面 CLI（v3.pre2）
+
+v3.pre2：界面层拆出为开源库 Glasspane（子模块），修复高 DPI 下毛玻璃错位。
 
 v3.pre1：Native AOT 单文件（约 10.8 MB，无需 .NET 运行时）；默认改用 Windows 内置 Media Foundation H.264 编解码，FFmpeg 变为可选扩展包；界面由 Avalonia 改为原生 Direct3D11/Direct2D；Windows 辅助服务拆为独立的 `frd-wintools.exe`。
 
