@@ -15,6 +15,7 @@ sealed class UiHostPanel : UiGlassPanel
     public readonly UiButton Input = new() { Label = "", Icon = "mouse", IsToggle = true, IsVisible = false, ToolTip = Loc.T("键鼠：允许主控使用键盘和鼠标") };
     public readonly UiButton Clipboard = new() { Label = "", Icon = "clipboard", IsToggle = true, IsVisible = false, ToolTip = Loc.T("剪贴板：允许与主控同步") };
     public readonly UiButton Annotate = new() { Label = "", Icon = "pen", IsToggle = true, IsVisible = false, ToolTip = Loc.T("标注：允许主控在本机屏幕上画笔") };
+    public readonly UiButton Shot = new() { Label = "", Icon = "camera", ToolTip = Loc.T("截屏：截取本机屏幕，在图片上标注后保存或复制") };
     public readonly UiButton Disconnect = new() { Icon = "power", IsDanger = true, IsVisible = false, ToolTip = Loc.T("断开当前主控") };
     public readonly UiButton More = new() { Icon = "sliders", IsToggle = true, ToolTip = Loc.T("监听地址、会话时长与安全桌面服务") };
     public readonly UiButton Collapse = new() { Icon = "chevrons", ToolTip = Loc.T("收起为悬浮球（空闲 10 秒自动收起）") };
@@ -35,7 +36,7 @@ sealed class UiHostPanel : UiGlassPanel
     {
         MaxWidth = 320;
         moreElements = [ListenTitle, DurationTitle, ServiceTitle, ListenValue, DurationValue, ServiceValue, Install, Quit];
-        elements = [Status, Input, Clipboard, Annotate, Disconnect, More, Collapse, .. moreElements];
+        elements = [Status, Input, Clipboard, Annotate, Shot, Disconnect, More, Collapse, .. moreElements];
         Input.IsChecked = true; Clipboard.IsChecked = true; Annotate.IsChecked = true;
     }
 
@@ -64,7 +65,7 @@ sealed class UiHostPanel : UiGlassPanel
         var x = content.X; var y = content.Y; var width = content.Width;
         var buttons = new List<UiButton>();
         if (Controlled) buttons.AddRange([Input, Clipboard, Annotate, Disconnect]);
-        buttons.AddRange([More, Collapse]);
+        buttons.AddRange([Shot, More, Collapse]);
         foreach (var hidden in new[] { Input, Clipboard, Annotate, Disconnect }) hidden.IsVisible = Controlled;
         var sizes = buttons.Select(button => button.Measure(text, 0)).ToArray();
         var buttonsWidth = sizes.Sum(size => size.X) + 2 * (buttons.Count - 1);
@@ -159,6 +160,7 @@ sealed class UiHostWindow : UiWindow
             if (!allowed) overlay?.Reset();
         };
         panel.Install.Click += InstallHelper;
+        panel.Shot.Click += TakeScreenshot;
 
         server = new(config, addresses, port, token, probeSamples);
         server.ClipboardProgress += value => UiThread.Post(() =>
@@ -212,6 +214,21 @@ sealed class UiHostWindow : UiWindow
     }
 
     void Touch() => lastActivity = Environment.TickCount64;
+
+    /// <summary>Grabs the screen (the FRD cards exclude themselves from capture) and opens the annotation editor on the picture.</summary>
+    void TakeScreenshot()
+    {
+        try
+        {
+            var (bgra, width, height) = ScreenGrab.CapturePrimary();
+            new UiShotWindow(bgra, width, height);
+        }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("[screenshot] " + error);
+            panel.Status.ToolTip = Loc.T("截屏失败：") + error.Message;
+        }
+    }
 
     void Dock()
     {

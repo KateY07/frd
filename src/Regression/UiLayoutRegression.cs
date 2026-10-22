@@ -68,6 +68,16 @@ static class UiLayoutRegression
                         problems.AddRange(Check($"{lang} controller w={width} more={more} annotate={annotate} list={listOpen}", panel, panel.AllElements));
                     }
 
+        // ---- screenshot editor toolbar
+        foreach (var width in new[] { 640, 800, 1200 })
+        {
+            var panel = new UiShotPanel(gate) { PanelFraction = new(.5f, 0), OrbFraction = new(1, 0) };
+            panel.Message.Text = Loc.F("已保存：{0}", @"C:\Users\someone\Pictures\FRD\FRD-20261022-120000.png");
+            panel.Layout(text, width, 700);
+            checks++;
+            problems.AddRange(Check($"{lang} shot editor w={width}", panel, panel.AllElements));
+        }
+
         // ---- host panel
         foreach (var controlled in new[] { false, true })
             foreach (var more in new[] { false, true })

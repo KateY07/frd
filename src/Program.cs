@@ -28,6 +28,7 @@ static class Program
                 return 0;
             }
             if (args.Length > 0 && args[0] == "--mf-regression") return MfRegression.Run(args);
+            if (args.Length > 0 && args[0] == "--shot-regression") return ShotRegression.Run();
             if (args.Length > 0 && args[0] == "--ui-layout-regression") return UiLayoutRegression.Run(args.Length > 1 ? args[1] : "results/ui-layout.json");
             if (args is ["--auto-codec-probe", _, _] or ["--auto-decode-probe", _, _, _])
                 return AutoCodecProbe.RunWorker(args);
