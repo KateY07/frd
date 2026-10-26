@@ -86,7 +86,7 @@ sealed class UiControllerWindow : UiWindow
     long hoverSince;
     UiElement? tooltipTarget;
 
-    public UiControllerWindow(AppConfiguration config, int autoCloseSeconds, string? reportPath, RemoteOptions? remote = null)
+    public UiControllerWindow(AppConfiguration config, int autoCloseSeconds, string? reportPath, RemoteOptions? remote = null, string? customTitle = null)
     {
         remoteOptions = remote;
         this.config = config; this.autoCloseSeconds = autoCloseSeconds; this.reportPath = reportPath;
@@ -94,9 +94,11 @@ sealed class UiControllerWindow : UiWindow
         IsMainWindow = true; MinWidth = 680; MinHeight = 460;
         var title = autoCloseSeconds > 0 ? Loc.T("FRD — 自动回归（完成后关闭）") : Loc.T("FRD — 真实屏幕 / localhost UDP");
         if (remote != null) title = Loc.F("FRD 主控端 — {0}:{1}", remote.Host, remote.Port);
+        if (!string.IsNullOrWhiteSpace(customTitle)) title = customTitle;
         CreateNative(title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, 0, unchecked((int)0x80000000), unchecked((int)0x80000000), 1280, 860);
         SetClientSize((int)(1280 * Scale), (int)(860 * Scale));
         CenterOnScreen();
+        AppIcon.Apply(Handle);
 
         measureDevices = new UiDevices();
         measureText = new UiText(measureDevices.DWrite);

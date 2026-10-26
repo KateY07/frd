@@ -24,12 +24,12 @@ static class UiApp
         return RemoteLaunch.hostExitCode;
     }
 
-    public static void RunController(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null)
+    public static void RunController(AppConfiguration config, int autoCloseSeconds = 0, string? reportPath = null, RemoteOptions? remote = null, string? title = null)
     {
         UiControllerWindow.RegressionExitCode = 0;
         Prepare();
         UiThread.Initialize();
-        using var window = new UiControllerWindow(config, autoCloseSeconds, reportPath, remote);
+        using var window = new UiControllerWindow(config, autoCloseSeconds, reportPath, remote, title);
         UiThread.Run();
         if (UiControllerWindow.RegressionExitCode != 0) Environment.ExitCode = UiControllerWindow.RegressionExitCode;
         SessionTrace.Event("controller-process", $"exit-code-{Environment.ExitCode}");
